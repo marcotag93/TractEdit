@@ -5,7 +5,10 @@ A Python-based graphical interface for interactively **viewing**, **selecting**,
 
 
 
-https://github.com/user-attachments/assets/7558b0ab-3fc0-44d3-9eb6-671b29608f00
+
+https://github.com/user-attachments/assets/ae40e6a8-927e-4d82-b315-7d7646563987
+
+
 
 
 ---
