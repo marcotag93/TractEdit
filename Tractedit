@@ -1,0 +1,65 @@
+#!/bin/bash
+
+#
+# This script assumes 'main.py' is located in the SAME directory
+# as this script file itself.
+# It attempts to run natively first. On Wayland, if the native run fails
+# (returns a non-zero exit code), it automatically retries using the
+# XCB compatibility layer (XWayland).
+#
+
+# --- Determine the script's own directory ---
+SCRIPT_DIR=$(cd "$(dirname "$(readlink -f "$0" || echo "$0")")" &> /dev/null && pwd)
+if [[ -z "$SCRIPT_DIR" ]]; then
+  echo "ERROR: Could not determine the script's directory." >&2
+  exit 1
+fi
+
+# --- Construct the expected path to main.py ---
+EXPECTED_MAIN_PY="$SCRIPT_DIR/main.py"
+TRACTEDIT_MAIN_PY="$EXPECTED_MAIN_PY"
+TRACTEDIT_DIR="$SCRIPT_DIR"
+
+# --- Check if main.py exists ---
+if [[ ! -f "$TRACTEDIT_MAIN_PY" ]]; then
+  echo "ERROR: 'main.py' not found in the script's directory: '$TRACTEDIT_DIR'." >&2
+  echo "Please ensure this script and 'main.py' are in the same directory." >&2
+  exit 1
+fi
+
+# --- Execution Variables ---
+EXIT_CODE=0
+
+# --- Automatic Detection and Fallback Logic ---
+IS_WAYLAND=false
+if [[ "$XDG_SESSION_TYPE" == "wayland" ]]; then
+  IS_WAYLAND=true
+  echo "INFO: Wayland session detected. Will attempt native execution first." >&2
+else
+  echo "INFO: Non-Wayland session detected ($XDG_SESSION_TYPE). Attempting native execution." >&2
+fi
+
+# --- Attempt 1: Run Natively ---
+echo "INFO: Attempt 1: Running TractEdit natively from: $TRACTEDIT_MAIN_PY" >&2
+(cd "$TRACTEDIT_DIR" && python3 "$TRACTEDIT_MAIN_PY" "$@")
+EXIT_CODE=$?
+
+# --- Attempt 2 (Fallback): Only if native failed AND we are on Wayland ---
+if [[ $EXIT_CODE -ne 0 && "$IS_WAYLAND" == true ]]; then
+  echo "WARN: Native execution failed with code $EXIT_CODE." >&2
+  echo "INFO: Attempt 2: Retrying with XCB platform plugin (Wayland fallback)..." >&2
+  echo "INFO: Running TractEdit from: $TRACTEDIT_MAIN_PY with XCB fallback" >&2
+  (cd "$TRACTEDIT_DIR" && env QT_QPA_PLATFORM=xcb python3 "$TRACTEDIT_MAIN_PY" "$@")
+  EXIT_CODE=$?
+elif [[ $EXIT_CODE -ne 0 ]]; then
+  echo "ERROR: TractEdit execution failed with code $EXIT_CODE. No XCB fallback attempted (not on Wayland)." >&2
+fi
+
+# --- Final Exit ---
+if [[ $EXIT_CODE -eq 0 ]]; then
+    echo "INFO: TractEdit finished successfully (final exit code $EXIT_CODE)." >&2
+else
+    echo "ERROR: TractEdit finished with errors (final exit code $EXIT_CODE)." >&2
+fi
+
+exit $EXIT_CODE
