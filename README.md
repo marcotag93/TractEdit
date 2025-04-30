@@ -6,7 +6,8 @@ A Python-based graphical interface for interactively **viewing**, **selecting**,
 
 
 
-https://github.com/user-attachments/assets/ae40e6a8-927e-4d82-b315-7d7646563987
+https://github.com/user-attachments/assets/e8065a6c-5c81-40c3-b32e-5e236c8d12c6
+
 
 
 
@@ -25,6 +26,7 @@ Center for Mind/Brain Sciences (CIMeC), University of Trento Italy
 ## Key Features
 
 - **Load & Save** streamline bundles (`.trk`, `.tck`)
+- **Anatomical Image:** Load NIfTI images (`.nii`, `.nii.gz`) as backgrounds for anatomical context.
 - **3D Visualization** with [VTK](https://vtk.org/) and [FURY](https://fury.gl/)
     - Default gray, orientation (RGB), or scalar-based coloring
 - **Interactive Editing Tools:**
