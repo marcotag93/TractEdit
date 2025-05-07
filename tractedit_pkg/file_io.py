@@ -23,70 +23,68 @@ def parse_numeric_tuple_from_string(value_str, target_type=float, expected_lengt
             try:
                 converted_tuple = tuple(target_type(x) for x in value_str)
                 if expected_length is not None and len(converted_tuple) != expected_length:
-                    print(f"Warning: Input sequence {value_str} has length {len(converted_tuple)}, expected {expected_length}.")
+                    # print(f"Warning: Input sequence {value_str} has length {len(converted_tuple)}, expected {expected_length}.") # debug
+                    return value_str # Return original if length mismatch after conversion
                 return converted_tuple
-            except (ValueError, TypeError) as e:
-                print(f"Warning: Could not convert existing sequence {value_str} to {target_type}: {e}")
-                return value_str
+            except (ValueError, TypeError): # e.g. target_type(x) fails
+                return value_str # Return original on conversion error
         elif isinstance(value_str, np.ndarray):
             try:
                 converted_array = value_str.astype(target_type)
-                # For matrix dimensions, expected_length might be a tuple (e.g., (4,4))
-                if isinstance(expected_length, tuple):
+                if isinstance(expected_length, tuple): # For matrix shapes
                     if converted_array.shape != expected_length:
-                         print(f"Warning: Input array {value_str} has shape {converted_array.shape}, expected {expected_length}.")
-                         return value_str # Return original if shape mismatch
-                elif expected_length is not None and len(converted_array) != expected_length:
-                     print(f"Warning: Input array {value_str} has length {len(converted_array)}, expected {expected_length}.")
-                     return value_str # Return original if length mismatch
-                return converted_array # Return the potentially type-converted array
-            except Exception as e:
-                 print(f"Warning: Could not ensure type {target_type} for ndarray {value_str}: {e}")
-                 return value_str 
-        else:
+                        return value_str
+                elif expected_length is not None: # For 1D array/tuple lengths
+                     if converted_array.ndim == 1 and len(converted_array) != expected_length:
+                         return value_str
+                     elif converted_array.ndim != 1 : # Or if not 1D when expected_length is int
+                         return value_str
+                return converted_array
+            except (ValueError, TypeError):
+                 return value_str # Return original on type conversion error for ndarray
+        else: # Not a string, list, tuple, or ndarray
              return value_str
 
     # --- If input is a string, proceed with parsing ---
     try:
-        # Try standard literal evaluation (handles tuples/lists)
         parsed_val = ast.literal_eval(value_str)
         if isinstance(parsed_val, (list, tuple)):
             result = tuple(target_type(x) for x in parsed_val)
             if expected_length is not None and len(result) != expected_length:
-                 print(f"Warning: Parsed tuple {result} from '{value_str}' has length {len(result)}, expected {expected_length}.")
-                 return value_str 
+                 # print(f"Warning: Parsed tuple {result} from '{value_str}' has length {len(result)}, expected {expected_length}.")
+                 return value_str # Return original string if length mismatch
             return result
-        # If literal_eval results in a single number (e.g., string was "1.0")
-        elif isinstance(parsed_val, (int, float)):
-             result = (target_type(parsed_val),) # Make it a tuple
-             if expected_length is not None and len(result) != expected_length:
-                 print(f"Warning: Parsed single number {result} from '{value_str}' has length {len(result)}, expected {expected_length}.")
+        elif isinstance(parsed_val, (int, float)): # e.g. value_str was "1.0"
+             result_scalar = target_type(parsed_val)
+             # If expected_length is 1, wrap in a tuple
+             if expected_length == 1:
+                 return (result_scalar,)
+             # If expected_length is None (e.g. for a single scalar not in a tuple), return scalar
+             elif expected_length is None: 
+                 return result_scalar
+             else: # Mismatch if expected_length is other than 1 or None for a single number
                  return value_str 
-             return result
+    except (ValueError, SyntaxError, TypeError): # ast.literal_eval failed or target_type(x) failed
+        # Fallback: try splitting the string
+        cleaned_str = value_str.strip('()[] ') # Added space to strip
+        parts = [p.strip() for p in cleaned_str.split(',') if p.strip()] if ',' in cleaned_str else \
+                [p.strip() for p in cleaned_str.split() if p.strip()]
 
-    except (ValueError, SyntaxError, TypeError):
-        cleaned_str = value_str.strip('()[]') # Remove brackets
-        parts = []
-        if ',' in cleaned_str:
-            parts = [p.strip() for p in cleaned_str.split(',')]
-        else:
-            parts = cleaned_str.split() # Split by whitespace
+        if not parts: # If splitting results in no parts
+            return value_str
 
         try:
-            result = tuple(target_type(p) for p in parts if p)
+            result = tuple(target_type(p) for p in parts)
             if expected_length is not None and len(result) != expected_length:
-                 print(f"Warning: Parsed tuple {result} from splitting '{value_str}' has length {len(result)}, expected {expected_length}.")
-                 return value_str # Return original string on mismatch
-            if not result:
-                 raise ValueError("Splitting resulted in empty sequence")
+                 # print(f"Warning: Parsed tuple {result} from splitting '{value_str}' has length {len(result)}, expected {expected_length}.")
+                 return value_str # Return original string if length mismatch
             return result
-        except (ValueError, TypeError) as e:
-            print(f"Warning: Could not parse '{value_str}' as a tuple of {target_type} after splitting: {e}")
-            return value_str # Return original string on failure
-
-    # Fallback: return the original string if none of the methods worked
-    print(f"Warning: Could not parse '{value_str}' into expected format. Returning original string.")
+        except (ValueError, TypeError): # target_type(p) failed
+            # print(f"Warning: Could not parse '{value_str}' as a tuple of {target_type} after splitting.")
+            return value_str
+    # Fallback if ast.literal_eval results in an unexpected type or other issues
     return value_str
+
 
 # --- Helper Function for Scalar Loading ---
 def _load_scalar_data(trk_file):
@@ -178,7 +176,7 @@ def load_anatomical_image(main_window):
 
     status_updater = getattr(main_window.vtk_panel, 'update_status', lambda msg: print(f"Status: {msg}"))
     status_updater(f"Loading image: {os.path.basename(input_path)}...")
-    QApplication.processEvents() 
+    QApplication.processEvents()
 
     try:
         # Load NIfTI file using nibabel
@@ -247,11 +245,11 @@ def load_streamlines_file(main_window):
 
     # Clean existing bundle first (if any)
     if main_window.streamlines_list:
-        main_window._close_bundle() 
+        main_window._close_bundle()
 
     status_updater = getattr(main_window.vtk_panel, 'update_status', lambda msg: print(f"Status: {msg}"))
     status_updater(f"Loading streamlines: {os.path.basename(input_path)}...")
-    QApplication.processEvents() 
+    QApplication.processEvents()
 
     try:
         # --- Load File ---
@@ -283,14 +281,14 @@ def load_streamlines_file(main_window):
                 main_window.vtk_panel.update_radius_actor(visible=False) # Hides selection sphere
                 if main_window.vtk_panel.render_window:
                      main_window.vtk_panel.render_window.Render()
-            return 
+            return
 
         # --- Assign Core Data to MainWindow ---
         main_window.streamlines_list = loaded_streamlines
         main_window.original_trk_header = trk_file.header.copy() if hasattr(trk_file, 'header') else {}
 
         # Load Affine
-        main_window.original_trk_affine = np.identity(4) 
+        main_window.original_trk_affine = np.identity(4)
         if hasattr(trk_file, 'tractogram') and hasattr(trk_file.tractogram, 'affine_to_rasmm'):
             loaded_affine = trk_file.tractogram.affine_to_rasmm
             if isinstance(loaded_affine, np.ndarray) and loaded_affine.shape == (4, 4):
@@ -394,8 +392,8 @@ def _get_save_path_and_extension(main_window):
         file_filter = "TrackVis TRK Files (*.trk)"
     elif required_ext == '.tck':
         file_filter = "TCK Files (*.tck)"
-    else: 
-        return None, None
+    else:
+        return None, None # Should have been caught by _validate_save_prerequisites
     all_filters = f"{file_filter};;All Files (*.*)"
 
     output_path, _ = QFileDialog.getSaveFileName(
@@ -406,22 +404,23 @@ def _get_save_path_and_extension(main_window):
     if not output_path:
         return None, None
 
-    _, output_ext = os.path.splitext(output_path)
-    output_ext = output_ext.lower()
+    _, output_ext_from_dialog = os.path.splitext(output_path)
+    output_ext_from_dialog = output_ext_from_dialog.lower()
 
-    # Enforce correct extension
-    if output_ext != required_ext:
-        if not output_ext:
-            output_path += required_ext
-            print(f"Save Info: Appended required extension '{required_ext}'.")
-            output_ext = required_ext
-        else:
-            error_msg = (f"Format Mismatch: Must save as '{required_ext}'. "
-                         f"Chosen path '{os.path.basename(output_path)}' has wrong extension ('{output_ext}').")
-            QMessageBox.warning(main_window, "Save Format Error", error_msg)
-            return None, None 
-
-    return output_path, output_ext
+    # Enforce correct extension, inform user if corrected
+    if output_ext_from_dialog != required_ext:
+        old_output_path = output_path
+        # Correct the path to have the required extension
+        output_path = os.path.splitext(output_path)[0] + required_ext
+        if output_ext_from_dialog == "": # No extension was provided
+            print(f"Save Info: Appended required extension '{required_ext}'. New path: {output_path}")
+        else: # A different extension was provided
+             QMessageBox.warning(main_window, "Save Format Corrected",
+                                f"File extension was corrected from '{output_ext_from_dialog}' to the required '{required_ext}'.\n"
+                                f"Saving as: {os.path.basename(output_path)}")
+             print(f"Save Info: Corrected extension from '{output_ext_from_dialog}' to '{required_ext}'. Path changed from '{old_output_path}' to '{output_path}'.")
+    # output_ext is now implicitly required_ext
+    return output_path, required_ext
 
 def _prepare_tractogram_and_affine(main_window):
     """Prepares the Tractogram object and validates the affine matrix."""
@@ -448,101 +447,149 @@ def _prepare_tractogram_and_affine(main_window):
     )
     return new_tractogram
 
-def _prepare_trk_header(base_header, nb_streamlines):
-    """Prepares and validates the header dictionary for TRK saving."""
+def _prepare_trk_header(base_header, nb_streamlines, anatomical_img_affine=None):
+    """
+    Prepares and validates the header dictionary for TRK saving.
+    If voxel_order is missing in base_header, attempts to derive it from
+    anatomical_img_affine, otherwise defaults to 'RAS'.
+    """
     header = base_header.copy()
     print("Preparing TRK header for saving...")
 
-    # Fields to clean/validate if they exist as strings
-    keys_to_clean_if_string = ['voxel_sizes', 'dimensions', 'voxel_to_rasmm']
-    expected_types = {'voxel_sizes': float, 'dimensions': int, 'voxel_to_rasmm': float}
-    expected_lengths = {'voxel_sizes': 3, 'dimensions': 3, 'voxel_to_rasmm': (4, 4)}
+    # --- Voxel Order Logic (Corrected) ---
+    raw_voxel_order_from_trk = header.get('voxel_order')
+    processed_voxel_order_from_trk = None
 
-    for key in keys_to_clean_if_string:
-        if key not in header: 
-            continue
-        original_value = header[key]
-        is_string = isinstance(original_value, str)
-        is_numeric_like = isinstance(original_value, (np.ndarray, list, tuple))
-
-        if not is_string and not is_numeric_like: 
-            continue 
-        parsed_value = original_value # Default to original
-        expected_type = expected_types.get(key, float)
-        length_or_shape = expected_lengths.get(key)
-
-        if is_string:
-            parsed_value = parse_numeric_tuple_from_string(
-                original_value, expected_type, length_or_shape
-            )
-            if isinstance(parsed_value, str): # Parsing failed
-                 print(f"    - Warning: Could not parse string '{original_value}' for key '{key}'. Keeping original.")
-                 continue 
-
-        # --- Validation for parsed string or existing numeric types ---
+    if isinstance(raw_voxel_order_from_trk, bytes):
         try:
-            valid = True
-            current_val = parsed_value
-            # Convert list to tuple, ndarray to expected type if needed
-            if isinstance(current_val, list):
-                current_val = tuple(expected_type(x) for x in current_val)
-            elif isinstance(current_val, np.ndarray):
-                current_val = current_val.astype(expected_type)
+            processed_voxel_order_from_trk = raw_voxel_order_from_trk.decode('utf-8', errors='strict')
+            print(f"    - Info: Decoded 'voxel_order' (bytes: {raw_voxel_order_from_trk}) to string: '{processed_voxel_order_from_trk}'")
+        except UnicodeDecodeError:
+            print(f"    - Warning: 'voxel_order' field in TRK header (bytes: {raw_voxel_order_from_trk}) could not be decoded. Treating as invalid.")
+    elif isinstance(raw_voxel_order_from_trk, str):
+        processed_voxel_order_from_trk = raw_voxel_order_from_trk
 
-            # Validate shape/length
-            if isinstance(length_or_shape, tuple) and isinstance(current_val, np.ndarray):
-                if current_val.shape != length_or_shape: valid = False
-            elif isinstance(length_or_shape, int):
-                 # Ensure it's a tuple (for dimensions, voxel_sizes) not ndarray after conversion
-                 if not isinstance(current_val, tuple) or len(current_val) != length_or_shape:
-                     # If it was an ndarray, try converting to tuple AFTER type cast
-                     if isinstance(parsed_value, np.ndarray) and len(parsed_value) == length_or_shape:
-                         current_val = tuple(current_val)
-                     else:
-                         valid = False
+    is_valid_trk_voxel_order = isinstance(processed_voxel_order_from_trk, str) and len(processed_voxel_order_from_trk) == 3
 
-            if valid:
-                if is_string: print(f"    - Parsed string for '{key}' to {type(current_val).__name__}: {current_val}.")
-                header[key] = current_val # Update header
-            else:
-                print(f"    - Warning: Validation failed for '{key}' (shape/length/type). Original value: {original_value}")
-                header[key] = original_value
-
-        except Exception as conv_e:
-            print(f"    - Warning: Error converting/validating field '{key}': {conv_e}. Keeping original.")
-            header[key] = original_value 
-
-    # --- Ensure essential fields are present and valid ---
-    header['nb_streamlines'] = nb_streamlines
-    if 'voxel_order' not in header or not isinstance(header['voxel_order'], str) or len(header['voxel_order']) != 3:
-        header['voxel_order'] = 'RAS'
-    header['voxel_order'] = header['voxel_order'].upper()
-
-    # Use .get() with default for validation checks
-    vs = header.get('voxel_sizes')
-    if not isinstance(vs, tuple) or len(vs) != 3:
-        header['voxel_sizes'] = (1.0, 1.0, 1.0)
-
-    dim = header.get('dimensions')
-    if not isinstance(dim, tuple) or len(dim) != 3:
-        header['dimensions'] = (1, 1, 1)
-
-    v2r = header.get('voxel_to_rasmm')
-    if not isinstance(v2r, np.ndarray) or v2r.shape != (4, 4):
-        header['voxel_to_rasmm'] = np.identity(4, dtype=np.float32)
+    if is_valid_trk_voxel_order:
+        header['voxel_order'] = processed_voxel_order_from_trk.upper()
+        print(f"    - Info: Using existing 'voxel_order' from TRK header: {header['voxel_order']}.")
     else:
-        header['voxel_to_rasmm'] = v2r.astype(np.float32) # Ensure float
+        if raw_voxel_order_from_trk is not None:
+            print(f"    - Warning: 'voxel_order' from TRK header ('{raw_voxel_order_from_trk}') is invalid or in an unexpected format.")
+        else:
+            print(f"    - Info: 'voxel_order' missing in TRK header.")
+
+        derived_from_anat = False
+        if anatomical_img_affine is not None and \
+           isinstance(anatomical_img_affine, np.ndarray) and \
+           anatomical_img_affine.shape == (4,4):
+            try:
+                axcodes = nib.aff2axcodes(anatomical_img_affine)
+                derived_vo_str = "".join(axcodes).upper()
+                if len(derived_vo_str) == 3:
+                    header['voxel_order'] = derived_vo_str
+                    derived_from_anat = True
+                    print(f"    - Info: Derived 'voxel_order' from loaded anatomical image: {header['voxel_order']}.")
+                else:
+                    print(f"    - Warning: Could not derive a valid 3-character 'voxel_order' from anatomical image affine (got: '{derived_vo_str}').")
+            except Exception as e:
+                print(f"    - Warning: Error deriving 'voxel_order' from anatomical image affine: {e}.")
+
+        if not derived_from_anat:
+            header['voxel_order'] = 'RAS'
+            # Contextual print for defaulting voxel_order
+            if raw_voxel_order_from_trk is None and anatomical_img_affine is None:
+                print(f"    - Info: 'voxel_order' missing, no anatomical image. Defaulting to 'RAS'.")
+            elif not is_valid_trk_voxel_order and anatomical_img_affine is None:
+                print(f"    - Info: Original 'voxel_order' invalid/missing, no anatomical image. Defaulting to 'RAS'.")
+            else: # Covers cases where derivation from anat failed or anat_img_affine was invalid
+                print(f"    - Info: Could not use original or derive 'voxel_order' from anatomical image. Defaulting to 'RAS'.")
+
+    # --- Process other specific TRK header fields ---
+    keys_to_process = {
+        'voxel_sizes': {'type': float, 'length': 3, 'default': (1.0, 1.0, 1.0)},
+        'dimensions': {'type': int, 'length': 3, 'default': (1, 1, 1)}, # Small valid default
+        'voxel_to_rasmm': {'type': float, 'shape': (4,4), 'default': np.identity(4, dtype=np.float32)}
+    }
+
+    for key, K_props in keys_to_process.items():
+        original_value = header.get(key)
+        processed_value = original_value
+        expected_item_type = K_props['type']
+        is_matrix = 'shape' in K_props
+
+        # 1. Decode if bytes
+        if isinstance(processed_value, bytes):
+            try:
+                processed_value = processed_value.decode('utf-8', errors='strict')
+                # print(f"    - Info: Decoded byte string for '{key}': {original_value} -> '{processed_value}'")
+            except UnicodeDecodeError:
+                print(f"    - Warning: Could not decode bytes for '{key}'. Original value: {original_value}")
+                header[key] = K_props['default']
+                print(f"    - Info: Set '{key}' to default: {header[key]}")
+                continue 
+
+        # 2. Parse if string, or use if already suitable type
+        if isinstance(processed_value, str):
+            parsed_val = parse_numeric_tuple_from_string(
+                processed_value,
+                expected_item_type,
+                K_props.get('length') or K_props.get('shape') 
+            )
+            # Check if parse_numeric_tuple_from_string returned the original string (failure)
+            if not (isinstance(parsed_val, str) and parsed_val == processed_value):
+                processed_value = parsed_val # Successfully parsed
+            else:
+                # Parsing failed
+                print(f"    - Info: Could not parse string '{processed_value}' for '{key}'.")
+        
+        # 3. Validate and set
+        valid_structure = False
+        final_value = None
+
+        try:
+            if is_matrix: # voxel_to_rasmm
+                if isinstance(processed_value, np.ndarray) and processed_value.shape == K_props['shape']:
+                    final_value = processed_value.astype(expected_item_type)
+                    valid_structure = True
+            else: # voxel_sizes, dimensions (tuples)
+                if isinstance(processed_value, tuple) and len(processed_value) == K_props['length']:
+                    final_value = tuple(expected_item_type(x) for x in processed_value)
+                    valid_structure = True
+                elif isinstance(processed_value, np.ndarray) and processed_value.ndim == 1 and len(processed_value) == K_props['length']:
+                    final_value = tuple(processed_value.astype(expected_item_type))
+                    valid_structure = True
+        except (ValueError, TypeError) as e: # Catch errors from type conversion (e.g., int('abc'))
+            print(f"    - Warning: Type conversion error for '{key}' (value: '{processed_value}'): {e}")
+            valid_structure = False 
+
+        if valid_structure:
+            header[key] = final_value
+            # print(f"    - Info: Successfully processed '{key}'. Value: {header[key]}")
+        else:
+            print(f"    - Warning: '{key}' ('{original_value}') was invalid, missing, or failed processing. Defaulted to {K_props['default']}.")
+            header[key] = K_props['default']
+
+    header['nb_streamlines'] = nb_streamlines
+    header['voxel_order'] = header['voxel_order'].upper()
 
     return header
 
 def _prepare_tck_header(base_header, nb_streamlines):
     """Prepares the header dictionary for TCK saving."""
     header = base_header.copy() if base_header is not None else {}
-    header['count'] = str(nb_streamlines) # TCK expects count as string
+    header['count'] = str(nb_streamlines) 
     header.pop('nb_streamlines', None) # Remove TRK specific field
     # Ensure other common fields are strings if present
     for key in ['voxel_order', 'dimensions', 'voxel_sizes']:
-        if key in header: header[key] = str(header[key])
+        if key in header:
+            if isinstance(header[key], bytes):
+                try:
+                    header[key] = header[key].decode('utf-8', errors='replace')
+                except Exception:
+                    header[key] = str(header[key]) # Fallback
+            header[key] = str(header[key])
     return header
 
 def _save_tractogram_file(tractogram, header, output_path, file_ext):
@@ -575,24 +622,28 @@ def save_streamlines_file(main_window):
     output_path, output_ext = _get_save_path_and_extension(main_window)
     if not output_path:
         status_updater("Save cancelled.")
-        return 
+        return
 
     # --- 3. Prepare Data ---
     status_updater(f"Saving {len(main_window.streamlines_list)} streamlines to: {os.path.basename(output_path)}...")
-    QApplication.processEvents() # Allow UI update
+    QApplication.processEvents() # UI update
 
     try:
         tractogram = _prepare_tractogram_and_affine(main_window)
 
         # --- 4. Prepare Header ---
-        header = {}
+        header_to_save = {}
         if output_ext == '.trk':
-            header = _prepare_trk_header(main_window.original_trk_header, len(tractogram.streamlines))
+            header_to_save = _prepare_trk_header(
+                main_window.original_trk_header,
+                len(tractogram.streamlines),
+                anatomical_img_affine=main_window.anatomical_image_affine
+            )
         elif output_ext == '.tck':
-            header = _prepare_tck_header(main_window.original_trk_header, len(tractogram.streamlines))
+            header_to_save = _prepare_tck_header(main_window.original_trk_header, len(tractogram.streamlines))
 
         # --- 5. Save File ---
-        success_msg = _save_tractogram_file(tractogram, header, output_path, output_ext)
+        success_msg = _save_tractogram_file(tractogram, header_to_save, output_path, output_ext)
         status_updater(success_msg)
 
     except Exception as e:
