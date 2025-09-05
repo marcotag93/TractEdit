@@ -1,6 +1,7 @@
-PyQt6==6.8.1
+PyQt6==6.7.0
 vtk==9.2.6
 fury==0.12.0
 nibabel==5.2.1
 numpy==1.26.4
+
 pytz==2024.1
