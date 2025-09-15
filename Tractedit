@@ -7,6 +7,11 @@
 # (returns a non-zero exit code), it automatically retries using the
 # XCB compatibility layer (XWayland).
 #
+# Additionally:
+# - The script sanitizes LD_LIBRARY_PATH to remove /usr/local/fsl entries,
+#   which can cause crashes when conflicting FSL-shipped libraries are loaded
+#   instead of the system or environment-provided Qt libraries.
+#
 
 # --- Determine the script's own directory ---
 SCRIPT_DIR=$(cd "$(dirname "$(readlink -f "$0" || echo "$0")")" &> /dev/null && pwd)
@@ -25,6 +30,15 @@ if [[ ! -f "$TRACTEDIT_MAIN_PY" ]]; then
   echo "ERROR: 'main.py' not found in the script's directory: '$TRACTEDIT_DIR'." >&2
   echo "Please ensure this script and 'main.py' are in the same directory." >&2
   exit 1
+fi
+
+# --- Sanitize LD_LIBRARY_PATH to avoid FSL conflicts ---
+if [[ -n "$LD_LIBRARY_PATH" ]]; then
+  CLEAN_LD=$(echo "$LD_LIBRARY_PATH" | tr ':' '\n' | grep -v '/usr/local/fsl' | paste -sd ':' -)
+  if [[ "$CLEAN_LD" != "$LD_LIBRARY_PATH" ]]; then
+    echo "INFO: Stripping /usr/local/fsl entries from LD_LIBRARY_PATH to prevent Qt conflicts." >&2
+    export LD_LIBRARY_PATH="$CLEAN_LD"
+  fi
 fi
 
 # --- Execution Variables ---
