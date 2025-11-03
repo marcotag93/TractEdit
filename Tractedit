@@ -1,17 +1,20 @@
 #!/bin/bash
 
 #
-# This script assumes 'main.py' is located in the SAME directory
-# as this script file itself.
-# It attempts to run natively first. On Wayland, if the native run fails
+# This script is a launcher for 'main.py', assuming 'main.py'
+# is located in the SAME directory as this script.
+#
+# It attempts to run the application natively first. If the native run fails
 # (returns a non-zero exit code), it automatically retries using the
-# XCB compatibility layer (XWayland).
+# XCB compatibility layer (XWayland fallback).
 #
 # Additionally:
 # - The script sanitizes LD_LIBRARY_PATH to remove /usr/local/fsl entries,
 #   which can cause crashes when conflicting FSL-shipped libraries are loaded
 #   instead of the system or environment-provided Qt libraries.
 #
+
+set -uo pipefail
 
 # --- Determine the script's own directory ---
 SCRIPT_DIR=$(cd "$(dirname "$(readlink -f "$0" || echo "$0")")" &> /dev/null && pwd)
@@ -20,10 +23,9 @@ if [[ -z "$SCRIPT_DIR" ]]; then
   exit 1
 fi
 
-# --- Construct the expected path to main.py ---
-EXPECTED_MAIN_PY="$SCRIPT_DIR/main.py"
-TRACTEDIT_MAIN_PY="$EXPECTED_MAIN_PY"
+# --- Define Application Paths ---
 TRACTEDIT_DIR="$SCRIPT_DIR"
+TRACTEDIT_MAIN_PY="$SCRIPT_DIR/main.py"
 
 # --- Check if main.py exists ---
 if [[ ! -f "$TRACTEDIT_MAIN_PY" ]]; then
@@ -33,7 +35,7 @@ if [[ ! -f "$TRACTEDIT_MAIN_PY" ]]; then
 fi
 
 # --- Sanitize LD_LIBRARY_PATH to avoid FSL conflicts ---
-if [[ -n "$LD_LIBRARY_PATH" ]]; then
+if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
   CLEAN_LD=$(echo "$LD_LIBRARY_PATH" | tr ':' '\n' | grep -v '/usr/local/fsl' | paste -sd ':' -)
   if [[ "$CLEAN_LD" != "$LD_LIBRARY_PATH" ]]; then
     echo "INFO: Stripping /usr/local/fsl entries from LD_LIBRARY_PATH to prevent Qt conflicts." >&2
@@ -41,37 +43,22 @@ if [[ -n "$LD_LIBRARY_PATH" ]]; then
   fi
 fi
 
-# --- Execution Variables ---
-EXIT_CODE=0
-
-# --- Automatic Detection and Fallback Logic ---
-IS_WAYLAND=false
-if [[ "$XDG_SESSION_TYPE" == "wayland" ]]; then
-  IS_WAYLAND=true
-  echo "INFO: Wayland session detected. Will attempt native execution first." >&2
-else
-  echo "INFO: Non-Wayland session detected ($XDG_SESSION_TYPE). Attempting native execution." >&2
-fi
-
 # --- Attempt 1: Run Natively ---
 echo "INFO: Attempt 1: Running TractEdit natively from: $TRACTEDIT_MAIN_PY" >&2
 (cd "$TRACTEDIT_DIR" && python3 "$TRACTEDIT_MAIN_PY" "$@")
 EXIT_CODE=$?
 
-# --- Attempt 2 (Fallback): Only if native failed AND we are on Wayland ---
-if [[ $EXIT_CODE -ne 0 && "$IS_WAYLAND" == true ]]; then
+# --- Attempt 2 (Fallback): Only if native execution failed ---
+if [[ $EXIT_CODE -ne 0 ]]; then
   echo "WARN: Native execution failed with code $EXIT_CODE." >&2
-  echo "INFO: Attempt 2: Retrying with XCB platform plugin (Wayland fallback)..." >&2
-  echo "INFO: Running TractEdit from: $TRACTEDIT_MAIN_PY with XCB fallback" >&2
+  echo "INFO: Attempt 2: Retrying with XCB platform plugin (fallback)..." >&2
   (cd "$TRACTEDIT_DIR" && env QT_QPA_PLATFORM=xcb python3 "$TRACTEDIT_MAIN_PY" "$@")
   EXIT_CODE=$?
-elif [[ $EXIT_CODE -ne 0 ]]; then
-  echo "ERROR: TractEdit execution failed with code $EXIT_CODE. No XCB fallback attempted (not on Wayland)." >&2
 fi
 
 # --- Final Exit ---
 if [[ $EXIT_CODE -eq 0 ]]; then
-    echo "INFO: TractEdit finished successfully (final exit code $EXIT_CODE)." >&2
+    echo "INFO: TractEdit finished successfully." >&2
 else
     echo "ERROR: TractEdit finished with errors (final exit code $EXIT_CODE)." >&2
 fi
