@@ -42,7 +42,7 @@ class MainWindow(QMainWindow):
         self.original_trk_header = None # Header dict from loaded file
         self.original_trk_affine = None # Affine matrix (affine_to_rasmm)
         self.original_trk_path = None # Full path
-        self.original_file_extension = None # '.trk' or '.tck' or None
+        self.original_file_extension = None # '.trk', '.tck', '.trx', or None
         self.scalar_data_per_point = None # Dictionary: {scalar_name: [scalar_array_sl0, ...]}
         self.active_scalar_name = None # Key for the currently active scalar
         self.selected_streamline_indices = set() # Indices of selected streamlines
@@ -79,11 +79,11 @@ class MainWindow(QMainWindow):
         """Creates QAction objects used in menus and potentially toolbars."""
 
         # --- File Actions ---
-        self.load_file_action = QAction("&Load trk/tck...", self)
-        self.load_file_action.setStatusTip("Load a trk or tck streamline file")
+        self.load_file_action = QAction("&Load trk/tck/trx...", self)
+        self.load_file_action.setStatusTip("Load a trk, tck or trx streamline file")
         self.load_file_action.triggered.connect(self._trigger_load_streamlines)
 
-        # --- Load Anatomical Image Action --- NEW ---
+        # --- Load Anatomical Image Action ---
         self.load_bg_image_action = QAction("Load &Image...", self)
         self.load_bg_image_action.setStatusTip("Load a NIfTI image (.nii, .nii.gz) as background")
         self.load_bg_image_action.triggered.connect(self._trigger_load_anatomical_image)
@@ -94,7 +94,7 @@ class MainWindow(QMainWindow):
         self.close_bundle_action.triggered.connect(self._close_bundle)
         self.close_bundle_action.setEnabled(False)
 
-        # --- Clear Anatomical Image Action --- NEW ---
+        # --- Clear Anatomical Image Action ---
         self.clear_bg_image_action = QAction("Clear Anatomical Image", self)
         self.clear_bg_image_action.setStatusTip("Remove the background anatomical image")
         self.clear_bg_image_action.triggered.connect(self._trigger_clear_anatomical_image)
@@ -102,7 +102,7 @@ class MainWindow(QMainWindow):
 
 
         self.save_file_action = QAction("&Save As...", self)
-        self.save_file_action.setStatusTip("Save the modified streamlines to a trk or tck file")
+        self.save_file_action.setStatusTip("Save the modified streamlines to a trk, tck or trx file")
         self.save_file_action.triggered.connect(self._trigger_save_streamlines)
         self.save_file_action.setEnabled(False)
 
@@ -197,7 +197,7 @@ class MainWindow(QMainWindow):
         """Creates the main menu bar and populates it with actions."""
         main_bar = self.menuBar()
 
-        # --- File Menu --- (MODIFIED)
+        # --- File Menu --- 
         file_menu = main_bar.addMenu("&File")
         file_menu.addAction(self.load_file_action)      # Load streamlines
         file_menu.addAction(self.load_bg_image_action)  # Load image (Moved here)
@@ -216,7 +216,7 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(self.undo_action)
         edit_menu.addAction(self.redo_action)
 
-        # --- View Menu --- (MODIFIED)
+        # --- View Menu ---
         view_menu = main_bar.addMenu("&View")
         color_menu = view_menu.addMenu("Streamline Color")
         color_menu.addAction(self.color_default_action)
@@ -407,7 +407,7 @@ class MainWindow(QMainWindow):
         # --- Handle scalar data (Placeholder - needs proper filtering) ---
         new_scalar_data = None
         if self.scalar_data_per_point:
-             # Basic check: if lengths match, assume indices align (simplistic)
+            # Basic check: if lengths match, assume indices align 
             lengths_ok = True
             for k, v in self.scalar_data_per_point.items():
                 if len(v) != len(self.streamlines_list):
@@ -495,7 +495,6 @@ class MainWindow(QMainWindow):
                 self.vtk_panel.update_status("No bundle open to close.")
             return
 
-        # print("Closing bundle (also clears image)...") # Keep print for now? User requested removal... removing.
         if self.vtk_panel:
             self.vtk_panel.update_status("Closing bundle (also clears image)...") # Status is okay
             QApplication.processEvents()
@@ -639,7 +638,6 @@ class MainWindow(QMainWindow):
 
     def _cleanup_vtk(self):
         """Safely cleans up VTK resources."""
-        # print("Cleaning up VTK...") # Removed print
         if hasattr(self, 'vtk_panel') and self.vtk_panel:
             if hasattr(self.vtk_panel, 'scene') and self.vtk_panel.scene:
                  try:

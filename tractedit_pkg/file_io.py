@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Functions for loading and saving streamline files (trk, tck)
+Functions for loading and saving streamline files (trk, tck, trx)
 and loading anatomical image files (NIfTI).
 """
 
@@ -10,9 +10,8 @@ import traceback
 import ast
 import numpy as np
 import nibabel as nib
+import trx.trx_file_memmap as tbx
 from PyQt6.QtWidgets import QFileDialog, QMessageBox, QApplication
-
-# --- Local Imports ---
 from .utils import ColorMode
 
 # --- Helper Function ---
@@ -35,15 +34,15 @@ def parse_numeric_tuple_from_string(value_str, target_type=float, expected_lengt
                     if converted_array.shape != expected_length:
                         return value_str
                 elif expected_length is not None: # For 1D array/tuple lengths
-                     if converted_array.ndim == 1 and len(converted_array) != expected_length:
-                         return value_str
-                     elif converted_array.ndim != 1 : # Or if not 1D when expected_length is int
-                         return value_str
+                        if converted_array.ndim == 1 and len(converted_array) != expected_length:
+                            return value_str
+                        elif converted_array.ndim != 1 : # Or if not 1D when expected_length is int
+                            return value_str
                 return converted_array
             except (ValueError, TypeError):
-                 return value_str # Return original on type conversion error for ndarray
+                return value_str # Return original on type conversion error for ndarray
         else: # Not a string, list, tuple, or ndarray
-             return value_str
+            return value_str
 
     # --- If input is a string, proceed with parsing ---
     try:
@@ -51,19 +50,19 @@ def parse_numeric_tuple_from_string(value_str, target_type=float, expected_lengt
         if isinstance(parsed_val, (list, tuple)):
             result = tuple(target_type(x) for x in parsed_val)
             if expected_length is not None and len(result) != expected_length:
-                 # print(f"Warning: Parsed tuple {result} from '{value_str}' has length {len(result)}, expected {expected_length}.")
-                 return value_str # Return original string if length mismatch
+                # print(f"Warning: Parsed tuple {result} from '{value_str}' has length {len(result)}, expected {expected_length}.")
+                return value_str # Return original string if length mismatch
             return result
-        elif isinstance(parsed_val, (int, float)): # e.g. value_str was "1.0"
-             result_scalar = target_type(parsed_val)
-             # If expected_length is 1, wrap in a tuple
-             if expected_length == 1:
-                 return (result_scalar,)
-             # If expected_length is None (e.g. for a single scalar not in a tuple), return scalar
-             elif expected_length is None: 
-                 return result_scalar
-             else: # Mismatch if expected_length is other than 1 or None for a single number
-                 return value_str 
+        elif isinstance(parsed_val, (int, float)): 
+            result_scalar = target_type(parsed_val)
+            # If expected_length is 1, wrap in a tuple
+            if expected_length == 1:
+                return (result_scalar,)
+            # If expected_length is None (e.g. for a single scalar not in a tuple), return scalar
+            elif expected_length is None: 
+                return result_scalar
+            else: # Mismatch if expected_length is other than 1 or None for a single number
+                return value_str 
     except (ValueError, SyntaxError, TypeError): # ast.literal_eval failed or target_type(x) failed
         # Fallback: try splitting the string
         cleaned_str = value_str.strip('()[] ') # Added space to strip
@@ -76,8 +75,8 @@ def parse_numeric_tuple_from_string(value_str, target_type=float, expected_lengt
         try:
             result = tuple(target_type(p) for p in parts)
             if expected_length is not None and len(result) != expected_length:
-                 # print(f"Warning: Parsed tuple {result} from splitting '{value_str}' has length {len(result)}, expected {expected_length}.")
-                 return value_str # Return original string if length mismatch
+                # print(f"Warning: Parsed tuple {result} from splitting '{value_str}' has length {len(result)}, expected {expected_length}.")
+                return value_str # Return original string if length mismatch
             return result
         except (ValueError, TypeError): # target_type(p) failed
             # print(f"Warning: Could not parse '{value_str}' as a tuple of {target_type} after splitting.")
@@ -85,10 +84,9 @@ def parse_numeric_tuple_from_string(value_str, target_type=float, expected_lengt
     # Fallback if ast.literal_eval results in an unexpected type or other issues
     return value_str
 
-
-# --- Helper Function for Scalar Loading ---
-def _load_scalar_data(trk_file):
-    """Attempts to load scalar data from the tractogram file object."""
+# --- Helper Function for Scalar Loading (Only for Nibabel objects) ---
+def _load_scalar_data_from_nibabel(trk_file):
+    """Attempts to load scalar data from the nibabel tractogram file object."""
     scalar_data = None
     active_scalar = None
     if hasattr(trk_file.tractogram, 'data_per_point') and trk_file.tractogram.data_per_point:
@@ -190,7 +188,7 @@ def load_anatomical_image(main_window):
         if image_data.ndim < 3:
             raise ValueError(f"Loaded image has only {image_data.ndim} dimensions, expected 3 or more.")
         if image_affine.shape != (4, 4):
-             raise ValueError(f"Loaded image affine has shape {image_affine.shape}, expected (4, 4).")
+                raise ValueError(f"Loaded image affine has shape {image_affine.shape}, expected (4, 4).")
 
         status_updater(f"Successfully loaded anatomical image: {os.path.basename(input_path)}")
         return image_data, image_affine, input_path
@@ -218,7 +216,7 @@ def load_anatomical_image(main_window):
 # --- Streamline File I/O Functions ---
 def load_streamlines_file(main_window):
     """
-    Loads a trk or tck file using nibabel.streamlines.load.
+    Loads a trk, tck, or trx file.
     Updates the MainWindow state, including scalar data if present.
 
     Args:
@@ -229,14 +227,16 @@ def load_streamlines_file(main_window):
         QMessageBox.critical(main_window, "Error", "VTK Scene not initialized.")
         return
 
-    file_filter = "Streamline Files (*.trk *.tck);;TrackVis Files (*.trk);;TCK Files (*.tck);;All Files (*.*)"
+    base_filter = "Streamline Files (*.trk *.tck *.trx)"
+    all_filters = f"{base_filter};;TrackVis Files (*.trk);;TCK Files (*.tck);;TRX Files (*.trx);;All Files (*.*)"
+    
     start_dir = ""
     if main_window.original_trk_path:
         start_dir = os.path.dirname(main_window.original_trk_path)
     elif main_window.anatomical_image_path:
         start_dir = os.path.dirname(main_window.anatomical_image_path)
 
-    input_path, _ = QFileDialog.getOpenFileName(main_window, "Select Input Streamline File", start_dir, file_filter)
+    input_path, _ = QFileDialog.getOpenFileName(main_window, "Select Input Streamline File", start_dir, all_filters)
 
     if not input_path:
         status_updater = getattr(main_window.vtk_panel, 'update_status', lambda msg: print(f"Status: {msg}"))
@@ -252,9 +252,81 @@ def load_streamlines_file(main_window):
     QApplication.processEvents()
 
     try:
-        # --- Load File ---
-        trk_file = nib.streamlines.load(input_path, lazy_load=False)
-        loaded_streamlines = list(trk_file.streamlines)
+        _, ext = os.path.splitext(input_path)
+        ext = ext.lower()
+
+        loaded_streamlines = []
+        loaded_header = {}
+        loaded_affine = np.identity(4)
+        scalar_data = None
+        active_scalar = None
+
+        if ext in ['.trk', '.tck']:
+            # --- Load File using Nibabel ---
+            trk_file = nib.streamlines.load(input_path, lazy_load=False)
+            loaded_streamlines = list(trk_file.streamlines)
+            loaded_header = trk_file.header.copy() if hasattr(trk_file, 'header') else {}
+
+            # Load Affine from Nibabel object
+            if hasattr(trk_file, 'tractogram') and hasattr(trk_file.tractogram, 'affine_to_rasmm'):
+                nib_affine = trk_file.tractogram.affine_to_rasmm
+                if isinstance(nib_affine, np.ndarray) and nib_affine.shape == (4, 4):
+                    loaded_affine = nib_affine
+                else:
+                    print(f"Warning: loaded affine_to_rasmm is not a valid 4x4 numpy array (type: {type(nib_affine)}). Using identity affine.")
+            else:
+                print("Warning: affine_to_rasmm not found in loaded file object. Using identity affine.")
+            
+            # --- Load Scalar Data using helper ---
+            scalar_data, active_scalar = _load_scalar_data_from_nibabel(trk_file)
+
+        elif ext == '.trx':
+            
+            # --- Load File using trx-python ---
+            trx_obj = tbx.load(input_path)
+            loaded_streamlines = list(trx_obj.streamlines) # Get streamlines
+            loaded_header = trx_obj.header.copy() # Get header
+            
+            # Load Affine from TRX object
+            if hasattr(trx_obj, 'affine_to_rasmm'):
+                trx_affine = trx_obj.affine_to_rasmm
+                if isinstance(trx_affine, np.ndarray) and trx_affine.shape == (4, 4):
+                    loaded_affine = trx_affine
+                else:
+                    print(f"Warning: TRX affine_to_rasmm is not a valid 4x4 numpy array (type: {type(trx_affine)}). Using identity affine.")
+            else:
+                print("Warning: affine_to_rasmm not found in loaded TRX file. Using identity affine.")
+
+            # --- Load Scalar Data (inlined logic from _load_scalar_data) ---
+            if hasattr(trx_obj, 'data_per_point') and trx_obj.data_per_point:
+                print("Scalar data found in file (data_per_point).")
+                try:
+                    loaded_scalars_dict = trx_obj.data_per_point.copy()
+                    if loaded_scalars_dict:
+                        processed_scalars = {}
+                        for key, value_list in loaded_scalars_dict.items():
+                            # trx-python data_per_point is already a list of arrays
+                            processed_scalars[key] = [np.asarray(arr) for arr in value_list] 
+                        
+                        scalar_data = processed_scalars
+                        active_scalar = list(loaded_scalars_dict.keys())[0]
+                        print(f"Assigned scalars. Active scalar: '{active_scalar}'")
+                    else:
+                        print("Scalar data dictionary (data_per_point) is empty.")
+                except Exception as scalar_e:
+                    print(f"Warning: Could not process scalar data: {scalar_e}\n{traceback.format_exc()}")
+                    scalar_data = None
+                    active_scalar = None
+            else:
+                print("No scalar data found in file (data_per_point).")
+            
+            # trx-python objects (especially memmap) might need closing
+            if hasattr(trx_obj, 'close'):
+                trx_obj.close()
+
+        else:
+            raise ValueError(f"Unsupported file extension: '{ext}'. Only .trk, .tck, and .trx are supported.")
+
 
         # --- Guard Clause: Check if streamlines were loaded ---
         if not loaded_streamlines:
@@ -280,27 +352,15 @@ def load_streamlines_file(main_window):
                 main_window.vtk_panel.update_highlight() # Clears highlight actor
                 main_window.vtk_panel.update_radius_actor(visible=False) # Hides selection sphere
                 if main_window.vtk_panel.render_window:
-                     main_window.vtk_panel.render_window.Render()
+                        main_window.vtk_panel.render_window.Render()
             return
 
         # --- Assign Core Data to MainWindow ---
         main_window.streamlines_list = loaded_streamlines
-        main_window.original_trk_header = trk_file.header.copy() if hasattr(trk_file, 'header') else {}
-
-        # Load Affine
-        main_window.original_trk_affine = np.identity(4)
-        if hasattr(trk_file, 'tractogram') and hasattr(trk_file.tractogram, 'affine_to_rasmm'):
-            loaded_affine = trk_file.tractogram.affine_to_rasmm
-            if isinstance(loaded_affine, np.ndarray) and loaded_affine.shape == (4, 4):
-                main_window.original_trk_affine = loaded_affine
-            else:
-                print(f"Warning: loaded affine_to_rasmm is not a valid 4x4 numpy array (type: {type(loaded_affine)}). Using identity affine.")
-        else:
-            print("Warning: affine_to_rasmm not found in loaded file object. Using identity affine.")
-
+        main_window.original_trk_header = loaded_header
+        main_window.original_trk_affine = loaded_affine
         main_window.original_trk_path = input_path
-        _, ext = os.path.splitext(input_path)
-        main_window.original_file_extension = ext.lower()
+        main_window.original_file_extension = ext 
 
         # Reset state variables specific to streamlines
         main_window.selected_streamline_indices = set()
@@ -308,8 +368,9 @@ def load_streamlines_file(main_window):
         main_window.redo_stack = []
         main_window.current_color_mode = ColorMode.DEFAULT
 
-        # --- Load Scalar Data ---
-        main_window.scalar_data_per_point, main_window.active_scalar_name = _load_scalar_data(trk_file)
+        # --- Assign Scalar Data ---
+        main_window.scalar_data_per_point = scalar_data
+        main_window.active_scalar_name = active_scalar
 
         # --- Update VTK and UI ---
         status_msg = f"Loaded {len(main_window.streamlines_list)} streamlines from {os.path.basename(input_path)}"
@@ -353,8 +414,8 @@ def load_streamlines_file(main_window):
             main_window.redo_stack = []
             main_window.current_color_mode = ColorMode.DEFAULT
             if main_window.vtk_panel:
-                 main_window.vtk_panel.update_main_streamlines_actor()
-                 main_window.vtk_panel.update_highlight()
+                main_window.vtk_panel.update_main_streamlines_actor()
+                main_window.vtk_panel.update_highlight()
             main_window._update_bundle_info_display()
             main_window._update_action_states()
         except Exception as cleanup_e:
@@ -374,7 +435,8 @@ def _validate_save_prerequisites(main_window):
     if main_window.original_trk_header is None:
         print("Warning: Original streamline header info missing. Saving with minimal header.")
         main_window.original_trk_header = {} # Ensure it's a dict
-    if main_window.original_file_extension not in ['.trk', '.tck']:
+    
+    if main_window.original_file_extension not in ['.trk', '.tck', '.trx']:
         print(f"Save Error: Cannot determine original format ('{main_window.original_file_extension}').")
         QMessageBox.critical(main_window, "Save Error", f"Cannot determine original format ('{main_window.original_file_extension}').")
         return False
@@ -392,8 +454,13 @@ def _get_save_path_and_extension(main_window):
         file_filter = "TrackVis TRK Files (*.trk)"
     elif required_ext == '.tck':
         file_filter = "TCK Files (*.tck)"
+    elif required_ext == '.trx':
+        file_filter = "TRX Files (*.trx)"
     else:
+        # Fallback or error if extension is invalid or TRX not supported
+        QMessageBox.critical(main_window, "Save Error", f"Cannot save: Unknown original format '{required_ext}'.")
         return None, None # Should have been caught by _validate_save_prerequisites
+    
     all_filters = f"{file_filter};;All Files (*.*)"
 
     output_path, _ = QFileDialog.getSaveFileName(
@@ -415,11 +482,10 @@ def _get_save_path_and_extension(main_window):
         if output_ext_from_dialog == "": # No extension was provided
             print(f"Save Info: Appended required extension '{required_ext}'. New path: {output_path}")
         else: # A different extension was provided
-             QMessageBox.warning(main_window, "Save Format Corrected",
+            QMessageBox.warning(main_window, "Save Format Corrected",
                                 f"File extension was corrected from '{output_ext_from_dialog}' to the required '{required_ext}'.\n"
                                 f"Saving as: {os.path.basename(output_path)}")
-             print(f"Save Info: Corrected extension from '{output_ext_from_dialog}' to '{required_ext}'. Path changed from '{old_output_path}' to '{output_path}'.")
-    # output_ext is now implicitly required_ext
+            print(f"Save Info: Corrected extension from '{output_ext_from_dialog}' to '{required_ext}'. Path changed from '{old_output_path}' to '{output_path}'.")
     return output_path, required_ext
 
 def _prepare_tractogram_and_affine(main_window):
@@ -433,13 +499,21 @@ def _prepare_tractogram_and_affine(main_window):
 
     # Handle potential scalar data
     data_per_point_to_save = {}
-    if main_window.scalar_data_per_point and main_window.active_scalar_name:
-        active_scalar_list = main_window.scalar_data_per_point.get(main_window.active_scalar_name, [])
-        if len(active_scalar_list) == len(tractogram_data):
+    if main_window.scalar_data_per_point:
+        # Check if scalar data is still valid for the current streamlines
+        all_lengths_match = True
+        for key, scalar_list in main_window.scalar_data_per_point.items():
+            if len(scalar_list) != len(tractogram_data):
+                print(f"Warning: Scalar '{key}' length ({len(scalar_list)}) mismatch with streamlines ({len(tractogram_data)}).")
+                all_lengths_match = False
+                break
+        
+        if all_lengths_match:
             data_per_point_to_save = main_window.scalar_data_per_point
         else:
             print("Warning: Scalar data length mismatch. Saving without scalar data.")
-
+    
+    # Use Nibabel's Tractogram object as a generic container
     new_tractogram = nib.streamlines.Tractogram(
         tractogram_data,
         data_per_point=data_per_point_to_save if data_per_point_to_save else None,
@@ -463,9 +537,9 @@ def _prepare_trk_header(base_header, nb_streamlines, anatomical_img_affine=None)
     if isinstance(raw_voxel_order_from_trk, bytes):
         try:
             processed_voxel_order_from_trk = raw_voxel_order_from_trk.decode('utf-8', errors='strict')
-            print(f"    - Info: Decoded 'voxel_order' (bytes: {raw_voxel_order_from_trk}) to string: '{processed_voxel_order_from_trk}'")
+            print(f"      - Info: Decoded 'voxel_order' (bytes: {raw_voxel_order_from_trk}) to string: '{processed_voxel_order_from_trk}'")
         except UnicodeDecodeError:
-            print(f"    - Warning: 'voxel_order' field in TRK header (bytes: {raw_voxel_order_from_trk}) could not be decoded. Treating as invalid.")
+            print(f"      - Warning: 'voxel_order' field in TRK header (bytes: {raw_voxel_order_from_trk}) could not be decoded. Treating as invalid.")
     elif isinstance(raw_voxel_order_from_trk, str):
         processed_voxel_order_from_trk = raw_voxel_order_from_trk
 
@@ -473,12 +547,12 @@ def _prepare_trk_header(base_header, nb_streamlines, anatomical_img_affine=None)
 
     if is_valid_trk_voxel_order:
         header['voxel_order'] = processed_voxel_order_from_trk.upper()
-        print(f"    - Info: Using existing 'voxel_order' from TRK header: {header['voxel_order']}.")
+        print(f"      - Info: Using existing 'voxel_order' from TRK header: {header['voxel_order']}.")
     else:
         if raw_voxel_order_from_trk is not None:
-            print(f"    - Warning: 'voxel_order' from TRK header ('{raw_voxel_order_from_trk}') is invalid or in an unexpected format.")
+            print(f"      - Warning: 'voxel_order' from TRK header ('{raw_voxel_order_from_trk}') is invalid or in an unexpected format.")
         else:
-            print(f"    - Info: 'voxel_order' missing in TRK header.")
+            print(f"      - Info: 'voxel_order' missing in TRK header.")
 
         derived_from_anat = False
         if anatomical_img_affine is not None and \
@@ -490,21 +564,21 @@ def _prepare_trk_header(base_header, nb_streamlines, anatomical_img_affine=None)
                 if len(derived_vo_str) == 3:
                     header['voxel_order'] = derived_vo_str
                     derived_from_anat = True
-                    print(f"    - Info: Derived 'voxel_order' from loaded anatomical image: {header['voxel_order']}.")
+                    print(f"      - Info: Derived 'voxel_order' from loaded anatomical image: {header['voxel_order']}.")
                 else:
-                    print(f"    - Warning: Could not derive a valid 3-character 'voxel_order' from anatomical image affine (got: '{derived_vo_str}').")
+                    print(f"      - Warning: Could not derive a valid 3-character 'voxel_order' from anatomical image affine (got: '{derived_vo_str}').")
             except Exception as e:
-                print(f"    - Warning: Error deriving 'voxel_order' from anatomical image affine: {e}.")
+                print(f"      - Warning: Error deriving 'voxel_order' from anatomical image affine: {e}.")
 
         if not derived_from_anat:
             header['voxel_order'] = 'RAS'
             # Contextual print for defaulting voxel_order
             if raw_voxel_order_from_trk is None and anatomical_img_affine is None:
-                print(f"    - Info: 'voxel_order' missing, no anatomical image. Defaulting to 'RAS'.")
+                print(f"      - Info: 'voxel_order' missing, no anatomical image. Defaulting to 'RAS'.")
             elif not is_valid_trk_voxel_order and anatomical_img_affine is None:
-                print(f"    - Info: Original 'voxel_order' invalid/missing, no anatomical image. Defaulting to 'RAS'.")
+                print(f"      - Info: Original 'voxel_order' invalid/missing, no anatomical image. Defaulting to 'RAS'.")
             else: # Covers cases where derivation from anat failed or anat_img_affine was invalid
-                print(f"    - Info: Could not use original or derive 'voxel_order' from anatomical image. Defaulting to 'RAS'.")
+                print(f"      - Info: Could not use original or derive 'voxel_order' from anatomical image. Defaulting to 'RAS'.")
 
     # --- Process other specific TRK header fields ---
     keys_to_process = {
@@ -523,11 +597,10 @@ def _prepare_trk_header(base_header, nb_streamlines, anatomical_img_affine=None)
         if isinstance(processed_value, bytes):
             try:
                 processed_value = processed_value.decode('utf-8', errors='strict')
-                # print(f"    - Info: Decoded byte string for '{key}': {original_value} -> '{processed_value}'")
             except UnicodeDecodeError:
-                print(f"    - Warning: Could not decode bytes for '{key}'. Original value: {original_value}")
+                print(f"      - Warning: Could not decode bytes for '{key}'. Original value: {original_value}")
                 header[key] = K_props['default']
-                print(f"    - Info: Set '{key}' to default: {header[key]}")
+                print(f"      - Info: Set '{key}' to default: {header[key]}")
                 continue 
 
         # 2. Parse if string, or use if already suitable type
@@ -542,7 +615,7 @@ def _prepare_trk_header(base_header, nb_streamlines, anatomical_img_affine=None)
                 processed_value = parsed_val # Successfully parsed
             else:
                 # Parsing failed
-                print(f"    - Info: Could not parse string '{processed_value}' for '{key}'.")
+                print(f"      - Info: Could not parse string '{processed_value}' for '{key}'.")
         
         # 3. Validate and set
         valid_structure = False
@@ -561,14 +634,13 @@ def _prepare_trk_header(base_header, nb_streamlines, anatomical_img_affine=None)
                     final_value = tuple(processed_value.astype(expected_item_type))
                     valid_structure = True
         except (ValueError, TypeError) as e: # Catch errors from type conversion (e.g., int('abc'))
-            print(f"    - Warning: Type conversion error for '{key}' (value: '{processed_value}'): {e}")
+            print(f"      - Warning: Type conversion error for '{key}' (value: '{processed_value}'): {e}")
             valid_structure = False 
 
         if valid_structure:
             header[key] = final_value
-            # print(f"    - Info: Successfully processed '{key}'. Value: {header[key]}")
         else:
-            print(f"    - Warning: '{key}' ('{original_value}') was invalid, missing, or failed processing. Defaulted to {K_props['default']}.")
+            print(f"      - Warning: '{key}' ('{original_value}') was invalid, missing, or failed processing. Defaulted to {K_props['default']}.")
             header[key] = K_props['default']
 
     header['nb_streamlines'] = nb_streamlines
@@ -592,25 +664,52 @@ def _prepare_tck_header(base_header, nb_streamlines):
             header[key] = str(header[key])
     return header
 
+def _prepare_trx_header(base_header, nb_streamlines):
+    """Prepares the header dictionary for TRX saving."""
+    header = base_header.copy() if base_header is not None else {}
+    header['nb_streamlines'] = nb_streamlines
+    
+    # Clean up fields from other formats if they exist
+    header.pop('count', None) # TCK specific
+    
+    return header
+
 def _save_tractogram_file(tractogram, header, output_path, file_ext):
-    """Saves the tractogram using nibabel based on the extension."""
+    """
+    Saves the tractogram using nibabel or trx-python based on the extension.
+    'tractogram' is a nib.streamlines.Tractogram object.
+    """
     if file_ext == '.trk':
         trk_file = nib.streamlines.TrkFile(tractogram, header=header)
         nib.streamlines.save(trk_file, output_path)
         print("File saved successfully (TRK)")
         return f"File saved successfully (TRK): {os.path.basename(output_path)}"
+    
     elif file_ext == '.tck':
         tck_file = nib.streamlines.TckFile(tractogram, header=header)
         nib.streamlines.save(tck_file, output_path)
         print("File saved successfully (TCK)")
         return f"File saved successfully (TCK): {os.path.basename(output_path)}"
+    
+    elif file_ext == '.trx':        
+        # 1. 'tractogram' is our nib.streamlines.Tractogram object.
+        #    'header' is our prepared header.
+        trx_obj_to_save = tbx.TrxFile.from_lazy_tractogram(
+            tractogram, header
+        )
+        
+        # 2. Save the newly created object using tbx.save()
+        tbx.save(trx_obj_to_save, output_path)
+        print("File saved successfully (TRX)")
+        return f"File saved successfully (TRX): {os.path.basename(output_path)}"
+    
     else:
         raise ValueError(f"Unsupported save extension: {file_ext}")
 
 # --- Main Save Function ---
 def save_streamlines_file(main_window):
     """
-    Saves the current streamlines to a trk or tck file (refactored).
+    Saves the current streamlines to a trk, tck, or trx file.
     """
     status_updater = getattr(main_window.vtk_panel, 'update_status', lambda msg: print(f"Status: {msg}"))
 
@@ -631,7 +730,6 @@ def save_streamlines_file(main_window):
     try:
         tractogram = _prepare_tractogram_and_affine(main_window)
 
-        # --- 4. Prepare Header ---
         header_to_save = {}
         if output_ext == '.trk':
             header_to_save = _prepare_trk_header(
@@ -640,8 +738,13 @@ def save_streamlines_file(main_window):
                 anatomical_img_affine=main_window.anatomical_image_affine
             )
         elif output_ext == '.tck':
-            header_to_save = _prepare_tck_header(main_window.original_trk_header, len(tractogram.streamlines))
-
+            header_to_save = _prepare_tck_header(
+                main_window.original_trk_header, len(tractogram.streamlines))
+        
+        elif output_ext == '.trx':
+            header_to_save = _prepare_trx_header(
+                main_window.original_trk_header, len(tractogram.streamlines))
+            
         # --- 5. Save File ---
         success_msg = _save_tractogram_file(tractogram, header_to_save, output_path, output_ext)
         status_updater(success_msg)
