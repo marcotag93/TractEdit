@@ -134,8 +134,8 @@ def _update_vtk_and_ui_after_load(main_window, status_msg):
         print(f"Status: {status_msg}")
 
     # Ensure radio button reflects default state if no scalars loaded
-    if hasattr(main_window, 'color_default_action') and not main_window.active_scalar_name:
-        main_window.color_default_action.setChecked(True)
+    if hasattr(main_window, 'color_orientation_action'):
+        main_window.color_orientation_action.setChecked(True)
 
     main_window._update_action_states()
     main_window._update_bundle_info_display()
@@ -343,7 +343,7 @@ def load_streamlines_file(main_window):
             main_window.selected_streamline_indices = set()
             main_window.undo_stack = []
             main_window.redo_stack = []
-            main_window.current_color_mode = ColorMode.DEFAULT
+            main_window.current_color_mode = ColorMode.ORIENTATION
             # Trigger UI updates
             main_window._update_bundle_info_display()
             main_window._update_action_states()
@@ -366,7 +366,7 @@ def load_streamlines_file(main_window):
         main_window.selected_streamline_indices = set()
         main_window.undo_stack = []
         main_window.redo_stack = []
-        main_window.current_color_mode = ColorMode.DEFAULT
+        main_window.current_color_mode = ColorMode.ORIENTATION
 
         # --- Assign Scalar Data ---
         main_window.scalar_data_per_point = scalar_data
@@ -412,7 +412,7 @@ def load_streamlines_file(main_window):
             main_window.selected_streamline_indices = set()
             main_window.undo_stack = []
             main_window.redo_stack = []
-            main_window.current_color_mode = ColorMode.DEFAULT
+            main_window.current_color_mode = ColorMode.ORIENTATION 
             if main_window.vtk_panel:
                 main_window.vtk_panel.update_main_streamlines_actor()
                 main_window.vtk_panel.update_highlight()

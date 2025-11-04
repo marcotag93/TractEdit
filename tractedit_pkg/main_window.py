@@ -134,10 +134,10 @@ class MainWindow(QMainWindow):
         self.coloring_action_group = QActionGroup(self)
         self.coloring_action_group.setExclusive(True)
 
-        self.color_default_action = QAction("Default Color", self)
-        self.color_default_action.setStatusTip("Color streamlines with default gray")
+        self.color_default_action = QAction("&Greyscale Color", self)
+        self.color_default_action.setStatusTip("Color streamlines with greyscale")
         self.color_default_action.setCheckable(True)
-        self.color_default_action.setChecked(True) # Default mode
+        self.color_default_action.setChecked(False) 
         self.color_default_action.triggered.connect(lambda: self._set_color_mode(ColorMode.DEFAULT))
         self.coloring_action_group.addAction(self.color_default_action)
         self.color_default_action.setEnabled(False)
@@ -145,6 +145,7 @@ class MainWindow(QMainWindow):
         self.color_orientation_action = QAction("Color by Orientation", self)
         self.color_orientation_action.setStatusTip("Color streamlines by local orientation (RGB)")
         self.color_orientation_action.setCheckable(True)
+        self.color_orientation_action.setChecked(True) # Default selection
         self.color_orientation_action.triggered.connect(lambda: self._set_color_mode(ColorMode.ORIENTATION))
         self.coloring_action_group.addAction(self.color_orientation_action)
         self.color_orientation_action.setEnabled(False)
@@ -521,7 +522,7 @@ class MainWindow(QMainWindow):
         self.active_scalar_name = None
         self.undo_stack = []
         self.redo_stack = []
-        self.current_color_mode = ColorMode.DEFAULT
+        self.current_color_mode = ColorMode.ORIENTATION
         self.color_default_action.setChecked(True)
 
         # Update VTK (remove main streamline actor)
