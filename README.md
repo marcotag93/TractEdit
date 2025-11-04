@@ -1,6 +1,6 @@
 # TractEdit
 
-A Python-based graphical interface for interactively **viewing**, **selecting**, and **editing** tractography bundles in `.trk` and `.tck` formats.
+A Python-based graphical interface for interactively **viewing**, **selecting**, and **editing** tractography bundles in `.trk`, `.tck` and `.trx` formats.
 
 
 
@@ -25,7 +25,7 @@ Center for Mind/Brain Sciences (CIMeC), University of Trento Italy
 
 ## Key Features
 
-- **Load & Save** streamline bundles (`.trk`, `.tck`)
+- **Load & Save** streamline bundles (`.trk`, `.tck`, `.trx`)
 - **Anatomical Image:** Load NIfTI images (`.nii`, `.nii.gz`) as backgrounds for anatomical context.
 - **3D Visualization** with [VTK](https://vtk.org/) and [FURY](https://fury.gl/)
     - Default gray, orientation (RGB), or scalar-based coloring
@@ -58,6 +58,7 @@ cd tractedit
 - [Nibabel](https://nipy.org/nibabel/)
 - NumPy
 - pytz
+- [trx-python](https://pypi.org/project/trx-python/)
   
 Recommend a virtual environment:
 ```bash
@@ -77,7 +78,7 @@ QT_QPA_PLATFORM=xcb python3 main.py
 ```
 
 ### 4. Load Sample Data (Optional)
-Explore `sample_data/` to test TractEdit with example `.trk` or `.tck` files.
+Explore `sample_data/` to test TractEdit with example `.trk`, `.tck` or `.trx` files.
 
 ---
 
@@ -117,7 +118,7 @@ Use **pre-built executable** Tractedit.exe (no Python setup required).
 
 ## Sample Workflow
 
-1. Open a `.trk` or `.tck` file via **File → Open**
+1. Open a `.trk`, `.tck` or `.trx` file via **File → Open**
 2. Use the mouse and `S` key to select streamlines
 3. Press `D` to delete, or `C` to clear selection
 4. Change streamline color in **View → Streamline Color**
