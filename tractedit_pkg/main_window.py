@@ -61,7 +61,7 @@ class MainWindow(QMainWindow):
         self.current_color_mode = ColorMode.DEFAULT
 
         # --- Window Properties ---
-        self.setWindowTitle("Tractedit GUI (PyQt6) - Interactive trk/tck Editor")
+        self.setWindowTitle("TractEdit GUI (PyQt6) - Interactive trk/tck/trx Editor")
         self.setGeometry(100, 100, 1100, 850)
 
         # --- Setup UI Components ---
@@ -664,7 +664,7 @@ class MainWindow(QMainWindow):
         """Displays the About tractedit information box."""
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle("About tractedit")
-        about_text = """<b>TractEdit version 1.1.0</b><br><br>
+        about_text = """<b>TractEdit version 1.2.0</b><br><br>
         Author: Marco Tagliaferri, PhD Candidate in Neuroscience<br>
         Center for Mind/Brain Sciences (CIMeC)
         University of Trento, Italy
