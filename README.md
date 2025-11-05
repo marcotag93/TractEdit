@@ -28,7 +28,7 @@ Center for Mind/Brain Sciences (CIMeC), University of Trento Italy
 - **Load & Save** streamline bundles (`.trk`, `.tck`, `.trx`)
 - **Anatomical Image:** Load NIfTI images (`.nii`, `.nii.gz`) as backgrounds for anatomical context.
 - **3D Visualization** with [VTK](https://vtk.org/) and [FURY](https://fury.gl/)
-    - Default gray, orientation (RGB), or scalar-based coloring
+    - Default orientation-based coloring (RGB), scalar-based coloring or greyscale
 - **Interactive Editing Tools:**
     - Sphere-based streamline selection (with adjustable radius)
     - Streamline deletion and undo/redo support
