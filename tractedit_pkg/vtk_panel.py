@@ -12,8 +12,6 @@ import traceback
 from PyQt6.QtWidgets import QVBoxLayout, QMessageBox, QApplication, QFileDialog
 from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 from fury import window, actor, colormap, ui
-
-# --- Local Imports ---
 from .utils import ColorMode
 
 class VTKPanel:
@@ -164,7 +162,6 @@ class VTKPanel:
         self.scene.add(self.radius_actor)
         self.current_radius_actor_radius = radius
         self.radius_actor.SetVisibility(0)
-
 
     def _update_existing_radius_actor(self, center_point, radius, visible):
         """Updates properties of the existing VTK sphere actor."""
@@ -390,54 +387,94 @@ class VTKPanel:
         # Update UI action states
         if self.main_window: self.main_window._update_action_states()
 
-
-    def _calculate_scalar_colors(self, streamlines, scalar_array_list):
-        """Calculates vertex colors based on a list of scalar arrays per streamline."""
+    # --- Function signature updated ---
+    def _calculate_scalar_colors(self, streamlines, scalar_array_list, vmin, vmax):
+        """
+        Calculates vertex colors based on a list of scalar arrays per streamline,
+        using the provided vmin and vmax for the colormap range.
+        Returns a single concatenated (TotalPoints, 3) numpy array for FURY.
+        """
         if not scalar_array_list or not streamlines: 
             return None
         if len(scalar_array_list) != len(streamlines): 
             return None
 
+        # --- 1. Get valid scalar arrays and map them to streamlines ---
         all_scalars_flat, valid_indices = [], []
-        for i, sl_scalars in enumerate(scalar_array_list):
-            if sl_scalars is not None and hasattr(sl_scalars, 'size') and sl_scalars.size > 0 and len(sl_scalars) == len(streamlines[i]):
-                all_scalars_flat.append(sl_scalars)
-                valid_indices.append(i)
-
-        if not all_scalars_flat: 
-            return None
-        concatenated_scalars = np.concatenate(all_scalars_flat)
-        if not concatenated_scalars.size > 0: 
-            return None
-
-        scalar_min, scalar_max = np.min(concatenated_scalars), np.max(concatenated_scalars)
-        lut = vtk.vtkLookupTable()
-        table_min = scalar_min - 0.5 if scalar_min == scalar_max else scalar_min
-        table_max = scalar_max + 0.5 if scalar_min == scalar_max else scalar_max
-        lut.SetTableRange(table_min, table_max)
-        lut.SetHueRange(0.667, 0.0)
-        lut.Build()
-
-        default_color_rgba = np.array([128, 128, 128, 255], dtype=np.uint8)
-        vertex_colors = []
+        streamlines_have_scalars = True
+        try:
+            for i, sl_scalars in enumerate(scalar_array_list):
+                if sl_scalars is not None and hasattr(sl_scalars, 'size') and len(sl_scalars) == len(streamlines[i]):
+                    all_scalars_flat.append(sl_scalars) # Keep valid scalar arrays
+                    valid_indices.append(i) # Keep index of streamline it belongs to
+        except Exception as e:
+            print(f"Warning: Error validating scalar data: {e}")
+            streamlines_have_scalars = False
+        
+        if not all_scalars_flat:
+             print("Warning: No valid, length-matching scalar data found for coloring.")
+             streamlines_have_scalars = False
+        
+        # --- 2. Create the LUT ---
+        if streamlines_have_scalars:
+            try:
+                concatenated_scalars = np.concatenate(all_scalars_flat)
+                if not concatenated_scalars.size > 0: 
+                    streamlines_have_scalars = False # All valid scalar arrays were empty
+                else:
+                    # Use the user-defined vmin and vmax for the table range
+                    lut = vtk.vtkLookupTable()
+                    table_min = vmin - 0.5 if vmin == vmax else vmin
+                    table_max = vmax + 0.5 if vmin == vmax else vmax
+                    
+                    lut.SetTableRange(table_min, table_max)
+                    lut.SetHueRange(0.667, 0.0) # Blue to Red (standard)
+                    lut.Build()
+            except Exception as e:
+                print(f"Error creating scalar LUT: {e}. Defaulting to grey.")
+                streamlines_have_scalars = False
+        
+        # --- 3. Build the list of color arrays (one per *non-empty* streamline) ---
+        default_color_rgb = np.array([128, 128, 128], dtype=np.uint8)
+        vertex_colors_list = [] # List to hold individual np.arrays
         rgb_output = [0.0, 0.0, 0.0]
-        scalar_idx = 0
+        scalar_idx_counter = 0 # To iterate through all_scalars_flat
+
         for i, sl in enumerate(streamlines):
             num_points = len(sl)
-            if i in valid_indices:
-                sl_scalars = all_scalars_flat[scalar_idx]
-                sl_colors_rgba = np.empty((num_points, 4), dtype=np.uint8)
-                for j in range(num_points):
-                    lut.GetColor(sl_scalars[j], rgb_output)
-                    sl_colors_rgba[j, 0:3] = [int(c * 255) for c in rgb_output]
-                    sl_colors_rgba[j, 3] = 255
-                vertex_colors.append(sl_colors_rgba)
-                scalar_idx += 1
-            else:
-                vertex_colors.append(np.array([default_color_rgba] * num_points, dtype=np.uint8))
+            if num_points == 0: # Skip empty streamlines
+                continue
+                
+            sl_colors_rgb = np.empty((num_points, 3), dtype=np.uint8)
+            
+            # Check if this (non-empty) streamline has valid scalar data
+            has_valid_scalar_for_this_sl = False
+            if streamlines_have_scalars and i in valid_indices:
+                if scalar_idx_counter < len(valid_indices) and valid_indices[scalar_idx_counter] == i:
+                    sl_scalars = all_scalars_flat[scalar_idx_counter]
+                    if len(sl_scalars) == num_points:
+                        for j in range(num_points):
+                            lut.GetColor(sl_scalars[j], rgb_output)
+                            sl_colors_rgb[j] = [int(c * 255) for c in rgb_output]
+                        has_valid_scalar_for_this_sl = True
+                    scalar_idx_counter += 1 
 
-        return {'colors': vertex_colors, 'opacity': 1.0, 'linewidth': 3}
+            if not has_valid_scalar_for_this_sl:
+                sl_colors_rgb[:] = default_color_rgb # Fill with default color
+            
+            vertex_colors_list.append(sl_colors_rgb)
 
+        if not vertex_colors_list: 
+            return None 
+
+        # --- 4. Concatenate all color arrays into one big array ---
+        try:
+            concatenated_colors = np.concatenate(vertex_colors_list, axis=0)
+        except ValueError as ve:
+             print(f"CRITICAL: Failed to concatenate color arrays: {ve}")
+             return None # Fallback to grey
+
+        return {'colors': concatenated_colors, 'opacity': 0.8, 'linewidth': 3}
 
     def _get_streamline_actor_params(self):
         """Determines parameters for the main streamlines actor."""
@@ -459,11 +496,14 @@ class VTKPanel:
             if scalar_data and active_scalar and active_scalar in scalar_data:
                 scalar_array_list = scalar_data.get(active_scalar)
                 if scalar_array_list:
-                    scalar_params = self._calculate_scalar_colors(streamlines, scalar_array_list)
+                    vmin = self.main_window.scalar_min_val
+                    vmax = self.main_window.scalar_max_val
+                    scalar_params = self._calculate_scalar_colors(streamlines, scalar_array_list, vmin, vmax)
                     if scalar_params: params = scalar_params
 
         return params
-
+                     
+            
     def update_main_streamlines_actor(self):
         """Recreates the main streamlines actor based on current data and color mode."""
         if not self.scene: 
@@ -483,11 +523,17 @@ class VTKPanel:
             self.update_highlight()
             return
 
-        streamlines = self.main_window.streamlines_list
-        actor_params = self._get_streamline_actor_params()
+        # Get original data
+        original_streamlines = self.main_window.streamlines_list
+        actor_params = self._get_streamline_actor_params() # This returns a single color array
+        streamlines_to_draw = [sl for sl in original_streamlines if sl is not None and len(sl) > 0]
+        
+        if not streamlines_to_draw: 
+             self.update_highlight()
+             return
 
         try:
-            self.streamlines_actor = actor.line(streamlines, **actor_params) # Use dictionary unpacking
+            self.streamlines_actor = actor.line(streamlines_to_draw, **actor_params) 
             self.scene.add(self.streamlines_actor)
         except Exception as e:
             print(f"Error creating main streamlines actor: {e}\n{traceback.format_exc()}")
@@ -497,8 +543,12 @@ class VTKPanel:
                     try: self.scene.rm(self.streamlines_actor)
                     except: 
                         pass
-                self.streamlines_actor = actor.line(streamlines, colors=(0.8, 0.8, 0.8), opacity=0.5, linewidth=2)
-                self.scene.add(self.streamlines_actor)
+                # Fallback: draw the filtered streamlines in grey
+                fallback_streamlines = [sl for sl in original_streamlines if sl is not None and len(sl) > 0]
+                if fallback_streamlines:
+                    self.streamlines_actor = actor.line(fallback_streamlines, colors=(0.8, 0.8, 0.8), opacity=0.5, linewidth=2)
+                    self.scene.add(self.streamlines_actor)
+                
                 if self.main_window:
                      self.main_window.current_color_mode = ColorMode.DEFAULT
                      self.main_window.color_default_action.setChecked(True)

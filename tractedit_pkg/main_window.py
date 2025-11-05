@@ -13,19 +13,24 @@ import numpy as np
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QMenuBar, QFileDialog,
-    QMessageBox, QLabel, QStatusBar, QApplication
+    QMessageBox, QLabel, QStatusBar, QApplication,
+    QToolBar, QDoubleSpinBox, 
+    QSlider, 
+    QHBoxLayout, QSpacerItem, QSizePolicy
 )
 from PyQt6.QtGui import QAction, QKeySequence, QActionGroup, QIcon
 from PyQt6.QtCore import Qt, pyqtSlot
 
-# --- Local Imports ---
-from . import file_io # For loading/saving functions
+from . import file_io 
 from .utils import (
     ColorMode, get_formatted_datetime, get_asset_path, format_tuple,
     MAX_STACK_LEVELS, DEFAULT_SELECTION_RADIUS, MIN_SELECTION_RADIUS,
     RADIUS_INCREMENT
 )
 from .vtk_panel import VTKPanel
+
+# --- Constant for slider precision ---
+SLIDER_PRECISION = 1000 # Use 1000 steps for the slider
 
 # --- Main GUI class ---
 class MainWindow(QMainWindow):
@@ -53,12 +58,24 @@ class MainWindow(QMainWindow):
         self.anatomical_image_data = None # Numpy array
         self.anatomical_image_affine = None # 4x4 numpy array
 
-        # Undo/Redo Stacks (only for streamline deletions)
+        # Undo/Redo Stacks
         self.undo_stack = []
         self.redo_stack = []
 
         # View State
         self.current_color_mode = ColorMode.DEFAULT
+
+        # --- Scalar Range Variables ---
+        self.scalar_min_val = 0.0           # Current min value for the colormap
+        self.scalar_max_val = 1.0           # Current max value for the colormap
+        self.scalar_data_min = 0.0          # Actual min value in the loaded data
+        self.scalar_data_max = 1.0          # Actual max value in the loaded data
+        self.scalar_range_initialized = False # Flag to check if range has been calculated
+        self.scalar_toolbar = None          
+        self.scalar_min_spinbox = None
+        self.scalar_max_spinbox = None
+        self.scalar_min_slider = None
+        self.scalar_max_slider = None
 
         # --- Window Properties ---
         self.setWindowTitle("TractEdit GUI (PyQt6) - Interactive trk/tck/trx Editor")
@@ -67,6 +84,7 @@ class MainWindow(QMainWindow):
         # --- Setup UI Components ---
         self._create_actions()
         self._create_menus()
+        self._create_scalar_toolbar() 
         self._setup_status_bar()
         self._setup_central_widget() # This creates the VTKPanel
 
@@ -157,7 +175,6 @@ class MainWindow(QMainWindow):
         self.coloring_action_group.addAction(self.color_scalar_action)
         self.color_scalar_action.setEnabled(False)
 
-
         # --- Command Actions ---
         self.clear_select_action = QAction("&Clear Selection", self)
         self.clear_select_action.setStatusTip("Clear the current streamline selection (C)")
@@ -201,10 +218,10 @@ class MainWindow(QMainWindow):
         # --- File Menu --- 
         file_menu = main_bar.addMenu("&File")
         file_menu.addAction(self.load_file_action)      # Load streamlines
-        file_menu.addAction(self.load_bg_image_action)  # Load image (Moved here)
+        file_menu.addAction(self.load_bg_image_action)  # Load image
         file_menu.addSeparator()
         file_menu.addAction(self.close_bundle_action)   # Close streamlines (also clears image)
-        file_menu.addAction(self.clear_bg_image_action) # Clear image (Moved here)
+        file_menu.addAction(self.clear_bg_image_action) # Clear image 
         file_menu.addSeparator()
         file_menu.addAction(self.save_file_action)      # Save streamlines
         file_menu.addSeparator()
@@ -223,7 +240,6 @@ class MainWindow(QMainWindow):
         color_menu.addAction(self.color_default_action)
         color_menu.addAction(self.color_orientation_action)
         color_menu.addAction(self.color_scalar_action)
-        # Background image actions moved to File menu
 
         # --- Commands Menu ---
         commands_menu = main_bar.addMenu("&Commands")
@@ -238,6 +254,77 @@ class MainWindow(QMainWindow):
         # --- Help Menu ---
         help_menu = main_bar.addMenu("&Help")
         help_menu.addAction(self.about_action)
+
+    # --- Scalar Toolbar ---
+    def _create_scalar_toolbar(self):
+        """Creates the toolbar for scalar range adjustment with sliders."""
+        self.scalar_toolbar = QToolBar("Scalar Range", self)
+        self.scalar_toolbar.setObjectName("ScalarToolbar") # For identification
+
+        # --- Spinboxes for precise input/display ---
+        self.scalar_min_spinbox = QDoubleSpinBox(self)
+        self.scalar_min_spinbox.setDecimals(3)
+        self.scalar_min_spinbox.setSingleStep(0.1)
+        self.scalar_min_spinbox.setRange(-1e9, 1e9)
+        self.scalar_min_spinbox.setToolTip("Min scalar value")
+
+        self.scalar_max_spinbox = QDoubleSpinBox(self)
+        self.scalar_max_spinbox.setDecimals(3)
+        self.scalar_max_spinbox.setSingleStep(0.1)
+        self.scalar_max_spinbox.setRange(-1e9, 1e9)
+        self.scalar_max_spinbox.setToolTip("Max scalar value")
+        
+        # --- Sliders for interactive dragging ---
+        self.scalar_min_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self.scalar_min_slider.setRange(0, SLIDER_PRECISION)
+        self.scalar_min_slider.setToolTip("Drag to adjust min scalar value")
+        
+        self.scalar_max_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self.scalar_max_slider.setRange(0, SLIDER_PRECISION)
+        self.scalar_max_slider.setValue(SLIDER_PRECISION)
+        self.scalar_max_slider.setToolTip("Drag to adjust max scalar value")
+        
+        # --- Reset Button ---
+        self.scalar_reset_button = QAction("Reset", self)
+        self.scalar_reset_button.setStatusTip("Reset scalar range to data min/max")
+        
+        # --- Layout ---
+        toolbar_widget = QWidget(self)
+        layout = QHBoxLayout(toolbar_widget)
+        layout.setContentsMargins(5, 0, 5, 0) # Tweak spacing
+        
+        layout.addWidget(QLabel(" Min: "))
+        layout.addWidget(self.scalar_min_spinbox, 1)
+        layout.addWidget(self.scalar_min_slider, 3)
+        
+        layout.addSpacerItem(QSpacerItem(10, 0, QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Ignored))
+        
+        layout.addWidget(QLabel(" Max: "))
+        layout.addWidget(self.scalar_max_spinbox, 1)
+        layout.addWidget(self.scalar_max_slider, 3)
+
+        self.scalar_toolbar.addWidget(toolbar_widget)
+        self.scalar_toolbar.addSeparator()
+        self.scalar_toolbar.addAction(self.scalar_reset_button)
+
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self.scalar_toolbar)
+        self.scalar_toolbar.setVisible(False) # Hide by default
+
+        # --- Connect Signals ---
+        # Sliders update spinbox on valueChanged (fast, no VTK)
+        self.scalar_min_slider.valueChanged.connect(self._slider_value_changed)
+        self.scalar_max_slider.valueChanged.connect(self._slider_value_changed)
+        
+        # Sliders update VTK on sliderReleased (slow, final update)
+        self.scalar_min_slider.sliderReleased.connect(self._trigger_vtk_update)
+        self.scalar_max_slider.sliderReleased.connect(self._trigger_vtk_update)
+        
+        # Spinboxes update slider and VTK on editingFinished (Enter pressed)
+        self.scalar_min_spinbox.editingFinished.connect(self._spinbox_value_changed)
+        self.scalar_max_spinbox.editingFinished.connect(self._spinbox_value_changed)
+        
+        # Reset button
+        self.scalar_reset_button.triggered.connect(self._reset_scalar_range)
 
     def _setup_status_bar(self):
         """Creates and configures the status bar with a permanent widget for bundle/image info."""
@@ -292,7 +379,7 @@ class MainWindow(QMainWindow):
         bundle_text = "Bundle: None"
         image_text = "Image: None"
 
-        # Streamline Info (same as before)
+        # Streamline Info
         if self.streamlines_list:
             count = len(self.streamlines_list)
             filename = os.path.basename(self.original_trk_path) if self.original_trk_path else "Unknown"
@@ -307,7 +394,7 @@ class MainWindow(QMainWindow):
                      dims_str = format_tuple(dims_val, precision=0)
             if 'voxel_sizes' in header:
                  vox_val = header['voxel_sizes']
-                 if isinstance(vox_val, (tuple, list, np.ndarray)) and len(vox_val) == 3:
+                 if isinstance(vox_val, (tuple, list, np.ndarray)) and len(dims_val) == 3:
                      vox_str = format_tuple(vox_val, precision=2)
             if 'voxel_order' in header and isinstance(header['voxel_order'], str):
                  order = header['voxel_order']
@@ -315,13 +402,13 @@ class MainWindow(QMainWindow):
             bundle_text = (f"Bundle: {filename}{file_type_info} | #: {count} | Dim={dims_str} | "
                            f"VoxSize={vox_str} | Order={order}{scalar_info}")
 
-        # Anatomical Image Info (same as before)
+        # Anatomical Image Info
         if self.anatomical_image_data is not None:
             filename = os.path.basename(self.anatomical_image_path) if self.anatomical_image_path else "Unknown"
             shape_str = format_tuple(self.anatomical_image_data.shape, precision=0)
             image_text = f"Image: {filename} | Shape={shape_str}"
 
-        # Combine and Set (same as before)
+        # Combine and Set
         separator = " || " if self.streamlines_list and self.anatomical_image_data is not None else " | "
         if not self.streamlines_list and not self.anatomical_image_data:
             final_text = " No data loaded "
@@ -334,16 +421,21 @@ class MainWindow(QMainWindow):
         self.data_info_label.setText(final_text)
 
 
-    # --- Undo/Redo Core Logic ---
+    # --- Undo/Redo Core Logic ---             
     def _perform_undo(self):
         """Performs the Undo operation (currently only for streamline deletions)."""
         if self.undo_stack:
-            current_state = {'streamlines': list(self.streamlines_list)}
+            current_state = {
+                'streamlines': list(self.streamlines_list),
+                'scalars': self.scalar_data_per_point
+            }
             self.redo_stack.append(current_state)
             if len(self.redo_stack) > MAX_STACK_LEVELS: self.redo_stack.pop(0)
 
+            # Restore previous (pre-delete) state from Undo
             previous_state = self.undo_stack.pop()
             self.streamlines_list = previous_state['streamlines']
+            self.scalar_data_per_point = previous_state.get('scalars') # Use .get for safety
             self.selected_streamline_indices = set()
 
             if self.vtk_panel:
@@ -354,16 +446,21 @@ class MainWindow(QMainWindow):
             self._update_action_states()
         elif self.vtk_panel:
              self.vtk_panel.update_status("Nothing to undo.")
-
+            
     def _perform_redo(self):
         """Performs the Redo operation (currently only for streamline deletions)."""
         if self.redo_stack:
-            current_state = {'streamlines': list(self.streamlines_list)}
+            current_state = {
+                'streamlines': list(self.streamlines_list),
+                'scalars': self.scalar_data_per_point
+            }
             self.undo_stack.append(current_state)
             if len(self.undo_stack) > MAX_STACK_LEVELS: self.undo_stack.pop(0)
 
+            # Restore next (deleted) state from Redo
             next_state = self.redo_stack.pop()
             self.streamlines_list = next_state['streamlines']
+            self.scalar_data_per_point = next_state.get('scalars') # Use .get for safety
             self.selected_streamline_indices = set()
 
             if self.vtk_panel:
@@ -397,7 +494,10 @@ class MainWindow(QMainWindow):
         if self.vtk_panel: self.vtk_panel.update_radius_actor(visible=False)
 
         num_to_delete = len(self.selected_streamline_indices)
-        undo_state = {'streamlines': list(self.streamlines_list)}
+        undo_state = {
+            'streamlines': list(self.streamlines_list),
+            'scalars': self.scalar_data_per_point # Save the *current* scalar data
+        }
         self.undo_stack.append(undo_state)
         if len(self.undo_stack) > MAX_STACK_LEVELS: self.undo_stack.pop(0)
         self.redo_stack = []
@@ -405,7 +505,7 @@ class MainWindow(QMainWindow):
         indices_to_delete = self.selected_streamline_indices
         new_streamlines_list = [sl for i, sl in enumerate(self.streamlines_list) if i not in indices_to_delete]
 
-        # --- Handle scalar data (Placeholder - needs proper filtering) ---
+        # --- Handle scalar data ---
         new_scalar_data = None
         if self.scalar_data_per_point:
             # Basic check: if lengths match, assume indices align 
@@ -418,7 +518,6 @@ class MainWindow(QMainWindow):
                 new_scalar_data = {}
                 for key, scalar_list in self.scalar_data_per_point.items():
                      new_scalar_data[key] = [s for i, s in enumerate(scalar_list) if i not in indices_to_delete]
-                print("Filtered scalar data (basic).")
             else:
                  print("Warning: Scalar data lengths inconsistent. Cannot filter scalars reliably during deletion.")
                  new_scalar_data = self.scalar_data_per_point 
@@ -473,17 +572,35 @@ class MainWindow(QMainWindow):
              self.color_default_action.setChecked(True)
              return
 
+        # --- Handle scalar toolbar visibility ---
         if self.current_color_mode != mode:
-            if mode == ColorMode.SCALAR and not self.active_scalar_name:
-                QMessageBox.warning(self, "Coloring Error", "No active scalar data loaded for streamlines.")
-                if self.current_color_mode == ColorMode.DEFAULT: self.color_default_action.setChecked(True)
-                elif self.current_color_mode == ColorMode.ORIENTATION: self.color_orientation_action.setChecked(True)
-                return
+            if mode == ColorMode.SCALAR:
+                if not self.active_scalar_name:
+                    QMessageBox.warning(self, "Coloring Error", "No active scalar data loaded for streamlines.")
+                    if self.current_color_mode == ColorMode.DEFAULT: self.color_default_action.setChecked(True)
+                    elif self.current_color_mode == ColorMode.ORIENTATION: self.color_orientation_action.setChecked(True)
+                    return
+                
+                # Calculate range in scalar mode
+                if not self.scalar_range_initialized:
+                    self._update_scalar_data_range() 
+                    self.scalar_range_initialized = True
+                
+                if self.scalar_toolbar: self.scalar_toolbar.setVisible(True)
+
+            elif mode == ColorMode.DEFAULT or mode == ColorMode.ORIENTATION:
+                if self.scalar_toolbar: self.scalar_toolbar.setVisible(False)
 
             self.current_color_mode = mode
             if self.vtk_panel:
                 self.vtk_panel.update_main_streamlines_actor()
                 self.vtk_panel.update_status(f"Streamline color mode changed to {mode.name}.")
+        
+        # Ensure toolbar visibility is correct in any case
+        if self.scalar_toolbar:
+             is_scalar = (mode == ColorMode.SCALAR and bool(self.active_scalar_name))
+             self.scalar_toolbar.setVisible(is_scalar)
+
 
     # --- GUI Action Methods ---
     def _close_bundle(self):
@@ -497,7 +614,7 @@ class MainWindow(QMainWindow):
             return
 
         if self.vtk_panel:
-            self.vtk_panel.update_status("Closing bundle (also clears image)...") # Status is okay
+            self.vtk_panel.update_status("Closing bundle (also clears image)...") 
             QApplication.processEvents()
 
             # Remove/hide streamline-related actors
@@ -524,8 +641,10 @@ class MainWindow(QMainWindow):
         self.redo_stack = []
         self.current_color_mode = ColorMode.ORIENTATION
         self.color_default_action.setChecked(True)
+        self.scalar_range_initialized = False
+        if self.scalar_toolbar: self.scalar_toolbar.setVisible(False)
 
-        # Update VTK (remove main streamline actor)
+        # Update VTK
         if self.vtk_panel:
             self.vtk_panel.update_main_streamlines_actor() # Should remove streamline actor
             self.vtk_panel.update_status("Bundle closed (Image also cleared).") # Keep status clear
@@ -539,7 +658,16 @@ class MainWindow(QMainWindow):
     # --- Action Trigger Wrappers ---
     def _trigger_load_streamlines(self):
         """Wrapper to call the streamline load function from file_io."""
+        self.scalar_range_initialized = False
+        if self.scalar_toolbar: self.scalar_toolbar.setVisible(False)
+        
         file_io.load_streamlines_file(self)
+        
+        # --- Update scalar range if scalar mode is already active
+        if self.current_color_mode == ColorMode.SCALAR and self.active_scalar_name:
+             self._update_scalar_data_range()
+             self.scalar_range_initialized = True
+             if self.scalar_toolbar: self.scalar_toolbar.setVisible(True)
 
     def _trigger_save_streamlines(self):
         """Wrapper to call the streamline save function from file_io."""
@@ -618,6 +746,184 @@ class MainWindow(QMainWindow):
         self._update_bundle_info_display()
         self._update_action_states()
 
+    # --- Helper functions for float <-> int mapping ---
+    def _float_to_int_slider(self, float_val):
+        """Maps a float value from the data range to the slider's integer range."""
+        data_min = self.scalar_data_min
+        data_max = self.scalar_data_max
+        
+        if (data_max - data_min) == 0:
+            return 0 
+            
+        # Clamp value to be within the data range
+        float_val = max(data_min, min(data_max, float_val))
+            
+        percent = (float_val - data_min) / (data_max - data_min)
+        return int(round(percent * SLIDER_PRECISION))
+        
+    def _int_slider_to_float(self, slider_val):
+        """Maps an integer slider value back to the float data range."""
+        data_min = self.scalar_data_min
+        data_max = self.scalar_data_max
+        
+        if (data_max - data_min) == 0:
+            return data_min
+            
+        percent = float(slider_val) / SLIDER_PRECISION
+        return data_min + percent * (data_max - data_min)
+
+    def _update_scalar_data_range(self):
+        """Calculates the min/max range from the active scalar data."""
+        if not self.active_scalar_name or not self.scalar_data_per_point:
+            print("Scalar range: No active scalar data to calculate range from.")
+            return
+
+        scalar_list = self.scalar_data_per_point.get(self.active_scalar_name)
+        if not scalar_list:
+             print("Scalar range: Active scalar list is empty.")
+             return
+             
+        try:
+            valid_scalars = [s for s in scalar_list if s is not None and s.size > 0]
+            if not valid_scalars:
+                 print("Scalar range: No valid scalar arrays found.")
+                 return
+                 
+            all_scalars_flat = np.concatenate(valid_scalars)
+            if all_scalars_flat.size == 0:
+                print("Scalar range: Concatenated scalar data is empty.")
+                return
+
+            data_min_val = np.min(all_scalars_flat)
+            data_max_val = np.max(all_scalars_flat)
+
+            # Handle edge case where all data is the same value
+            if data_min_val == data_max_val:
+                self.scalar_data_min = data_min_val - 0.5
+                self.scalar_data_max = data_max_val + 0.5
+            else:
+                self.scalar_data_min = data_min_val
+                self.scalar_data_max = data_max_val
+
+            self.scalar_min_val = self.scalar_data_min
+            self.scalar_max_val = self.scalar_data_max
+
+            self._update_scalar_range_widgets() # This will update spinboxes and sliders
+
+        except Exception as e:
+            print(f"Error calculating scalar data range: {e}")
+            self.scalar_data_min = 0.0
+            self.scalar_data_max = 1.0
+            self.scalar_min_val = 0.0
+            self.scalar_max_val = 1.0
+            self._update_scalar_range_widgets()
+
+    def _update_scalar_range_widgets(self):
+        """Updates the spinbox and slider widgets with current range and values."""
+        if not self.scalar_min_spinbox or not self.scalar_max_spinbox:
+            return
+            
+        # Block signals to prevent feedback loops
+        self.scalar_min_spinbox.blockSignals(True)
+        self.scalar_max_spinbox.blockSignals(True)
+        self.scalar_min_slider.blockSignals(True)
+        self.scalar_max_slider.blockSignals(True)
+
+        # Set the allowed range for the spinboxes
+        self.scalar_min_spinbox.setRange(self.scalar_data_min, self.scalar_data_max)
+        self.scalar_max_spinbox.setRange(self.scalar_data_min, self.scalar_data_max)
+
+        # Set the current values
+        self.scalar_min_spinbox.setValue(self.scalar_min_val)
+        self.scalar_max_spinbox.setValue(self.scalar_max_val)
+        
+        # Set the slider values
+        self.scalar_min_slider.setValue(self._float_to_int_slider(self.scalar_min_val))
+        self.scalar_max_slider.setValue(self._float_to_int_slider(self.scalar_max_val))
+
+        # Unblock signals
+        self.scalar_min_spinbox.blockSignals(False)
+        self.scalar_max_spinbox.blockSignals(False)
+        self.scalar_min_slider.blockSignals(False)
+        self.scalar_max_slider.blockSignals(False)
+
+    def _slider_value_changed(self, slider_val):
+        """
+        Slot for when slider value changes.
+        Updates the corresponding spinbox, but does NOT trigger VTK update.
+        """
+        float_val = self._int_slider_to_float(slider_val)
+        
+        if self.sender() == self.scalar_min_slider:
+            self.scalar_min_val = float_val
+            self.scalar_min_spinbox.blockSignals(True)
+            self.scalar_min_spinbox.setValue(float_val)
+            self.scalar_min_spinbox.blockSignals(False)
+            # Ensure min slider doesn't cross max slider
+            if slider_val > self.scalar_max_slider.value():
+                self.scalar_max_slider.blockSignals(True)
+                self.scalar_max_slider.setValue(slider_val)
+                self.scalar_max_slider.blockSignals(False)
+                
+        elif self.sender() == self.scalar_max_slider:
+            self.scalar_max_val = float_val
+            self.scalar_max_spinbox.blockSignals(True)
+            self.scalar_max_spinbox.setValue(float_val)
+            self.scalar_max_spinbox.blockSignals(False)
+            # Ensure max slider doesn't cross min slider
+            if slider_val < self.scalar_min_slider.value():
+                self.scalar_min_slider.blockSignals(True)
+                self.scalar_min_slider.setValue(slider_val)
+                self.scalar_min_slider.blockSignals(False)
+
+    def _spinbox_value_changed(self):
+        """
+        Slot for when spinbox editing is finished.
+        Updates sliders and triggers VTK update.
+        """
+        min_val = self.scalar_min_spinbox.value()
+        max_val = self.scalar_max_spinbox.value()
+
+        # Ensure min <= max
+        if min_val > max_val:
+            if self.sender() == self.scalar_min_spinbox: max_val = min_val
+            else: min_val = max_val
+            
+        self.scalar_min_val = min_val
+        self.scalar_max_val = max_val
+        
+        self._update_scalar_range_widgets() # Resyncs both sliders and spinboxes
+        self._trigger_vtk_update() # Trigger the slow update
+        
+
+    def _reset_scalar_range(self):
+        """Slot to reset the scalar range to the data's full range."""
+        self.scalar_min_val = self.scalar_data_min
+        self.scalar_max_val = self.scalar_data_max
+        self._update_scalar_range_widgets()
+        self._trigger_vtk_update() # Manually trigger the changed signal to force a redraw
+        
+    def _trigger_vtk_update(self):
+        """
+        Validates range and triggers the (slow) VTK actor update.
+        Called on slider release or spinbox edit finished.
+        """
+        # --- Validation ---
+        min_val = self.scalar_min_val
+        max_val = self.scalar_max_val
+        
+        if min_val > max_val:
+            self.scalar_min_val = max_val
+            min_val = max_val
+        
+        # Update widgets one last time to be sure they are synced
+        self._update_scalar_range_widgets()
+        
+        # --- Trigger Update ---
+        if self.vtk_panel and self.current_color_mode == ColorMode.SCALAR:
+            self.vtk_panel.update_main_streamlines_actor()
+            self.vtk_panel.update_status(f"Scalar range set to: [{min_val:.3f}, {max_val:.3f}]")
+
     # --- Window Close Event ---
     def closeEvent(self, event):
         """Handles the main window close event, prompting if data is loaded."""
@@ -665,7 +971,7 @@ class MainWindow(QMainWindow):
         """Displays the About tractedit information box."""
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle("About tractedit")
-        about_text = """<b>TractEdit version 1.2.0</b><br><br>
+        about_text = """<b>TractEdit version 1.2.1</b><br><br>
         Author: Marco Tagliaferri, PhD Candidate in Neuroscience<br>
         Center for Mind/Brain Sciences (CIMeC)
         University of Trento, Italy

@@ -84,7 +84,7 @@ def parse_numeric_tuple_from_string(value_str, target_type=float, expected_lengt
     # Fallback if ast.literal_eval results in an unexpected type or other issues
     return value_str
 
-# --- Helper Function for Scalar Loading (Only for Nibabel objects) ---
+# --- Helper Function for Scalar Loading ---
 def _load_scalar_data_from_nibabel(trk_file):
     """Attempts to load scalar data from the nibabel tractogram file object."""
     scalar_data = None
@@ -92,7 +92,7 @@ def _load_scalar_data_from_nibabel(trk_file):
     if hasattr(trk_file.tractogram, 'data_per_point') and trk_file.tractogram.data_per_point:
         print("Scalar data found in file (data_per_point).")
         try:
-            loaded_scalars_dict = trk_file.tractogram.data_per_point.copy()
+            loaded_scalars_dict = dict(trk_file.tractogram.data_per_point)
             if loaded_scalars_dict:
                 processed_scalars = {}
                 for key, value_list in loaded_scalars_dict.items():
@@ -217,7 +217,7 @@ def load_anatomical_image(main_window):
 def load_streamlines_file(main_window):
     """
     Loads a trk, tck, or trx file.
-    Updates the MainWindow state, including scalar data if present.
+    Updates the MainWindow state.
 
     Args:
         main_window: The instance of the main application window.
@@ -301,7 +301,7 @@ def load_streamlines_file(main_window):
             if hasattr(trx_obj, 'data_per_point') and trx_obj.data_per_point:
                 print("Scalar data found in file (data_per_point).")
                 try:
-                    loaded_scalars_dict = trx_obj.data_per_point.copy()
+                    loaded_scalars_dict = dict(trx_obj.data_per_point)
                     if loaded_scalars_dict:
                         processed_scalars = {}
                         for key, value_list in loaded_scalars_dict.items():
@@ -320,7 +320,7 @@ def load_streamlines_file(main_window):
             else:
                 print("No scalar data found in file (data_per_point).")
             
-            # trx-python objects (especially memmap) might need closing
+            # trx-python objects closing
             if hasattr(trx_obj, 'close'):
                 trx_obj.close()
 
@@ -530,7 +530,7 @@ def _prepare_trk_header(base_header, nb_streamlines, anatomical_img_affine=None)
     header = base_header.copy()
     print("Preparing TRK header for saving...")
 
-    # --- Voxel Order Logic (Corrected) ---
+    # --- Voxel Order Logic ---
     raw_voxel_order_from_trk = header.get('voxel_order')
     processed_voxel_order_from_trk = None
 
@@ -633,7 +633,7 @@ def _prepare_trk_header(base_header, nb_streamlines, anatomical_img_affine=None)
                 elif isinstance(processed_value, np.ndarray) and processed_value.ndim == 1 and len(processed_value) == K_props['length']:
                     final_value = tuple(processed_value.astype(expected_item_type))
                     valid_structure = True
-        except (ValueError, TypeError) as e: # Catch errors from type conversion (e.g., int('abc'))
+        except (ValueError, TypeError) as e: # Catch errors from type conversion 
             print(f"      - Warning: Type conversion error for '{key}' (value: '{processed_value}'): {e}")
             valid_structure = False 
 
@@ -652,8 +652,7 @@ def _prepare_tck_header(base_header, nb_streamlines):
     """Prepares the header dictionary for TCK saving."""
     header = base_header.copy() if base_header is not None else {}
     header['count'] = str(nb_streamlines) 
-    header.pop('nb_streamlines', None) # Remove TRK specific field
-    # Ensure other common fields are strings if present
+    header.pop('nb_streamlines', None) 
     for key in ['voxel_order', 'dimensions', 'voxel_sizes']:
         if key in header:
             if isinstance(header[key], bytes):
@@ -669,7 +668,7 @@ def _prepare_trx_header(base_header, nb_streamlines):
     header = base_header.copy() if base_header is not None else {}
     header['nb_streamlines'] = nb_streamlines
     
-    # Clean up fields from other formats if they exist
+    # Clean up fields
     header.pop('count', None) # TCK specific
     
     return header
@@ -677,7 +676,6 @@ def _prepare_trx_header(base_header, nb_streamlines):
 def _save_tractogram_file(tractogram, header, output_path, file_ext):
     """
     Saves the tractogram using nibabel or trx-python based on the extension.
-    'tractogram' is a nib.streamlines.Tractogram object.
     """
     if file_ext == '.trk':
         trk_file = nib.streamlines.TrkFile(tractogram, header=header)
