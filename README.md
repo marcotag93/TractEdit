@@ -69,7 +69,7 @@ Recommend a virtual environment:
 ```bash
 python -m venv venv
 source venv/bin/activate 
-# Install the project and its dependencies:
+# Install the app and its dependencies:
 pip install .
 ```
 
