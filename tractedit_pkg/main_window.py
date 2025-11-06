@@ -10,6 +10,8 @@ file I/O, and the VTK panel.
 
 import os
 import numpy as np
+from typing import Optional, List, Set, Dict, Any
+import nibabel as nib
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QMenuBar, QFileDialog,
@@ -18,7 +20,7 @@ from PyQt6.QtWidgets import (
     QSlider, 
     QHBoxLayout, QSpacerItem, QSizePolicy
 )
-from PyQt6.QtGui import QAction, QKeySequence, QActionGroup, QIcon
+from PyQt6.QtGui import QAction, QKeySequence, QActionGroup, QIcon, QCloseEvent
 from PyQt6.QtCore import Qt, pyqtSlot
 
 from . import file_io 
@@ -39,43 +41,44 @@ class MainWindow(QMainWindow):
     Sets up the UI, manages application state (streamlines, selection, undo/redo),
     and delegates rendering/interaction to VTKPanel and file I/O to file_io.
     """
-    def __init__(self, parent=None):
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
 
         # --- Initialize Streamline Data Variables ---
-        self.streamlines_list = []
-        self.original_trk_header = None # Header dict from loaded file
-        self.original_trk_affine = None # Affine matrix (affine_to_rasmm)
-        self.original_trk_path = None # Full path
-        self.original_file_extension = None # '.trk', '.tck', '.trx', or None
-        self.scalar_data_per_point = None # Dictionary: {scalar_name: [scalar_array_sl0, ...]}
-        self.active_scalar_name = None # Key for the currently active scalar
-        self.selected_streamline_indices = set() # Indices of selected streamlines
-        self.selection_radius_3d = DEFAULT_SELECTION_RADIUS # Radius for sphere selection
+        self.tractogram_data: Optional['nib.streamlines.ArraySequence'] = None
+        self.visible_indices: Set[int] = set()
+        self.original_trk_header: Optional[Dict[str, Any]] = None # Header dict from loaded file
+        self.original_trk_affine: Optional[np.ndarray] = None # Affine matrix (affine_to_rasmm)
+        self.original_trk_path: Optional[str] = None # Full path
+        self.original_file_extension: Optional[str] = None # '.trk', '.tck', '.trx', or None
+        self.scalar_data_per_point: Optional[Dict[str, 'nib.streamlines.ArraySequence']] = None # Dictionary: {scalar_name: [scalar_array_sl0, ...]}
+        self.active_scalar_name: Optional[str] = None # Key for the currently active scalar
+        self.selected_streamline_indices: Set[int] = set() # Indices of selected streamlines
+        self.selection_radius_3d: float = DEFAULT_SELECTION_RADIUS # Radius for sphere selection
 
         # --- Initialize Anatomical Image Data Variables ---
-        self.anatomical_image_path = None
-        self.anatomical_image_data = None # Numpy array
-        self.anatomical_image_affine = None # 4x4 numpy array
+        self.anatomical_image_path: Optional[str] = None
+        self.anatomical_image_data: Optional[np.ndarray] = None # Numpy array
+        self.anatomical_image_affine: Optional[np.ndarray] = None # 4x4 numpy array
 
         # Undo/Redo Stacks
-        self.undo_stack = []
-        self.redo_stack = []
+        self.undo_stack: List[Set[int]] = []
+        self.redo_stack: List[Set[int]] = []
 
         # View State
-        self.current_color_mode = ColorMode.DEFAULT
+        self.current_color_mode: ColorMode = ColorMode.DEFAULT
 
         # --- Scalar Range Variables ---
-        self.scalar_min_val = 0.0           # Current min value for the colormap
-        self.scalar_max_val = 1.0           # Current max value for the colormap
-        self.scalar_data_min = 0.0          # Actual min value in the loaded data
-        self.scalar_data_max = 1.0          # Actual max value in the loaded data
-        self.scalar_range_initialized = False # Flag to check if range has been calculated
-        self.scalar_toolbar = None          
-        self.scalar_min_spinbox = None
-        self.scalar_max_spinbox = None
-        self.scalar_min_slider = None
-        self.scalar_max_slider = None
+        self.scalar_min_val: float = 0.0           # Current min value for the colormap
+        self.scalar_max_val: float = 1.0           # Current max value for the colormap
+        self.scalar_data_min: float = 0.0          # Actual min value in the loaded data
+        self.scalar_data_max: float = 1.0          # Actual max value in the loaded data
+        self.scalar_range_initialized: bool = False # Flag to check if range has been calculated
+        self.scalar_toolbar: Optional[QToolBar] = None          
+        self.scalar_min_spinbox: Optional[QDoubleSpinBox] = None
+        self.scalar_max_spinbox: Optional[QDoubleSpinBox] = None
+        self.scalar_min_slider: Optional[QSlider] = None
+        self.scalar_max_slider: Optional[QSlider] = None
 
         # --- Window Properties ---
         self.setWindowTitle("TractEdit GUI (PyQt6) - Interactive trk/tck/trx Editor")
@@ -93,66 +96,66 @@ class MainWindow(QMainWindow):
         self._update_action_states()
         self._update_bundle_info_display()
 
-    def _create_actions(self):
+    def _create_actions(self) -> None:
         """Creates QAction objects used in menus and potentially toolbars."""
 
         # --- File Actions ---
-        self.load_file_action = QAction("&Load trk/tck/trx...", self)
+        self.load_file_action: QAction = QAction("&Load trk/tck/trx...", self)
         self.load_file_action.setStatusTip("Load a trk, tck or trx streamline file")
         self.load_file_action.triggered.connect(self._trigger_load_streamlines)
 
         # --- Load Anatomical Image Action ---
-        self.load_bg_image_action = QAction("Load &Image...", self)
+        self.load_bg_image_action: QAction = QAction("Load &Image...", self)
         self.load_bg_image_action.setStatusTip("Load a NIfTI image (.nii, .nii.gz) as background")
         self.load_bg_image_action.triggered.connect(self._trigger_load_anatomical_image)
-        self.load_bg_image_action.setEnabled(False)
+        self.load_bg_image_action.setEnabled(False) 
 
-        self.close_bundle_action = QAction("&Close Bundle", self)
-        self.close_bundle_action.setStatusTip("Close the current streamline bundle (also clears image)") # Updated tip
+        self.close_bundle_action: QAction = QAction("&Close Bundle", self)
+        self.close_bundle_action.setStatusTip("Close the current streamline bundle") # Updated tip
         self.close_bundle_action.triggered.connect(self._close_bundle)
         self.close_bundle_action.setEnabled(False)
 
         # --- Clear Anatomical Image Action ---
-        self.clear_bg_image_action = QAction("Clear Anatomical Image", self)
+        self.clear_bg_image_action: QAction = QAction("Clear Anatomical Image", self)
         self.clear_bg_image_action.setStatusTip("Remove the background anatomical image")
         self.clear_bg_image_action.triggered.connect(self._trigger_clear_anatomical_image)
         self.clear_bg_image_action.setEnabled(False) # Enabled only when image loaded
 
 
-        self.save_file_action = QAction("&Save As...", self)
+        self.save_file_action: QAction = QAction("&Save As...", self)
         self.save_file_action.setStatusTip("Save the modified streamlines to a trk, tck or trx file")
         self.save_file_action.triggered.connect(self._trigger_save_streamlines)
         self.save_file_action.setEnabled(False)
 
-        self.screenshot_action = QAction("Save &Screenshot", self)
+        self.screenshot_action: QAction = QAction("Save &Screenshot", self)
         self.screenshot_action.setStatusTip("Save a screenshot of the current view (bundle and image)")
         self.screenshot_action.setShortcut("Ctrl+P")
         self.screenshot_action.triggered.connect(self._trigger_screenshot)
         self.screenshot_action.setEnabled(False)
 
-        self.exit_action = QAction("&Exit", self)
+        self.exit_action: QAction = QAction("&Exit", self)
         self.exit_action.setStatusTip("Exit the application")
         self.exit_action.setShortcut(QKeySequence("Ctrl+Q"))
         self.exit_action.triggered.connect(self.close)
 
         # --- Edit Actions ---
-        self.undo_action = QAction("&Undo", self)
+        self.undo_action: QAction = QAction("&Undo", self)
         self.undo_action.setStatusTip("Undo the last deletion")
         self.undo_action.setShortcut(QKeySequence.StandardKey.Undo) # Ctrl+Z
         self.undo_action.triggered.connect(self._perform_undo)
         self.undo_action.setEnabled(False)
 
-        self.redo_action = QAction("&Redo", self)
+        self.redo_action: QAction = QAction("&Redo", self)
         self.redo_action.setStatusTip("Redo the last undone deletion")
         self.redo_action.setShortcut(QKeySequence.StandardKey.Redo) # Ctrl+Y / Ctrl+Shift+Z
         self.redo_action.triggered.connect(self._perform_redo)
         self.redo_action.setEnabled(False)
 
         # --- View Actions (Coloring) ---
-        self.coloring_action_group = QActionGroup(self)
+        self.coloring_action_group: QActionGroup = QActionGroup(self)
         self.coloring_action_group.setExclusive(True)
 
-        self.color_default_action = QAction("&Greyscale Color", self)
+        self.color_default_action: QAction = QAction("&Greyscale Color", self)
         self.color_default_action.setStatusTip("Color streamlines with greyscale")
         self.color_default_action.setCheckable(True)
         self.color_default_action.setChecked(False) 
@@ -160,7 +163,7 @@ class MainWindow(QMainWindow):
         self.coloring_action_group.addAction(self.color_default_action)
         self.color_default_action.setEnabled(False)
 
-        self.color_orientation_action = QAction("Color by Orientation", self)
+        self.color_orientation_action: QAction = QAction("Color by Orientation", self)
         self.color_orientation_action.setStatusTip("Color streamlines by local orientation (RGB)")
         self.color_orientation_action.setCheckable(True)
         self.color_orientation_action.setChecked(True) # Default selection
@@ -168,7 +171,7 @@ class MainWindow(QMainWindow):
         self.coloring_action_group.addAction(self.color_orientation_action)
         self.color_orientation_action.setEnabled(False)
 
-        self.color_scalar_action = QAction("Color by Scalar", self)
+        self.color_scalar_action: QAction = QAction("Color by Scalar", self)
         self.color_scalar_action.setStatusTip("Color streamlines by the first loaded scalar value per point")
         self.color_scalar_action.setCheckable(True)
         self.color_scalar_action.triggered.connect(lambda: self._set_color_mode(ColorMode.SCALAR))
@@ -176,44 +179,44 @@ class MainWindow(QMainWindow):
         self.color_scalar_action.setEnabled(False)
 
         # --- Command Actions ---
-        self.clear_select_action = QAction("&Clear Selection", self)
+        self.clear_select_action: QAction = QAction("&Clear Selection", self)
         self.clear_select_action.setStatusTip("Clear the current streamline selection (C)")
         self.clear_select_action.setShortcut("C")
         self.clear_select_action.triggered.connect(self._perform_clear_selection)
         self.clear_select_action.setEnabled(False)
 
-        self.delete_select_action = QAction("&Delete Selection", self)
+        self.delete_select_action: QAction = QAction("&Delete Selection", self)
         self.delete_select_action.setStatusTip("Delete the selected streamlines (D)")
         self.delete_select_action.setShortcut("D")
         self.delete_select_action.triggered.connect(self._perform_delete_selection)
         self.delete_select_action.setEnabled(False)
 
-        self.increase_radius_action = QAction("&Increase Radius", self)
+        self.increase_radius_action: QAction = QAction("&Increase Radius", self)
         self.increase_radius_action.setStatusTip(f"Increase the selection sphere radius (+{RADIUS_INCREMENT}mm)")
         self.increase_radius_action.setShortcut("+")
         self.increase_radius_action.triggered.connect(self._increase_radius)
         self.increase_radius_action.setEnabled(False)
 
-        self.decrease_radius_action = QAction("&Decrease Radius", self)
+        self.decrease_radius_action: QAction = QAction("&Decrease Radius", self)
         self.decrease_radius_action.setStatusTip(f"Decrease the selection sphere radius (-{RADIUS_INCREMENT}mm)")
         self.decrease_radius_action.setShortcut("-")
         self.decrease_radius_action.triggered.connect(self._decrease_radius)
         self.decrease_radius_action.setEnabled(False)
 
-        self.hide_sphere_action = QAction("&Hide Selection Sphere", self)
+        self.hide_sphere_action: QAction = QAction("&Hide Selection Sphere", self)
         self.hide_sphere_action.setStatusTip("Hide the blue selection sphere (Esc)")
         self.hide_sphere_action.setShortcut("Esc")
         self.hide_sphere_action.triggered.connect(self._hide_sphere)
         self.hide_sphere_action.setEnabled(True)
 
         # --- Help Menu ---
-        self.about_action = QAction("&About TractEdit...", self)
+        self.about_action: QAction = QAction("&About TractEdit...", self)
         self.about_action.setStatusTip("Show information about TractEdit")
         self.about_action.triggered.connect(self._show_about_dialog)
 
-    def _create_menus(self):
+    def _create_menus(self) -> None:
         """Creates the main menu bar and populates it with actions."""
-        main_bar = self.menuBar()
+        main_bar: QMenuBar = self.menuBar()
 
         # --- File Menu --- 
         file_menu = main_bar.addMenu("&File")
@@ -256,7 +259,7 @@ class MainWindow(QMainWindow):
         help_menu.addAction(self.about_action)
 
     # --- Scalar Toolbar ---
-    def _create_scalar_toolbar(self):
+    def _create_scalar_toolbar(self) -> None:
         """Creates the toolbar for scalar range adjustment with sliders."""
         self.scalar_toolbar = QToolBar("Scalar Range", self)
         self.scalar_toolbar.setObjectName("ScalarToolbar") # For identification
@@ -285,7 +288,7 @@ class MainWindow(QMainWindow):
         self.scalar_max_slider.setToolTip("Drag to adjust max scalar value")
         
         # --- Reset Button ---
-        self.scalar_reset_button = QAction("Reset", self)
+        self.scalar_reset_button: QAction = QAction("Reset", self)
         self.scalar_reset_button.setStatusTip("Reset scalar range to data min/max")
         
         # --- Layout ---
@@ -326,27 +329,27 @@ class MainWindow(QMainWindow):
         # Reset button
         self.scalar_reset_button.triggered.connect(self._reset_scalar_range)
 
-    def _setup_status_bar(self):
+    def _setup_status_bar(self) -> None:
         """Creates and configures the status bar with a permanent widget for bundle/image info."""
-        self.status_bar = self.statusBar()
-        self.data_info_label = QLabel(" No data loaded ")
+        self.status_bar: QStatusBar = self.statusBar()
+        self.data_info_label: QLabel = QLabel(" No data loaded ")
         self.data_info_label.setStyleSheet("border: 1px solid grey; padding: 2px;")
         self.status_bar.addPermanentWidget(self.data_info_label)
 
-    def _setup_central_widget(self):
+    def _setup_central_widget(self) -> None:
         """Sets up the main central widget which will contain the VTK panel."""
-        self.central_widget = QWidget()
+        self.central_widget: QWidget = QWidget()
         self.setCentralWidget(self.central_widget)
-        self.vtk_panel = VTKPanel(parent_widget=self.central_widget, main_window_ref=self)
+        self.vtk_panel: VTKPanel = VTKPanel(parent_widget=self.central_widget, main_window_ref=self)
 
-    def _update_initial_status(self):
+    def _update_initial_status(self) -> None:
         """Sets the initial status message in the VTK panel."""
         date_str = get_formatted_datetime()
         self.vtk_panel.update_status(f"Ready ({date_str}). Load data.")
 
-    def _update_action_states(self):
+    def _update_action_states(self) -> None:
             """Enables/disables actions based on current application state."""
-            has_streamlines = bool(self.streamlines_list)
+            has_streamlines = self.tractogram_data is not None
             has_selection = bool(self.selected_streamline_indices)
             has_scalars = bool(self.scalar_data_per_point)
             has_image = self.anatomical_image_data is not None
@@ -374,14 +377,14 @@ class MainWindow(QMainWindow):
             self.increase_radius_action.setEnabled(has_streamlines)
             self.decrease_radius_action.setEnabled(has_streamlines)
 
-    def _update_bundle_info_display(self):
+    def _update_bundle_info_display(self) -> None:
         """Updates the data information QLabel in the status bar for both streamlines and image."""
         bundle_text = "Bundle: None"
         image_text = "Image: None"
 
         # Streamline Info
-        if self.streamlines_list:
-            count = len(self.streamlines_list)
+        if self.tractogram_data is not None:
+            count = len(self.visible_indices)
             filename = os.path.basename(self.original_trk_path) if self.original_trk_path else "Unknown"
             file_type_info = f" ({self.original_file_extension.upper()})" if self.original_file_extension else ""
             scalar_info = f" | Scalar: {self.active_scalar_name}" if self.active_scalar_name else ""
@@ -409,71 +412,76 @@ class MainWindow(QMainWindow):
             image_text = f"Image: {filename} | Shape={shape_str}"
 
         # Combine and Set
-        separator = " || " if self.streamlines_list and self.anatomical_image_data is not None else " | "
-        if not self.streamlines_list and not self.anatomical_image_data:
+        separator = " || " if self.tractogram_data is not None and self.anatomical_image_data is not None else " | "
+        if self.tractogram_data is None and not self.anatomical_image_data:
             final_text = " No data loaded "
-        elif self.streamlines_list and self.anatomical_image_data is None:
+        elif self.tractogram_data is not None and self.anatomical_image_data is None:
             final_text = f" {bundle_text} "
-        elif not self.streamlines_list and self.anatomical_image_data is not None:
+        elif self.tractogram_data is None and self.anatomical_image_data is not None:
              final_text = f" {image_text} "
         else:
              final_text = f" {bundle_text}{separator}{image_text} "
         self.data_info_label.setText(final_text)
 
-
     # --- Undo/Redo Core Logic ---             
-    def _perform_undo(self):
-        """Performs the Undo operation (currently only for streamline deletions)."""
-        if self.undo_stack:
-            current_state = {
-                'streamlines': list(self.streamlines_list),
-                'scalars': self.scalar_data_per_point
-            }
-            self.redo_stack.append(current_state)
-            if len(self.redo_stack) > MAX_STACK_LEVELS: self.redo_stack.pop(0)
-
-            # Restore previous (pre-delete) state from Undo
-            previous_state = self.undo_stack.pop()
-            self.streamlines_list = previous_state['streamlines']
-            self.scalar_data_per_point = previous_state.get('scalars') # Use .get for safety
-            self.selected_streamline_indices = set()
-
+    def _perform_undo(self) -> None:
+        """
+        Performs the Undo operation (re-inserts deleted streamlines).
+        """
+        if not self.undo_stack:
             if self.vtk_panel:
-                self.vtk_panel.update_main_streamlines_actor()
-                self.vtk_panel.update_status(f"Undo successful. Streamlines: {len(self.streamlines_list)}")
+                self.vtk_panel.update_status("Nothing to undo.")
+            return
 
-            self._update_bundle_info_display()
-            self._update_action_states()
-        elif self.vtk_panel:
-             self.vtk_panel.update_status("Nothing to undo.")
+        # Pop the set of indices that were deleted
+        indices_to_restore: Set[int] = self.undo_stack.pop()
+        
+        # Add them back to the visible set
+        self.visible_indices.update(indices_to_restore)
+
+        # Push the command to the redo stack
+        self.redo_stack.append(indices_to_restore)
+        if len(self.redo_stack) > MAX_STACK_LEVELS: self.redo_stack.pop(0)
+        
+        self.selected_streamline_indices = set()
+
+        if self.vtk_panel:
+            self.vtk_panel.update_main_streamlines_actor()
+            self.vtk_panel.update_status(f"Undo successful. Streamlines: {len(self.visible_indices)}")
+
+        self._update_bundle_info_display()
+        self._update_action_states()
             
-    def _perform_redo(self):
-        """Performs the Redo operation (currently only for streamline deletions)."""
-        if self.redo_stack:
-            current_state = {
-                'streamlines': list(self.streamlines_list),
-                'scalars': self.scalar_data_per_point
-            }
-            self.undo_stack.append(current_state)
-            if len(self.undo_stack) > MAX_STACK_LEVELS: self.undo_stack.pop(0)
-
-            # Restore next (deleted) state from Redo
-            next_state = self.redo_stack.pop()
-            self.streamlines_list = next_state['streamlines']
-            self.scalar_data_per_point = next_state.get('scalars') # Use .get for safety
-            self.selected_streamline_indices = set()
-
+    def _perform_redo(self) -> None:
+        """
+        Performs the Redo operation (re-deletes streamlines).
+        """
+        if not self.redo_stack:
             if self.vtk_panel:
-                self.vtk_panel.update_main_streamlines_actor()
-                self.vtk_panel.update_status(f"Redo successful. Streamlines: {len(self.streamlines_list)}")
+                self.vtk_panel.update_status("Nothing to redo.")
+            return
+            
+        # Pop the command
+        indices_to_delete_again: Set[int] = self.redo_stack.pop()
+        
+        # Remove them from the visible set
+        self.visible_indices.difference_update(indices_to_delete_again)
 
-            self._update_bundle_info_display()
-            self._update_action_states()
-        elif self.vtk_panel:
-            self.vtk_panel.update_status("Nothing to redo.")
+        # Push the command back to the undo stack
+        self.undo_stack.append(indices_to_delete_again)
+        if len(self.undo_stack) > MAX_STACK_LEVELS: self.undo_stack.pop(0)
+
+        self.selected_streamline_indices = set()
+
+        if self.vtk_panel:
+            self.vtk_panel.update_main_streamlines_actor()
+            self.vtk_panel.update_status(f"Redo successful. Streamlines: {len(self.visible_indices)}")
+
+        self._update_bundle_info_display()
+        self._update_action_states()
 
     # --- Command Actions Logic ---
-    def _perform_clear_selection(self):
+    def _perform_clear_selection(self) -> None:
         """Clears the current streamline selection."""
         if self.vtk_panel: self.vtk_panel.update_radius_actor(visible=False)
 
@@ -486,56 +494,40 @@ class MainWindow(QMainWindow):
             self.vtk_panel.update_status("Clear: No active selection.")
         self._update_action_states()
 
-    def _perform_delete_selection(self):
-        """Deletes the selected streamlines."""
+    def _perform_delete_selection(self) -> None:
+        """
+        Deletes the selected streamlines.
+        Uses the memory-efficient Command Pattern.
+        """
         if not self.selected_streamline_indices:
             if self.vtk_panel: self.vtk_panel.update_status("Delete: No streamlines selected.")
             return
         if self.vtk_panel: self.vtk_panel.update_radius_actor(visible=False)
 
         num_to_delete = len(self.selected_streamline_indices)
-        undo_state = {
-            'streamlines': list(self.streamlines_list),
-            'scalars': self.scalar_data_per_point # Save the *current* scalar data
-        }
-        self.undo_stack.append(undo_state)
+        
+        # --- New Undo/Redo Command Logic ---
+        indices_to_delete: Set[int] = self.selected_streamline_indices.copy()
+        
+        # --- Create the command object ---
+        self.undo_stack.append(indices_to_delete)
         if len(self.undo_stack) > MAX_STACK_LEVELS: self.undo_stack.pop(0)
-        self.redo_stack = []
+        self.redo_stack = [] # Clear redo stack on a new action
 
-        indices_to_delete = self.selected_streamline_indices
-        new_streamlines_list = [sl for i, sl in enumerate(self.streamlines_list) if i not in indices_to_delete]
-
-        # --- Handle scalar data ---
-        new_scalar_data = None
-        if self.scalar_data_per_point:
-            # Basic check: if lengths match, assume indices align 
-            lengths_ok = True
-            for k, v in self.scalar_data_per_point.items():
-                if len(v) != len(self.streamlines_list):
-                    lengths_ok = False
-                    break
-            if lengths_ok:
-                new_scalar_data = {}
-                for key, scalar_list in self.scalar_data_per_point.items():
-                     new_scalar_data[key] = [s for i, s in enumerate(scalar_list) if i not in indices_to_delete]
-            else:
-                 print("Warning: Scalar data lengths inconsistent. Cannot filter scalars reliably during deletion.")
-                 new_scalar_data = self.scalar_data_per_point 
-
-        # Update state
-        self.streamlines_list = new_streamlines_list
-        self.scalar_data_per_point = new_scalar_data
+        # --- Update state ---
+        self.visible_indices.difference_update(indices_to_delete)
+        
         self.selected_streamline_indices = set()
 
         if self.vtk_panel:
             self.vtk_panel.update_main_streamlines_actor()
-            self.vtk_panel.update_status(f"Deleted {num_to_delete} streamlines. Remaining: {len(self.streamlines_list)}.")
+            self.vtk_panel.update_status(f"Deleted {num_to_delete} streamlines. Remaining: {len(self.visible_indices)}.")
         self._update_bundle_info_display()
         self._update_action_states()
 
-    def _increase_radius(self):
+    def _increase_radius(self) -> None:
         """Increases the selection radius."""
-        if not self.streamlines_list: 
+        if not self.tractogram_data: 
             return
         self.selection_radius_3d += RADIUS_INCREMENT
         if self.vtk_panel:
@@ -544,9 +536,9 @@ class MainWindow(QMainWindow):
                 center = self.vtk_panel.radius_actor.GetCenter()
                 self.vtk_panel.update_radius_actor(center_point=center, radius=self.selection_radius_3d, visible=True)
 
-    def _decrease_radius(self):
+    def _decrease_radius(self) -> None:
         """Decreases the selection radius."""
-        if not self.streamlines_list: 
+        if not self.tractogram_data: 
             return
         new_radius = self.selection_radius_3d - RADIUS_INCREMENT
         self.selection_radius_3d = max(MIN_SELECTION_RADIUS, new_radius)
@@ -556,7 +548,7 @@ class MainWindow(QMainWindow):
                 center = self.vtk_panel.radius_actor.GetCenter()
                 self.vtk_panel.update_radius_actor(center_point=center, radius=self.selection_radius_3d, visible=True)
 
-    def _hide_sphere(self):
+    def _hide_sphere(self) -> None:
         """Hides the selection sphere."""
         if self.vtk_panel:
             self.vtk_panel.update_radius_actor(visible=False)
@@ -564,11 +556,11 @@ class MainWindow(QMainWindow):
 
     # --- View Action Logic ---
     @pyqtSlot(object)
-    def _set_color_mode(self, mode):
+    def _set_color_mode(self, mode: ColorMode) -> None:
         """Sets the streamline coloring mode and triggers VTK update."""
         if not isinstance(mode, ColorMode): 
             return
-        if not self.streamlines_list:
+        if not self.tractogram_data:
              self.color_default_action.setChecked(True)
              return
 
@@ -596,19 +588,18 @@ class MainWindow(QMainWindow):
                 self.vtk_panel.update_main_streamlines_actor()
                 self.vtk_panel.update_status(f"Streamline color mode changed to {mode.name}.")
         
-        # Ensure toolbar visibility is correct in any case
+        # Ensure toolbar visibility
         if self.scalar_toolbar:
              is_scalar = (mode == ColorMode.SCALAR and bool(self.active_scalar_name))
              self.scalar_toolbar.setVisible(is_scalar)
 
 
     # --- GUI Action Methods ---
-    def _close_bundle(self):
+    def _close_bundle(self) -> None:
         """
         Closes the current streamline bundle.
-        Also clears anatomical image as a workaround for cleanup crashes.
         """
-        if not self.streamlines_list:
+        if not self.tractogram_data:
             if self.vtk_panel:
                 self.vtk_panel.update_status("No bundle open to close.")
             return
@@ -630,7 +621,8 @@ class MainWindow(QMainWindow):
                  self.vtk_panel.clear_anatomical_slices()
 
         # Reset streamline data state
-        self.streamlines_list = []
+        self.tractogram_data = None
+        self.visible_indices = set()
         self.original_trk_header = None
         self.original_trk_affine = None
         self.original_trk_path = None
@@ -656,7 +648,7 @@ class MainWindow(QMainWindow):
         self._update_action_states()
 
     # --- Action Trigger Wrappers ---
-    def _trigger_load_streamlines(self):
+    def _trigger_load_streamlines(self) -> None:
         """Wrapper to call the streamline load function from file_io."""
         self.scalar_range_initialized = False
         if self.scalar_toolbar: self.scalar_toolbar.setVisible(False)
@@ -669,13 +661,13 @@ class MainWindow(QMainWindow):
              self.scalar_range_initialized = True
              if self.scalar_toolbar: self.scalar_toolbar.setVisible(True)
 
-    def _trigger_save_streamlines(self):
+    def _trigger_save_streamlines(self) -> None:
         """Wrapper to call the streamline save function from file_io."""
         file_io.save_streamlines_file(self)
 
-    def _trigger_screenshot(self):
+    def _trigger_screenshot(self) -> None:
         """Wrapper to call the screenshot function in vtk_panel."""
-        if not (self.streamlines_list or self.anatomical_image_data):
+        if not (self.tractogram_data or self.anatomical_image_data):
              QMessageBox.warning(self, "Screenshot Error", "No data loaded to take a screenshot of.")
              return
         if self.vtk_panel:
@@ -689,7 +681,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Screenshot Error", "VTK panel not initialized.")
 
     # --- Background Image Methods ---
-    def _trigger_load_anatomical_image(self):
+    def _trigger_load_anatomical_image(self) -> None:
         """Triggers loading of an anatomical image."""
         if self.anatomical_image_data is not None:
             reply = QMessageBox.question(self, 'Replace Image?',
@@ -700,7 +692,6 @@ class MainWindow(QMainWindow):
                 return
             else:
                 self._trigger_clear_anatomical_image() # Clear before loading new one
-
 
         img_data, img_affine, img_path = file_io.load_anatomical_image(self)
 
@@ -720,7 +711,7 @@ class MainWindow(QMainWindow):
             self._update_bundle_info_display()
             self._update_action_states()
 
-    def _trigger_clear_anatomical_image(self):
+    def _trigger_clear_anatomical_image(self) -> None:
         """Clears the currently loaded anatomical image."""
         if self.anatomical_image_data is None:
             if self.vtk_panel:
@@ -737,7 +728,7 @@ class MainWindow(QMainWindow):
         if self.vtk_panel:
             self.vtk_panel.clear_anatomical_slices()
             self.vtk_panel.update_status("Anatomical image cleared.")
-            if not self.streamlines_list and self.vtk_panel.scene:
+            if not self.tractogram_data and self.vtk_panel.scene:
                  self.vtk_panel.scene.reset_camera()
                  self.vtk_panel.scene.reset_clipping_range()
             if self.vtk_panel.render_window:
@@ -747,7 +738,7 @@ class MainWindow(QMainWindow):
         self._update_action_states()
 
     # --- Helper functions for float <-> int mapping ---
-    def _float_to_int_slider(self, float_val):
+    def _float_to_int_slider(self, float_val: float) -> int:
         """Maps a float value from the data range to the slider's integer range."""
         data_min = self.scalar_data_min
         data_max = self.scalar_data_max
@@ -761,7 +752,7 @@ class MainWindow(QMainWindow):
         percent = (float_val - data_min) / (data_max - data_min)
         return int(round(percent * SLIDER_PRECISION))
         
-    def _int_slider_to_float(self, slider_val):
+    def _int_slider_to_float(self, slider_val: int) -> float:
         """Maps an integer slider value back to the float data range."""
         data_min = self.scalar_data_min
         data_max = self.scalar_data_max
@@ -772,24 +763,21 @@ class MainWindow(QMainWindow):
         percent = float(slider_val) / SLIDER_PRECISION
         return data_min + percent * (data_max - data_min)
 
-    def _update_scalar_data_range(self):
+    def _update_scalar_data_range(self) -> None:
         """Calculates the min/max range from the active scalar data."""
         if not self.active_scalar_name or not self.scalar_data_per_point:
             print("Scalar range: No active scalar data to calculate range from.")
             return
 
-        scalar_list = self.scalar_data_per_point.get(self.active_scalar_name)
-        if not scalar_list:
+        scalar_sequence = self.scalar_data_per_point.get(self.active_scalar_name)
+        if not scalar_sequence:
              print("Scalar range: Active scalar list is empty.")
              return
              
         try:
-            valid_scalars = [s for s in scalar_list if s is not None and s.size > 0]
-            if not valid_scalars:
-                 print("Scalar range: No valid scalar arrays found.")
-                 return
-                 
-            all_scalars_flat = np.concatenate(valid_scalars)
+            valid_scalars = (s for s in scalar_sequence if s is not None and s.size > 0)
+
+            all_scalars_flat = np.concatenate(list(valid_scalars))
             if all_scalars_flat.size == 0:
                 print("Scalar range: Concatenated scalar data is empty.")
                 return
@@ -818,7 +806,7 @@ class MainWindow(QMainWindow):
             self.scalar_max_val = 1.0
             self._update_scalar_range_widgets()
 
-    def _update_scalar_range_widgets(self):
+    def _update_scalar_range_widgets(self) -> None:
         """Updates the spinbox and slider widgets with current range and values."""
         if not self.scalar_min_spinbox or not self.scalar_max_spinbox:
             return
@@ -847,7 +835,7 @@ class MainWindow(QMainWindow):
         self.scalar_min_slider.blockSignals(False)
         self.scalar_max_slider.blockSignals(False)
 
-    def _slider_value_changed(self, slider_val):
+    def _slider_value_changed(self, slider_val: int) -> None:
         """
         Slot for when slider value changes.
         Updates the corresponding spinbox, but does NOT trigger VTK update.
@@ -876,7 +864,7 @@ class MainWindow(QMainWindow):
                 self.scalar_min_slider.setValue(slider_val)
                 self.scalar_min_slider.blockSignals(False)
 
-    def _spinbox_value_changed(self):
+    def _spinbox_value_changed(self) -> None:
         """
         Slot for when spinbox editing is finished.
         Updates sliders and triggers VTK update.
@@ -896,14 +884,14 @@ class MainWindow(QMainWindow):
         self._trigger_vtk_update() # Trigger the slow update
         
 
-    def _reset_scalar_range(self):
+    def _reset_scalar_range(self) -> None:
         """Slot to reset the scalar range to the data's full range."""
         self.scalar_min_val = self.scalar_data_min
         self.scalar_max_val = self.scalar_data_max
         self._update_scalar_range_widgets()
         self._trigger_vtk_update() # Manually trigger the changed signal to force a redraw
         
-    def _trigger_vtk_update(self):
+    def _trigger_vtk_update(self) -> None:
         """
         Validates range and triggers the (slow) VTK actor update.
         Called on slider release or spinbox edit finished.
@@ -925,9 +913,9 @@ class MainWindow(QMainWindow):
             self.vtk_panel.update_status(f"Scalar range set to: [{min_val:.3f}, {max_val:.3f}]")
 
     # --- Window Close Event ---
-    def closeEvent(self, event):
+    def closeEvent(self, event: QCloseEvent) -> None:
         """Handles the main window close event, prompting if data is loaded."""
-        data_loaded = bool(self.streamlines_list or self.anatomical_image_data)
+        data_loaded = bool(self.tractogram_data or self.anatomical_image_data)
         prompt_message = "Data (streamlines and/or image) is currently loaded.\nAre you sure you want to quit?"
 
         if data_loaded:
@@ -943,7 +931,7 @@ class MainWindow(QMainWindow):
             self._cleanup_vtk()
             event.accept()
 
-    def _cleanup_vtk(self):
+    def _cleanup_vtk(self) -> None:
         """Safely cleans up VTK resources."""
         if hasattr(self, 'vtk_panel') and self.vtk_panel:
             if hasattr(self.vtk_panel, 'scene') and self.vtk_panel.scene:
@@ -967,11 +955,11 @@ class MainWindow(QMainWindow):
                     print(f"Error finalizing VTK render window: {e}")
 
     # --- Help-About dialog ---
-    def _show_about_dialog(self):
+    def _show_about_dialog(self) -> None:
         """Displays the About tractedit information box."""
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle("About tractedit")
-        about_text = """<b>TractEdit version 1.2.1</b><br><br>
+        about_text = """<b>TractEdit version 1.3.0</b><br><br>
         Author: Marco Tagliaferri, PhD Candidate in Neuroscience<br>
         Center for Mind/Brain Sciences (CIMeC)
         University of Trento, Italy

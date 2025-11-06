@@ -13,9 +13,11 @@ import nibabel as nib
 import trx.trx_file_memmap as tbx
 from PyQt6.QtWidgets import QFileDialog, QMessageBox, QApplication
 from .utils import ColorMode
+from typing import Optional, List, Dict, Any, Tuple, Type, Union
 
 # --- Helper Function ---
-def parse_numeric_tuple_from_string(value_str, target_type=float, expected_length=None):
+# This is a mess, will be updated to be cleaner in the future 
+def parse_numeric_tuple_from_string(value_str: Any, target_type: Type = float, expected_length: Optional[Union[int, Tuple[int, ...]]] = None) -> Any:
     if not isinstance(value_str, str):
         # If it's already a list or tuple, try to convert types and check length
         if isinstance(value_str, (list, tuple)):
@@ -84,36 +86,8 @@ def parse_numeric_tuple_from_string(value_str, target_type=float, expected_lengt
     # Fallback if ast.literal_eval results in an unexpected type or other issues
     return value_str
 
-# --- Helper Function for Scalar Loading ---
-def _load_scalar_data_from_nibabel(trk_file):
-    """Attempts to load scalar data from the nibabel tractogram file object."""
-    scalar_data = None
-    active_scalar = None
-    if hasattr(trk_file.tractogram, 'data_per_point') and trk_file.tractogram.data_per_point:
-        print("Scalar data found in file (data_per_point).")
-        try:
-            loaded_scalars_dict = dict(trk_file.tractogram.data_per_point)
-            if loaded_scalars_dict:
-                processed_scalars = {}
-                for key, value_list in loaded_scalars_dict.items():
-                    processed_scalars[key] = [np.asarray(arr) for arr in value_list]
-
-                scalar_data = processed_scalars
-                active_scalar = list(loaded_scalars_dict.keys())[0]
-                print(f"Assigned scalars. Active scalar: '{active_scalar}'")
-            else:
-                print("Scalar data dictionary (data_per_point) is empty.")
-        except Exception as scalar_e:
-            print(f"Warning: Could not process scalar data: {scalar_e}\n{traceback.format_exc()}")
-            scalar_data = None
-            active_scalar = None
-    else:
-        print("No scalar data found in file (data_per_point).")
-
-    return scalar_data, active_scalar
-
 # --- Helper Function for VTK/UI Update ---
-def _update_vtk_and_ui_after_load(main_window, status_msg):
+def _update_vtk_and_ui_after_load(main_window: Any, status_msg: str) -> None:
     """Updates VTK panel and main window UI elements after loading."""
     if main_window.vtk_panel:
         main_window.vtk_panel.update_main_streamlines_actor()
@@ -141,7 +115,7 @@ def _update_vtk_and_ui_after_load(main_window, status_msg):
     main_window._update_bundle_info_display()
 
 # --- Anatomical Image Loading Function ---
-def load_anatomical_image(main_window):
+def load_anatomical_image(main_window: Any) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[str]]:
     """
     Loads a NIfTI image file (.nii, .nii.gz).
     Returns the image data array and affine matrix.
@@ -180,7 +154,6 @@ def load_anatomical_image(main_window):
         # Load NIfTI file using nibabel
         img = nib.load(input_path)
 
-        # Get data - use get_fdata() for float data potentially scaled
         image_data = img.get_fdata(dtype=np.float32) # Ensure float for VTK/FURY
         image_affine = img.affine
 
@@ -214,7 +187,7 @@ def load_anatomical_image(main_window):
         return None, None, None
 
 # --- Streamline File I/O Functions ---
-def load_streamlines_file(main_window):
+def load_streamlines_file(main_window: Any) -> None:
     """
     Loads a trk, tck, or trx file.
     Updates the MainWindow state.
@@ -244,7 +217,7 @@ def load_streamlines_file(main_window):
         return
 
     # Clean existing bundle first (if any)
-    if main_window.streamlines_list:
+    if main_window.tractogram_data:
         main_window._close_bundle()
 
     status_updater = getattr(main_window.vtk_panel, 'update_status', lambda msg: print(f"Status: {msg}"))
@@ -255,21 +228,41 @@ def load_streamlines_file(main_window):
         _, ext = os.path.splitext(input_path)
         ext = ext.lower()
 
-        loaded_streamlines = []
-        loaded_header = {}
-        loaded_affine = np.identity(4)
-        scalar_data = None
-        active_scalar = None
+        loaded_streamlines_obj: Optional['nib.streamlines.ArraySequence'] = None
+        loaded_header: Dict[str, Any] = {}
+        loaded_affine: np.ndarray = np.identity(4)
+        scalar_data: Optional[Dict[str, 'nib.streamlines.ArraySequence']] = None
+        active_scalar: Optional[str] = None
+        tractogram_obj: Any = None # To hold the object with .data_per_point
+        num_streamlines = 0
+        
+        # Clear any old trx file reference
+        if hasattr(main_window, 'trx_file_reference'):
+             try:
+                 main_window.trx_file_reference.close()
+             except Exception:
+                 pass 
+        main_window.trx_file_reference = None
 
         if ext in ['.trk', '.tck']:
             # --- Load File using Nibabel ---
-            trk_file = nib.streamlines.load(input_path, lazy_load=False)
-            loaded_streamlines = list(trk_file.streamlines)
+            # lazy_load=True returns a generator for .trk/.tck.
+            trk_file = nib.streamlines.load(input_path, lazy_load=True)
+            
+            # This is the memory-intensive step
+            streamlines_list = list(trk_file.streamlines)
+            num_streamlines = len(streamlines_list)
+            print(f"Info: Loaded {num_streamlines} streamlines from {ext} file into memory.")
+
+            # Store as an ArraySequence for a consistent API
+            loaded_streamlines_obj = nib.streamlines.ArraySequence(streamlines_list)
+            
             loaded_header = trk_file.header.copy() if hasattr(trk_file, 'header') else {}
+            tractogram_obj = trk_file.tractogram # This has the data_per_point
 
             # Load Affine from Nibabel object
-            if hasattr(trk_file, 'tractogram') and hasattr(trk_file.tractogram, 'affine_to_rasmm'):
-                nib_affine = trk_file.tractogram.affine_to_rasmm
+            if hasattr(tractogram_obj, 'affine_to_rasmm'):
+                nib_affine = tractogram_obj.affine_to_rasmm
                 if isinstance(nib_affine, np.ndarray) and nib_affine.shape == (4, 4):
                     loaded_affine = nib_affine
                 else:
@@ -277,15 +270,37 @@ def load_streamlines_file(main_window):
             else:
                 print("Warning: affine_to_rasmm not found in loaded file object. Using identity affine.")
             
-            # --- Load Scalar Data using helper ---
-            scalar_data, active_scalar = _load_scalar_data_from_nibabel(trk_file)
+            # --- Load Scalar Data ---
+            if hasattr(tractogram_obj, 'data_per_point') and tractogram_obj.data_per_point:
+                print("Scalar data found in file (data_per_point).")
+                # For nibabel, data_per_point is a PerPointDict (dict of lists)
+                # We MUST convert it to a dict of ArraySequences for our new model.
+                scalar_data = {}
+                try:
+                    for key, value_list in tractogram_obj.data_per_point.items():
+                        scalar_data[key] = nib.streamlines.ArraySequence(value_list)
+                    if scalar_data:
+                        active_scalar = list(scalar_data.keys())[0]
+                        print(f"Assigned scalars. Active scalar: '{active_scalar}'")
+                except Exception as scalar_e:
+                    print(f"Warning: Could not process scalar data: {scalar_e}\n{traceback.format_exc()}")
+                    scalar_data = None
+                    active_scalar = None
+            else:
+                 print("No scalar data found in file (data_per_point).")
 
         elif ext == '.trx':
             
             # --- Load File using trx-python ---
             trx_obj = tbx.load(input_path)
-            loaded_streamlines = list(trx_obj.streamlines) # Get streamlines
+            
+            # trx_obj.streamlines IS a lazy ArraySequence. 
+            loaded_streamlines_obj = trx_obj.streamlines # Get streamlines
+            num_streamlines = len(loaded_streamlines_obj) # This is fast
+            print(f"Info: Loaded {num_streamlines} streamlines from {ext} file (lazy-loaded).")
+            
             loaded_header = trx_obj.header.copy() # Get header
+            tractogram_obj = trx_obj # This has the data_per_point
             
             # Load Affine from TRX object
             if hasattr(trx_obj, 'affine_to_rasmm'):
@@ -297,43 +312,30 @@ def load_streamlines_file(main_window):
             else:
                 print("Warning: affine_to_rasmm not found in loaded TRX file. Using identity affine.")
 
-            # --- Load Scalar Data (inlined logic from _load_scalar_data) ---
+            # --- Load Scalar Data (REFACTORED) ---
             if hasattr(trx_obj, 'data_per_point') and trx_obj.data_per_point:
                 print("Scalar data found in file (data_per_point).")
-                try:
-                    loaded_scalars_dict = dict(trx_obj.data_per_point)
-                    if loaded_scalars_dict:
-                        processed_scalars = {}
-                        for key, value_list in loaded_scalars_dict.items():
-                            # trx-python data_per_point is already a list of arrays
-                            processed_scalars[key] = [np.asarray(arr) for arr in value_list] 
-                        
-                        scalar_data = processed_scalars
-                        active_scalar = list(loaded_scalars_dict.keys())[0]
-                        print(f"Assigned scalars. Active scalar: '{active_scalar}'")
-                    else:
-                        print("Scalar data dictionary (data_per_point) is empty.")
-                except Exception as scalar_e:
-                    print(f"Warning: Could not process scalar data: {scalar_e}\n{traceback.format_exc()}")
-                    scalar_data = None
-                    active_scalar = None
+                # For trx-python, data_per_point is *already* a PerPointArraySequenceDict (dict of ArraySequences).
+                scalar_data = trx_obj.data_per_point
+                if scalar_data:
+                    active_scalar = list(scalar_data.keys())[0]
+                    print(f"Assigned scalars. Active scalar: '{active_scalar}'")
             else:
                 print("No scalar data found in file (data_per_point).")
             
-            # trx-python objects closing
-            if hasattr(trx_obj, 'close'):
-                trx_obj.close()
+            main_window.trx_file_reference = trx_obj
 
         else:
             raise ValueError(f"Unsupported file extension: '{ext}'. Only .trk, .tck, and .trx are supported.")
 
 
         # --- Guard Clause: Check if streamlines were loaded ---
-        if not loaded_streamlines:
+        if not loaded_streamlines_obj or num_streamlines == 0:
             print("No streamlines found in file.")
             QMessageBox.information(main_window, "Load Info", "No streamlines found in the selected file.")
             status_updater(f"Loaded 0 streamlines from {os.path.basename(input_path)}")
-            main_window.streamlines_list = []
+            main_window.tractogram_data = None
+            main_window.visible_indices = set()
             main_window.original_trk_header = None
             main_window.original_trk_affine = None
             main_window.original_trk_path = None
@@ -356,7 +358,9 @@ def load_streamlines_file(main_window):
             return
 
         # --- Assign Core Data to MainWindow ---
-        main_window.streamlines_list = loaded_streamlines
+        main_window.tractogram_data = loaded_streamlines_obj
+        main_window.visible_indices = set(range(num_streamlines))
+        
         main_window.original_trk_header = loaded_header
         main_window.original_trk_affine = loaded_affine
         main_window.original_trk_path = input_path
@@ -373,7 +377,7 @@ def load_streamlines_file(main_window):
         main_window.active_scalar_name = active_scalar
 
         # --- Update VTK and UI ---
-        status_msg = f"Loaded {len(main_window.streamlines_list)} streamlines from {os.path.basename(input_path)}"
+        status_msg = f"Loaded {len(main_window.tractogram_data)} streamlines from {os.path.basename(input_path)}"
         if main_window.active_scalar_name:
             status_msg += f" | Active Scalar: {main_window.active_scalar_name}"
         _update_vtk_and_ui_after_load(main_window, status_msg)
@@ -402,7 +406,8 @@ def load_streamlines_file(main_window):
         status_updater(f"Error loading file: {os.path.basename(input_path)}")
         try:
             # Reset only streamline-related vars, keep anatomical if loaded
-            main_window.streamlines_list = []
+            main_window.tractogram_data = None
+            main_window.visible_indices = set()
             main_window.original_trk_header = None
             main_window.original_trk_affine = None
             main_window.original_trk_path = None
@@ -422,9 +427,9 @@ def load_streamlines_file(main_window):
             print(f"ERROR during error cleanup after streamline load failure: {cleanup_e}")
 
 
-def _validate_save_prerequisites(main_window):
+def _validate_save_prerequisites(main_window: Any) -> bool:
     """Checks if prerequisites for saving streamlines are met."""
-    if main_window.streamlines_list is None or not main_window.streamlines_list:
+    if main_window.tractogram_data is None:
         print("Save Error: No streamline data to save.")
         QMessageBox.warning(main_window, "Save Error", "No streamline data to save.")
         return False
@@ -442,7 +447,7 @@ def _validate_save_prerequisites(main_window):
         return False
     return True
 
-def _get_save_path_and_extension(main_window):
+def _get_save_path_and_extension(main_window: Any) -> Tuple[Optional[str], Optional[str]]:
     """Gets the output path and validated extension from the user."""
     required_ext = main_window.original_file_extension
     initial_dir = os.path.dirname(main_window.original_trk_path) if main_window.original_trk_path else ""
@@ -459,7 +464,7 @@ def _get_save_path_and_extension(main_window):
     else:
         # Fallback or error if extension is invalid or TRX not supported
         QMessageBox.critical(main_window, "Save Error", f"Cannot save: Unknown original format '{required_ext}'.")
-        return None, None # Should have been caught by _validate_save_prerequisites
+        return None, None 
     
     all_filters = f"{file_filter};;All Files (*.*)"
 
@@ -488,9 +493,15 @@ def _get_save_path_and_extension(main_window):
             print(f"Save Info: Corrected extension from '{output_ext_from_dialog}' to '{required_ext}'. Path changed from '{old_output_path}' to '{output_path}'.")
     return output_path, required_ext
 
-def _prepare_tractogram_and_affine(main_window):
+def _prepare_tractogram_and_affine(main_window: Any) -> nib.streamlines.Tractogram:
     """Prepares the Tractogram object and validates the affine matrix."""
-    tractogram_data = main_window.streamlines_list
+    tractogram = main_window.tractogram_data
+    # Get the sorted list of indices to save
+    indices_to_save = sorted(list(main_window.visible_indices))
+    
+    # Create a generator for the streamlines to save
+    streamlines_to_save_gen = (tractogram[i] for i in indices_to_save)
+
     affine_matrix = main_window.original_trk_affine
 
     if not isinstance(affine_matrix, np.ndarray) or affine_matrix.shape != (4, 4):
@@ -500,28 +511,25 @@ def _prepare_tractogram_and_affine(main_window):
     # Handle potential scalar data
     data_per_point_to_save = {}
     if main_window.scalar_data_per_point:
-        # Check if scalar data is still valid for the current streamlines
-        all_lengths_match = True
-        for key, scalar_list in main_window.scalar_data_per_point.items():
-            if len(scalar_list) != len(tractogram_data):
-                print(f"Warning: Scalar '{key}' length ({len(scalar_list)}) mismatch with streamlines ({len(tractogram_data)}).")
-                all_lengths_match = False
-                break
-        
-        if all_lengths_match:
-            data_per_point_to_save = main_window.scalar_data_per_point
-        else:
-            print("Warning: Scalar data length mismatch. Saving without scalar data.")
+        try:
+            for key, scalar_sequence in main_window.scalar_data_per_point.items():
+                # Use the same generator logic to get scalars for visible indices
+                scalars_for_key_gen = (scalar_sequence[i] for i in indices_to_save)
+                # We must save it as a list of arrays
+                data_per_point_to_save[key] = list(scalars_for_key_gen)
+        except Exception as e:
+            print(f"Warning: Could not filter scalar data for saving. Saving without scalars. Error: {e}")
+            data_per_point_to_save = {}
     
     # Use Nibabel's Tractogram object as a generic container
     new_tractogram = nib.streamlines.Tractogram(
-        tractogram_data,
+        list(streamlines_to_save_gen),
         data_per_point=data_per_point_to_save if data_per_point_to_save else None,
         affine_to_rasmm=affine_matrix
     )
     return new_tractogram
 
-def _prepare_trk_header(base_header, nb_streamlines, anatomical_img_affine=None):
+def _prepare_trk_header(base_header: Dict[str, Any], nb_streamlines: int, anatomical_img_affine: Optional[np.ndarray] = None) -> Dict[str, Any]:
     """
     Prepares and validates the header dictionary for TRK saving.
     If voxel_order is missing in base_header, attempts to derive it from
@@ -648,7 +656,7 @@ def _prepare_trk_header(base_header, nb_streamlines, anatomical_img_affine=None)
 
     return header
 
-def _prepare_tck_header(base_header, nb_streamlines):
+def _prepare_tck_header(base_header: Optional[Dict[str, Any]], nb_streamlines: int) -> Dict[str, Any]:
     """Prepares the header dictionary for TCK saving."""
     header = base_header.copy() if base_header is not None else {}
     header['count'] = str(nb_streamlines) 
@@ -663,7 +671,7 @@ def _prepare_tck_header(base_header, nb_streamlines):
             header[key] = str(header[key])
     return header
 
-def _prepare_trx_header(base_header, nb_streamlines):
+def _prepare_trx_header(base_header: Optional[Dict[str, Any]], nb_streamlines: int) -> Dict[str, Any]:
     """Prepares the header dictionary for TRX saving."""
     header = base_header.copy() if base_header is not None else {}
     header['nb_streamlines'] = nb_streamlines
@@ -673,7 +681,7 @@ def _prepare_trx_header(base_header, nb_streamlines):
     
     return header
 
-def _save_tractogram_file(tractogram, header, output_path, file_ext):
+def _save_tractogram_file(tractogram: nib.streamlines.Tractogram, header: Dict[str, Any], output_path: str, file_ext: str) -> str:
     """
     Saves the tractogram using nibabel or trx-python based on the extension.
     """
@@ -705,7 +713,7 @@ def _save_tractogram_file(tractogram, header, output_path, file_ext):
         raise ValueError(f"Unsupported save extension: {file_ext}")
 
 # --- Main Save Function ---
-def save_streamlines_file(main_window):
+def save_streamlines_file(main_window: Any) -> None:
     """
     Saves the current streamlines to a trk, tck, or trx file.
     """
@@ -722,13 +730,13 @@ def save_streamlines_file(main_window):
         return
 
     # --- 3. Prepare Data ---
-    status_updater(f"Saving {len(main_window.streamlines_list)} streamlines to: {os.path.basename(output_path)}...")
+    status_updater(f"Saving {len(main_window.visible_indices)} streamlines to: {os.path.basename(output_path)}...")
     QApplication.processEvents() # UI update
 
     try:
         tractogram = _prepare_tractogram_and_affine(main_window)
 
-        header_to_save = {}
+        header_to_save: Dict[str, Any] = {}
         if output_ext == '.trk':
             header_to_save = _prepare_trk_header(
                 main_window.original_trk_header,
