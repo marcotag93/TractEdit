@@ -26,19 +26,19 @@ Center for Mind/Brain Sciences (CIMeC), University of Trento Italy
 ## Key Features
 
 - **Load & Save** streamline bundles (`.trk`, `.tck`, `.trx`)
-- **Anatomical Image:** Load NIfTI images (`.nii`, `.nii.gz`) as backgrounds for anatomical context.
+- **Multi-View Orthogonal Visualization:** Integrated 3D viewer and three linked 2D orthogonal slice views (Axial, Coronal, Sagittal).
+- **Anatomical Image:** Load NIfTI images (`.nii`, `.nii.gz`) as backgrounds for anatomical context and **interactive slice navigation**.
 - **3D Visualization** with [VTK](https://vtk.org/) and [FURY](https://fury.gl/)
-    - Default orientation-based coloring (RGB), scalar-based coloring or greyscale
+    - Default orientation (RGB), or scalar-based coloring with dynamic colormap range adjustment, or greyscale.
 - **Interactive Editing Tools:**
     - Sphere-based streamline selection (with adjustable radius)
-    - Streamline deletion and undo/redo support
+    - Streamline deletion and undo/redo support.
     - Screenshot export
 - **Streamline Info Display:**
     - File name, streamline count, voxel size, bounding box, etc.
 - **Keyboard Shortcuts** for fast interaction (see full list below)
 
 > ⚠️ **Note:** TractEdit is optimized for refining *bundles*, not whole-brain tractograms. Files with a large number of streamlines may cause slowdowns or freezing depending on your system.
-
 ---
 
 ## Getting Started (Manual Install)
@@ -50,6 +50,7 @@ cd tractedit
 ```
 
 ### 2. Install Dependencies
+The project dependencies (including PyQt6, VTK, and Nibabel) are defined in pyproject.toml
 
 - Python 3.8–3.11 (tested)
 - [PyQt6](https://pypi.org/project/PyQt6/)
@@ -64,34 +65,25 @@ Recommend a virtual environment:
 ```bash
 python -m venv venv
 source venv/bin/activate 
-pip install -r requirements.txt
+# Install the project and its dependencies:
+pip install .
 ```
 
 ### 3. Launch the App
+The application can now be launched using the tractedit command installed via pip.
 ```bash
-python3 main.py
+tractedit
 ```
 
-> On some Linux systems (e.g., Ubuntu Wayland), if you encounter Qt errors, try 'xcb' below. The bash command automatically handles this error.
+> On some Linux systems (e.g., Ubuntu Wayland), if you encounter Qt errors, try 'xcb' below.
 ```bash
-QT_QPA_PLATFORM=xcb python3 main.py
+QT_QPA_PLATFORM=xcb tractedit
 ```
 
 ### 4. Load Sample Data (Optional)
 Explore `sample_data/` to test TractEdit with example `.trk`, `.tck` or `.trx` files.
 
 ---
-
-### For Linux/MacOS
-```bash
-chmod +x Tractedit
-./Tractedit
-```
-You can add TractEdit to your PATH:
-```bash
-echo 'export PATH="/path/to/tractedit:$PATH"' >> ~/.bashrc
-source ~/.bashrc
-```
 
 ### For Windows
 Use **pre-built executable** Tractedit.exe (no Python setup required).
@@ -107,6 +99,9 @@ Use **pre-built executable** Tractedit.exe (no Python setup required).
 | **d**                | Delete selected streamlines                 |
 | **+ / =**            | Increase selection sphere radius            |
 | **-**                | Decrease selection sphere radius            |
+| **↑ / ↓**            | Axial Slice navigation (Z-axis)             |
+| **← / →**            | Sagittal Slice navigation (X-axis)          |
+| **Ctrl+↑ / Ctrl+↓**  | Coronal Slice navigation (Y-axis)           |
 | **Ctrl+s**           | Save As                                     |
 | **Ctrl+z**           | Undo last deletion                          |
 | **Ctrl+y / Shift+z** | Redo last undone deletion                   |
@@ -119,10 +114,12 @@ Use **pre-built executable** Tractedit.exe (no Python setup required).
 ## Sample Workflow
 
 1. Open a `.trk`, `.tck` or `.trx` file via **File → Open**
-2. Use the mouse and `S` key to select streamlines
-3. Press `D` to delete, or `C` to clear selection
-4. Change streamline color in **View → Streamline Color**
-5. Save your edited bundle with **File → Save As**
+2. Load an anatomical image via **File → Load Image** to enable 2D slice views.
+3. Use the mouse click-drag in the 2D slice views or the arrow keys (see shortcuts above) to navigate the anatomical slices.
+4. Use the mouse and `S` key to select streamlines
+5. Press `D` to delete, or `C` to clear selection. Use Ctrl+Z to undo deletions.
+6. If needed, change streamline color in **View → Streamline Color**. If using Color by Scalar, use the Scalar Range toolbar at the top of the window to adjust the min/max range of the colormap.
+7. Save your edited bundle with **File → Save As**
 
 ---
 
