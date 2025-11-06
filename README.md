@@ -50,7 +50,7 @@ Center for Mind/Brain Sciences (CIMeC), University of Trento Italy
 ### 1. Clone the Repository
 ```bash
 git clone https://github.com/marcotag93/TractEdit.git
-cd TractEdiit
+cd TractEdit
 ```
 
 ### 2. Install Dependencies
