@@ -128,7 +128,7 @@ Use **pre-built executable** Tractedit.exe (no Python setup required).
 
 1. Open a `.trk`, `.tck` or `.trx` file via **File → Open**
 2. Load an anatomical image via **File → Load Image** to enable 2D slice views.
-3. Load anatomical ROIs via **File → Load ROI* and right-click ROI layers to set them as Include or Exclude regions to automatically filter streamlines.
+3. Load anatomical ROIs via **File → Load ROI** and right-click ROI layers to set them as Include or Exclude regions to automatically filter streamlines.
 4. Use the mouse click-drag in the 2D slice views or the arrow keys (see shortcuts above) to navigate the anatomical slices.
 5. Use the mouse and `S` key to select streamlines
 6. Press `D` to delete, or `C` to clear selection. Use Ctrl+Z to undo deletions.
