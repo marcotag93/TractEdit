@@ -1053,17 +1053,27 @@ class MainWindow(QMainWindow):
             self.vtk_panel.update_status("ROI loading complete.")
 
     def _trigger_clear_all_rois(self, notify: bool = True) -> None:
-        """Clears all loaded ROI image layers."""
+        """Clears all loaded ROI image layers and resets logic filters."""
         if not self.roi_layers:
             return
 
+        # 1. Clear Data Containers
         self.roi_layers.clear()
         self.roi_visibility.clear()
+
+        # 2. Clear Logic States and Caches
+        self.roi_states.clear()
+        self.roi_intersection_cache.clear()
+        self.roi_highlight_indices.clear()
+
+        # 3. Re-calculate Visuals
+        self._update_roi_visual_selection() 
+        self._apply_logic_filters()
 
         if self.vtk_panel:
             self.vtk_panel.clear_all_roi_layers()
             if notify:
-                self.vtk_panel.update_status("All ROI layers cleared.")
+                self.vtk_panel.update_status("All ROI layers and filters cleared.")
         
         self._update_bundle_info_display()
         self._update_action_states()
