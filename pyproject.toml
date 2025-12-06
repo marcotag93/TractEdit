@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tractedit"
-version = "1.3.0" 
+version = "2.0.1" 
 authors = [
     { name = "Marco Tagliaferri", email = "marco.tagliaferri@unitn.it" },
     { name = "Marco Tagliaferri", email = "marco.tagliaferri93@gmail.com" },

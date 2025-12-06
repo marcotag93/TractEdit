@@ -8,17 +8,21 @@ Handles display of streamlines and anatomical image slices using a custom intera
 import os
 import numpy as np
 import vtk
-import traceback
+import logging
 from PyQt6.QtWidgets import (
     QVBoxLayout, QMessageBox, QApplication, QFileDialog, 
-    QWidget, QHBoxLayout, QSplitter
+    QWidget, QHBoxLayout, QSplitter, QMenu
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QPoint
+from PyQt6.QtGui import QAction
 from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 from fury import window, actor, colormap
 from .utils import ColorMode
 from typing import Optional, List, Dict, Any, Tuple, Set
 import nibabel as nib
+from functools import partial
+
+logger = logging.getLogger(__name__)
 
 class CustomInteractorStyle2D(vtk.vtkInteractorStyleImage):
     """
@@ -54,6 +58,7 @@ class CustomInteractorStyle2D(vtk.vtkInteractorStyleImage):
         """Handles left mouse button release."""
         if self.vtk_panel:
             self.vtk_panel.is_navigating_2d = False
+            self.vtk_panel._update_slow_slice_components()
             
     def OnMouseMove(self, obj: vtk.vtkObject, event_id: str) -> None:
         """Handles mouse move."""
@@ -97,6 +102,20 @@ class VTKPanel:
         self.coronal_vtk_widget: QVTKRenderWindowInteractor = QVTKRenderWindowInteractor()
         self.sagittal_vtk_widget: QVTKRenderWindowInteractor = QVTKRenderWindowInteractor()
         
+        self.axial_vtk_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.coronal_vtk_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.sagittal_vtk_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+
+        self.axial_vtk_widget.customContextMenuRequested.connect(
+            partial(self._show_2d_context_menu, widget=self.axial_vtk_widget, view_type='axial')
+        )
+        self.coronal_vtk_widget.customContextMenuRequested.connect(
+            partial(self._show_2d_context_menu, widget=self.coronal_vtk_widget, view_type='coronal')
+        )
+        self.sagittal_vtk_widget.customContextMenuRequested.connect(
+            partial(self._show_2d_context_menu, widget=self.sagittal_vtk_widget, view_type='sagittal')
+        )
+
         ortho_splitter.addWidget(self.axial_vtk_widget)
         ortho_splitter.addWidget(self.coronal_vtk_widget)
         ortho_splitter.addWidget(self.sagittal_vtk_widget)
@@ -148,7 +167,17 @@ class VTKPanel:
         self.sagittal_scene: window.Scene = window.Scene()
         self.sagittal_scene.background((0.0, 0.0, 0.0))
         self.sagittal_render_window: vtk.vtkRenderWindow = self.sagittal_vtk_widget.GetRenderWindow()
+        self.sagittal_render_window.SetNumberOfLayers(2)  # Enable multiple layers
         self.sagittal_render_window.AddRenderer(self.sagittal_scene)
+        self.sagittal_scene.SetLayer(0)  # Base layer for slice
+        
+        # Create overlay renderer for sagittal crosshair (renders on top)
+        self.sagittal_overlay_renderer = vtk.vtkRenderer()
+        self.sagittal_overlay_renderer.SetLayer(1)  # Overlay layer
+        self.sagittal_overlay_renderer.InteractiveOff()  # Don't intercept mouse events
+        self.sagittal_overlay_renderer.PreserveColorBufferOn()  # Keep background from layer 0
+        self.sagittal_render_window.AddRenderer(self.sagittal_overlay_renderer)
+        
         self.sagittal_interactor: vtk.vtkRenderWindowInteractor = self.sagittal_render_window.GetInteractor()
         style_2d_sagittal = CustomInteractorStyle2D(self)
         self.sagittal_interactor.SetInteractorStyle(style_2d_sagittal)
@@ -172,8 +201,13 @@ class VTKPanel:
         self.coronal_crosshair_actor: Optional[vtk.vtkActor] = None
         self.sagittal_crosshair_actor: Optional[vtk.vtkActor] = None
         self.crosshair_lines: Dict[str, vtk.vtkLineSource] = {} # Stores vtkLineSource objects for updates
+        self.crosshair_appenders: Dict[str, vtk.vtkAppendPolyData] = {} # Stores vtkAppendPolyData 
         
         self.is_navigating_2d: bool = False
+        
+        self.roi_slice_actors: Dict[str, Dict[str, vtk.vtkActor]] = {} # Key: path, Val: {'axial':, 'coronal':, 'sagittal':}
+        
+        self.roi_highlight_actor: Optional[vtk.vtkActor] = None 
         
         # --- Slice Navigation State ---
         self.current_slice_indices: Dict[str, Optional[int]] = {'x': None, 'y': None, 'z': None}
@@ -205,7 +239,72 @@ class VTKPanel:
         self.scene.reset_camera()
         
         self._render_all() 
+        
+    def set_anatomical_slice_visibility(self, visible: bool) -> None:
+        """Sets visibility for anatomical slices and associated crosshairs."""
+        vis_flag = 1 if visible else 0
+        
+        # 1. Update Slice Actors
+        for act in [self.axial_slice_actor, self.coronal_slice_actor, self.sagittal_slice_actor]:
+            if act: act.SetVisibility(vis_flag)
+            
+        # 2. Update Crosshair Actors
+        for act in [self.axial_crosshair_actor, self.coronal_crosshair_actor, self.sagittal_crosshair_actor]:
+            if act: act.SetVisibility(vis_flag)
+            
+        self._render_all()
 
+    def update_roi_highlight_actor(self) -> None:
+        """
+        Updates the Red highlight actor based on ROI 'Select' indices.
+        """
+        if not self.scene: return
+
+        # Remove existing
+        if self.roi_highlight_actor:
+            try: self.scene.rm(self.roi_highlight_actor)
+            except: pass
+            self.roi_highlight_actor = None
+            
+        if not self.main_window or not self.main_window.tractogram_data: return
+        
+        indices = getattr(self.main_window, 'roi_highlight_indices', set())
+        if not indices: return
+        
+        # Get actual streamline data
+        tractogram = self.main_window.tractogram_data
+        streamlines_list = []
+        for idx in indices:
+            try:
+                if idx < len(tractogram):
+                    sl = tractogram[idx]
+                    if len(sl) > 0:
+                        streamlines_list.append(sl)
+            except: pass
+            
+        if not streamlines_list: return
+        
+        try:
+            # Create Red Actor (1, 0, 0)
+            self.roi_highlight_actor = actor.line(
+                streamlines_list,
+                colors=(1, 0, 0),
+                linewidth=4,
+                opacity=1.0,
+                depth_cue=False # Make it pop out
+            )
+            self.scene.add(self.roi_highlight_actor)
+            
+            # Use mapper offset to ensure it draws ON TOP of the grey/yellow bundles
+            mapper = self.roi_highlight_actor.GetMapper()
+            if mapper:
+                mapper.SetResolveCoincidentTopologyToPolygonOffset()
+                mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(-2, -20) # Stronger offset than yellow
+                
+            self.render_window.Render()
+            
+        except Exception as e:
+            logger.error(f"Error creating ROI highlight actor: {e}")
 
     def _render_all(self) -> None:
         """Renders all four VTK windows if they are initialized."""
@@ -219,73 +318,180 @@ class VTKPanel:
             if self.sagittal_render_window and self.sagittal_render_window.GetInteractor().GetInitialized():
                 self.sagittal_render_window.Render()
         except Exception as e:
-            print(f"Warning: Error during _render_all: {e}")
+            logger.warning(f"Warning: Error during _render_all: {e}")
             
+    def _show_2d_context_menu(self, position: QPoint, widget: QVTKRenderWindowInteractor, view_type: str) -> None:
+        """
+        Shows a context menu for the 2D view that was right-clicked.
+        
+        Args:
+            position: The QPoint where the click occurred (local to the widget).
+            widget: The QVTKRenderWindowInteractor that was clicked.
+            view_type: 'axial', 'coronal', or 'sagittal'.
+        """
+        # Only show the menu if an anatomical image is loaded
+        if not self.main_window or self.main_window.anatomical_image_data is None:
+            return
+            
+        menu = QMenu(widget)
+        
+        # Create the "Reset View" action
+        reset_action = QAction("Reset View", widget)
+        
+        # Connect the action to our new reset helper function
+        reset_action.triggered.connect(partial(self._reset_2d_view, view_type=view_type))
+        
+        menu.addAction(reset_action)
+        
+        # Show the menu at the global position of the click
+        menu.exec(widget.mapToGlobal(position))
+
+    def _reset_2d_view(self, view_type: str) -> None:
+        """Resets the camera for a specific 2D view and re-renders it."""
+        try:
+            if view_type == 'axial':
+                self._update_axial_camera(reset_zoom_pan=True)
+                if self.axial_render_window: self.axial_render_window.Render()
+                    
+            elif view_type == 'coronal':
+                self._update_coronal_camera(reset_zoom_pan=True)
+                if self.coronal_render_window: self.coronal_render_window.Render()
+                    
+            elif view_type == 'sagittal':
+                self._update_sagittal_camera(reset_zoom_pan=True)
+                if self.sagittal_render_window: self.sagittal_render_window.Render()
+                
+        except Exception as e:
+            logger.error(f"Error resetting 2D view ({view_type}): {e}")
+                        
     def _setup_ortho_cameras(self) -> None:
         """Sets the cameras for the 2D views to be orthogonal."""
         if not self.axial_scene or not self.coronal_scene or not self.sagittal_scene:
             return
             
         try:
-            self._update_axial_camera()
-            self._update_coronal_camera()
-            self._update_sagittal_camera()
+            # Call with reset=True for initial setup
+            self._update_axial_camera(reset_zoom_pan=True)
+            self._update_coronal_camera(reset_zoom_pan=True)
+            self._update_sagittal_camera(reset_zoom_pan=True)
         except Exception as e:
-            print(f"Error setting up ortho cameras: {e}")
+            logger.error(f"Error setting up ortho cameras: {e}")
             
-    def _update_axial_camera(self) -> None:
+    def _update_axial_camera(self, reset_zoom_pan: bool = False) -> None:
         """Updates the axial 2D camera to follow its slice."""
         if not self.axial_scene: return
         try:
-            self.axial_scene.reset_camera()
             cam = self.axial_scene.GetActiveCamera()
             if not cam.GetParallelProjection(): cam.SetParallelProjection(1)
-            fp = cam.GetFocalPoint()
-            dist = cam.GetDistance()
-            cam.SetPosition(fp[0], fp[1], fp[2] + dist) # View from +Z
-            cam.SetFocalPoint(fp[0], fp[1], fp[2])
-            cam.SetViewUp(0, 1, 0)
+
+            if reset_zoom_pan or not self.axial_slice_actor:
+                # Full reset (initial setup or fallback)
+                self.axial_scene.reset_camera()
+                if not cam.GetParallelProjection(): cam.SetParallelProjection(1)
+                fp = cam.GetFocalPoint()
+                dist = cam.GetDistance()
+                cam.SetPosition(fp[0], fp[1], fp[2] + dist) # View from +Z
+                cam.SetFocalPoint(fp[0], fp[1], fp[2])
+                cam.SetViewUp(0, 1, 0)
+            else:
+                # Just follow the slice in Z, keeping X,Y pan and zoom
+                actor_center = self.axial_slice_actor.GetCenter()
+                
+                current_fp = cam.GetFocalPoint()
+                current_pos = cam.GetPosition()
+                
+                new_focal_z = actor_center[2]
+                z_delta = new_focal_z - current_fp[2]
+
+                # Only update if the slice has actually moved in Z
+                if abs(z_delta) > 1e-6:
+                    cam.SetFocalPoint(current_fp[0], current_fp[1], new_focal_z)
+                    cam.SetPosition(current_pos[0], current_pos[1], current_pos[2] + z_delta)
+            
             self.axial_scene.reset_clipping_range()
         except Exception as e:
-            print(f"Error updating axial camera: {e}")
+            logger.error(f"Error updating axial camera: {e}")
 
-    def _update_coronal_camera(self) -> None:
+    def _update_coronal_camera(self, reset_zoom_pan: bool = False) -> None:
         """Updates the coronal 2D camera to follow its slice."""
         if not self.coronal_scene: return
         try:
-            self.coronal_scene.reset_camera()
             cam = self.coronal_scene.GetActiveCamera()
             if not cam.GetParallelProjection(): cam.SetParallelProjection(1)
-            fp = cam.GetFocalPoint()
-            dist = cam.GetDistance()
-            cam.SetPosition(fp[0], fp[1] - dist, fp[2]) # View from -Y
-            cam.SetFocalPoint(fp[0], fp[1], fp[2])
-            cam.SetViewUp(0, 0, 1) # Up is Z
+
+            if reset_zoom_pan or not self.coronal_slice_actor:
+                # Full reset
+                self.coronal_scene.reset_camera()
+                if not cam.GetParallelProjection(): cam.SetParallelProjection(1)
+                fp = cam.GetFocalPoint()
+                dist = cam.GetDistance()
+                cam.SetPosition(fp[0], fp[1] - dist, fp[2]) # View from -Y
+                cam.SetFocalPoint(fp[0], fp[1], fp[2])
+                cam.SetViewUp(0, 0, 1) # Up is Z
+            else:
+                # Just follow the slice in Y
+                actor_center = self.coronal_slice_actor.GetCenter()
+                
+                current_fp = cam.GetFocalPoint()
+                current_pos = cam.GetPosition()
+                
+                new_focal_y = actor_center[1]
+                y_delta = new_focal_y - current_fp[1]
+
+                if abs(y_delta) > 1e-6:
+                    cam.SetFocalPoint(current_fp[0], new_focal_y, current_fp[2])
+                    cam.SetPosition(current_pos[0], current_pos[1] + y_delta, current_pos[2])
+            
             self.coronal_scene.reset_clipping_range()
         except Exception as e:
-            print(f"Error updating coronal camera: {e}")
+            logger.error(f"Error updating coronal camera: {e}")
 
-    def _update_sagittal_camera(self) -> None:
+    def _update_sagittal_camera(self, reset_zoom_pan: bool = False) -> None:
         """Updates the sagittal 2D camera to follow its slice."""
         if not self.sagittal_scene: return
         try:
-            self.sagittal_scene.reset_camera()
             cam = self.sagittal_scene.GetActiveCamera()
             if not cam.GetParallelProjection(): cam.SetParallelProjection(1)
-            fp = cam.GetFocalPoint()
-            dist = cam.GetDistance()
-            cam.SetPosition(fp[0] - dist, fp[1], fp[2]) # View from -X
-            cam.SetFocalPoint(fp[0], fp[1], fp[2])
-            cam.SetViewUp(0, 0, 1) # Up is Z
+            
+            if reset_zoom_pan or not self.sagittal_slice_actor:
+                self.sagittal_scene.reset_camera()
+                if not cam.GetParallelProjection(): cam.SetParallelProjection(1)
+                fp = cam.GetFocalPoint()
+                dist = cam.GetDistance()
+                cam.SetPosition(fp[0] + dist, fp[1], fp[2]) # Was fp[0] - dist
+                cam.SetFocalPoint(fp[0], fp[1], fp[2])
+                cam.SetViewUp(0, 0, 1) # Up is Z
+            else:
+                actor_center = self.sagittal_slice_actor.GetCenter()
+                
+                current_fp = cam.GetFocalPoint()
+                current_pos = cam.GetPosition()
+                
+                new_focal_x = actor_center[0]
+                x_delta = new_focal_x - current_fp[0]
+
+                if abs(x_delta) > 1e-6:
+                    cam.SetFocalPoint(new_focal_x, current_fp[1], current_fp[2])
+                    cam.SetPosition(current_pos[0] + x_delta, current_pos[1], current_pos[2])
+            
             self.sagittal_scene.reset_clipping_range()
+            
+            # Expand the clipping range to ensure the crosshair in the overlay is never clipped
+            # The crosshair sits at the same depth as the slice and can get clipped at edges
+            near, far = cam.GetClippingRange()
+            cam.SetClippingRange(near * 0.01, far * 100) 
+            
+            # Don't reset clipping range on overlay - it shares the camera and would override main scene's clipping
+            if hasattr(self, 'sagittal_overlay_renderer') and self.sagittal_overlay_renderer:
+                self.sagittal_overlay_renderer.SetActiveCamera(cam)
         except Exception as e:
-            print(f"Error updating sagittal camera: {e}")
-              
+            logger.error(f"Error updating sagittal camera: {e}")
+            
     def _create_2d_label_actor(self, text: str, scene: window.Scene, pos: Tuple[float, float], h_align: str = "Center", v_align: str = "Center") -> None:
         """Helper function to create a single 2D text label."""
         text_prop = vtk.vtkTextProperty()
         text_prop.SetFontSize(14)
-        text_prop.SetColor(0.8, 0.8, 0.8) # Light grey
+        text_prop.SetColor(0.8, 0.8, 0.8)
         text_prop.SetFontFamilyToArial()
         text_prop.BoldOff()
         text_prop.ShadowOff()
@@ -334,8 +540,8 @@ class VTKPanel:
         # --- Sagittal View (S/I, A/P) ---
         self._create_2d_label_actor("S", self.sagittal_scene, (0.5, 0.98), v_align="Top")
         self._create_2d_label_actor("I", self.sagittal_scene, (0.5, 0.02), v_align="Bottom")
-        self._create_2d_label_actor("P", self.sagittal_scene, (0.98, 0.5), h_align="Right")
-        self._create_2d_label_actor("A", self.sagittal_scene, (0.02, 0.5), h_align="Left")
+        self._create_2d_label_actor("A", self.sagittal_scene, (0.98, 0.5), h_align="Right")
+        self._create_2d_label_actor("P", self.sagittal_scene, (0.02, 0.5), h_align="Left")
 
     def _create_scene_ui(self) -> None:
         """Creates the initial UI elements (Axes, Text) within the VTK scene."""
@@ -408,10 +614,10 @@ class VTKPanel:
             self.orientation_widget.SetInteractor(self.interactor)
             self.orientation_widget.SetViewport(0.85, 0.0, 1.0, 0.15)
             self.orientation_widget.SetEnabled(1)
-            self.orientation_widget.InteractiveOff() # Prevent user interaction
+            self.orientation_widget.InteractiveOff() 
 
         except Exception as e:
-            print(f"Warning: Could not create 3D orientation cube: {e}")
+            logger.warning(f"Could not create 3D orientation cube: {e}")
 
         # --- Add 2D Orientation Labels ---
         self._create_2d_orientation_labels()
@@ -454,7 +660,7 @@ class VTKPanel:
             if self.render_window and self.render_window.GetInteractor().GetInitialized():
                 self.render_window.Render()
         except Exception as e:
-            print(f"Error updating status text actor: {e}\n{traceback.format_exc()}")
+            logger.error(f"Error updating status text actor:", exc_info=e)
 
     # --- Selection Sphere Actor Management ---
     def _ensure_radius_actor_exists(self, radius: float, center_point: Tuple[float, float, float]) -> None:
@@ -550,7 +756,7 @@ class VTKPanel:
 
         # Basic checks
         if image_data is None or affine is None or image_data.ndim < 3:
-            print("Error: Invalid image data or affine provided for slices.")
+            logger.error("Invalid image data or affine provided for slices.")
             self.clear_anatomical_slices()
             return
 
@@ -592,7 +798,7 @@ class VTKPanel:
             img_max = np.max(image_data)
 
             if not np.isfinite(img_min) or not np.isfinite(img_max):
-                print("Warning: Image contains non-finite values. Clamping range.")
+                logger.warning("Image contains non-finite values. Clamping range.")
                 finite_data = image_data[np.isfinite(image_data)]
                 if finite_data.size > 0: img_min, img_max = np.min(finite_data), np.max(finite_data)
                 else: img_min, img_max = 0.0, 1.0
@@ -641,12 +847,12 @@ class VTKPanel:
 
         except TypeError as te:
              error_msg = f"TypeError during slice actor creation/display: {te}"
-             print(error_msg); traceback.print_exc()
+             logger.error(error_msg, exc_info=True)
              QMessageBox.critical(self.main_window, "Slice Actor TypeError", error_msg)
              self.clear_anatomical_slices()
         except Exception as e:
             error_msg = f"Error during anatomical slice actor creation/addition: {e}"
-            print(error_msg); traceback.print_exc()
+            logger.error(error_msg, exc_info=True)
             QMessageBox.critical(self.main_window, "Slice Actor Error", error_msg)
             self.clear_anatomical_slices()
             
@@ -657,74 +863,110 @@ class VTKPanel:
         self.update_status(f"Slice View: X={current_x} Y={current_y} Z={current_z}")
 
     def clear_anatomical_slices(self, reset_state: bool = True) -> None:
-        """Removes anatomical slice actors from the scene."""
+        """
+        Removes anatomical slice actors from all active scenes and resets slice state.
+        """
         self._clear_crosshairs()
-        
-        actors_to_remove = [self.axial_slice_actor, self.coronal_slice_actor, self.sagittal_slice_actor]
-        scenes_to_check = [self.scene, self.axial_scene, self.coronal_scene, self.sagittal_scene]
-        removed_count = 0
-        
-        for act in actors_to_remove:
-            if act is not None:
-                for scn in scenes_to_check:
-                    if scn is not None:
-                        try:
-                            scn.rm(act)
-                            removed_count += 1
-                        except (ValueError, AttributeError): pass
-                        except Exception as e: print(f"Error removing slice actor: {e}")
 
-        self.axial_slice_actor, self.coronal_slice_actor, self.sagittal_slice_actor = None, None, None
+        # Create lists of valid objects only (filter out None) to reduce nesting
+        actors_to_remove = [
+            a for a in [self.axial_slice_actor, self.coronal_slice_actor, self.sagittal_slice_actor] 
+            if a is not None
+        ]
         
+        scenes_to_check = [
+            s for s in [self.scene, self.axial_scene, self.coronal_scene, self.sagittal_scene] 
+            if s is not None
+        ]
+
+        scene_changed = False
+
+        for actor in actors_to_remove:
+            for scene in scenes_to_check:
+                try:
+                    # Attempt to remove actor from scene
+                    scene.rm(actor)
+                    scene_changed = True
+                except (ValueError, AttributeError):
+                    pass
+                except Exception as e:
+                    logger.error(f"Error removing slice actor: {e}", exc_info=True)
+
+        # Reset actor references
+        self.axial_slice_actor = None
+        self.coronal_slice_actor = None
+        self.sagittal_slice_actor = None
+
         if reset_state:
             self.current_slice_indices = {'x': None, 'y': None, 'z': None}
             self.image_shape_vox = None
             self.image_extents = {'x': None, 'y': None, 'z': None}
 
-        if removed_count > 0:
+        if scene_changed:
             self._render_all()
+            
+    def _debug_roi_alignment(self, key: str, main_vox: np.ndarray, roi_vox: np.ndarray) -> None: 
+        """Debug method to check ROI alignment issues."""
+        main_world = self._voxel_to_world(main_vox, self.main_window.anatomical_image_affine)
+        roi_world = self._voxel_to_world(roi_vox, self.main_window.roi_layers[key]['affine'])
+        
+        logger.info(f"  Main voxel: {main_vox} -> World: {main_world}")
+        logger.info(f"  ROI voxel: {roi_vox} -> World: {roi_world}")
+        logger.info(f"  World difference: {np.linalg.norm(main_world - roi_world)}")
+        
+        # Check if orientations match
+        main_orient = nib.aff2axcodes(self.main_window.anatomical_image_affine)
+        roi_orient = nib.aff2axcodes(self.main_window.roi_layers[key]['affine'])
+        logger.info(f"  Main orientation: {main_orient}")
+        logger.info(f"  ROI orientation: {roi_orient}")
 
     # --- Clear Crosshairs ---
     def _clear_crosshairs(self) -> None:
         """Removes the 2D crosshair actors from their scenes."""
-        actors_to_remove = [
-            (self.axial_scene, self.axial_crosshair_actor),
-            (self.coronal_scene, self.coronal_crosshair_actor),
-            (self.sagittal_scene, self.sagittal_crosshair_actor)
-        ]
-        
-        for scn, act in actors_to_remove:
+        # Remove axial and coronal from their scenes
+        for scn, act in [(self.axial_scene, self.axial_crosshair_actor),
+                         (self.coronal_scene, self.coronal_crosshair_actor)]:
             if scn and act:
                 try:
                     scn.rm(act)
                 except (ValueError, AttributeError):
-                    pass # Actor already removed or scene cleared
+                    pass
                 except Exception as e:
-                    print(f"Error removing crosshair actor: {e}")
+                    logger.error(f"Error removing crosshair actor: {e}")
+        
+        # Remove sagittal crosshair from overlay renderer
+        if hasattr(self, 'sagittal_overlay_renderer') and self.sagittal_overlay_renderer and self.sagittal_crosshair_actor:
+            try:
+                self.sagittal_overlay_renderer.RemoveActor(self.sagittal_crosshair_actor)
+            except Exception as e:
+                logger.error(f"Error removing sagittal crosshair actor: {e}")
 
         self.axial_crosshair_actor = None
         self.coronal_crosshair_actor = None
         self.sagittal_crosshair_actor = None
         self.crosshair_lines = {}
-
+        self.crosshair_appenders = {}
+    
     # --- Voxel <-> World Coordinate Helpers ---
-    def _voxel_to_world(self, vox_coord: List[float]) -> np.ndarray:
+    def _voxel_to_world(self, vox_coord: List[float], affine: Optional[np.ndarray] = None) -> np.ndarray:
         """Converts a voxel index [i, j, k] to world RASmm coordinates [x, y, z]."""
-        if self.main_window is None or self.main_window.anatomical_image_affine is None:
-            return np.array(vox_coord) # Fallback
+        if affine is None:
+            if self.main_window is None or self.main_window.anatomical_image_affine is None:
+                return np.array(vox_coord) # Fallback
+            affine = self.main_window.anatomical_image_affine
         
-        affine = self.main_window.anatomical_image_affine
         homog_vox = np.array([vox_coord[0], vox_coord[1], vox_coord[2], 1.0])
         world_coord = np.dot(affine, homog_vox)
         return world_coord[:3]
 
-    def _world_to_voxel(self, world_coord: List[float]) -> np.ndarray:
+    def _world_to_voxel(self, world_coord: List[float], inv_affine: Optional[np.ndarray] = None) -> np.ndarray:
         """Converts world RASmm coordinates [x, y, z] to voxel indices [i, j, k]."""
-        if self.main_window is None or self.main_window.anatomical_image_affine is None:
-            return np.array(world_coord) # Fallback
+        if inv_affine is None:
+            if self.main_window is None or self.main_window.anatomical_image_affine is None:
+                return np.array(world_coord) # Fallback
+            affine = self.main_window.anatomical_image_affine
+            inv_affine = np.linalg.inv(affine)
             
-        affine = self.main_window.anatomical_image_affine
-        inv_affine = np.linalg.inv(affine)
         homog_world = np.array([world_coord[0], world_coord[1], world_coord[2], 1.0])
         vox_coord = np.dot(inv_affine, homog_world)
         return vox_coord[:3] # Return float voxel coords
@@ -746,23 +988,24 @@ class VTKPanel:
             z_min, z_max = self.image_extents['z']
 
             # --- 1. Define line endpoints in WORLD coordinates ---
-            # Axial View (X-Y plane): Shows Sagittal (X) and Coronal (Y) lines at current Z
-            ax_line_x_p1 = self._voxel_to_world([x, y_min, z])
-            ax_line_x_p2 = self._voxel_to_world([x, y_max, z])
-            ax_line_y_p1 = self._voxel_to_world([x_min, y, z])
-            ax_line_y_p2 = self._voxel_to_world([x_max, y, z])
+            main_affine = self.main_window.anatomical_image_affine
+            # Axial View (X-Y plane):
+            ax_line_x_p1 = self._voxel_to_world([x, y_min, z], main_affine)
+            ax_line_x_p2 = self._voxel_to_world([x, y_max, z], main_affine)
+            ax_line_y_p1 = self._voxel_to_world([x_min, y, z], main_affine)
+            ax_line_y_p2 = self._voxel_to_world([x_max, y, z], main_affine)
             
-            # Coronal View (X-Z plane): Shows Sagittal (X) and Axial (Z) lines at current Y
-            co_line_x_p1 = self._voxel_to_world([x, y, z_min])
-            co_line_x_p2 = self._voxel_to_world([x, y, z_max])
-            co_line_z_p1 = self._voxel_to_world([x_min, y, z])
-            co_line_z_p2 = self._voxel_to_world([x_max, y, z])
+            # Coronal View (X-Z plane):
+            co_line_x_p1 = self._voxel_to_world([x, y, z_min], main_affine)
+            co_line_x_p2 = self._voxel_to_world([x, y, z_max], main_affine)
+            co_line_z_p1 = self._voxel_to_world([x_min, y, z], main_affine)
+            co_line_z_p2 = self._voxel_to_world([x_max, y, z], main_affine)
             
-            # Sagittal View (Y-Z plane): Shows Coronal (Y) and Axial (Z) lines at current X 
-            sa_line_y_p1 = self._voxel_to_world([x, y_min, z])
-            sa_line_y_p2 = self._voxel_to_world([x, y_max, z])
-            sa_line_z_p1 = self._voxel_to_world([x, y, z_min])
-            sa_line_z_p2 = self._voxel_to_world([x, y, z_max])
+            # Sagittal View (Y-Z plane):
+            sa_line_y_p1 = self._voxel_to_world([x, y_min, z], main_affine)
+            sa_line_y_p2 = self._voxel_to_world([x, y_max, z], main_affine)
+            sa_line_z_p1 = self._voxel_to_world([x, y, z_min], main_affine)
+            sa_line_z_p2 = self._voxel_to_world([x, y, z_max], main_affine)
             
             # --- 2. Check if actors need to be created ---
             if self.axial_crosshair_actor is None:
@@ -770,11 +1013,13 @@ class VTKPanel:
                 # --- Axial ---
                 self.crosshair_lines['ax_x'] = vtk.vtkLineSource()
                 self.crosshair_lines['ax_y'] = vtk.vtkLineSource()
-                ax_append = vtk.vtkAppendPolyData()
-                ax_append.AddInputConnection(self.crosshair_lines['ax_x'].GetOutputPort())
-                ax_append.AddInputConnection(self.crosshair_lines['ax_y'].GetOutputPort())
+                self.crosshair_appenders['axial'] = vtk.vtkAppendPolyData()
+                self.crosshair_appenders['axial'].AddInputConnection(self.crosshair_lines['ax_x'].GetOutputPort())
+                self.crosshair_appenders['axial'].AddInputConnection(self.crosshair_lines['ax_y'].GetOutputPort())
                 ax_mapper = vtk.vtkPolyDataMapper()
-                ax_mapper.SetInputConnection(ax_append.GetOutputPort())
+                ax_mapper.SetInputConnection(self.crosshair_appenders['axial'].GetOutputPort())
+                ax_mapper.SetResolveCoincidentTopologyToPolygonOffset()
+                ax_mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(-1, -1)
                 self.axial_crosshair_actor = vtk.vtkActor()
                 self.axial_crosshair_actor.SetMapper(ax_mapper)
                 self.axial_crosshair_actor.GetProperty().SetColor(1, 1, 0) # Yellow
@@ -785,11 +1030,13 @@ class VTKPanel:
                 # --- Coronal ---
                 self.crosshair_lines['co_x'] = vtk.vtkLineSource()
                 self.crosshair_lines['co_z'] = vtk.vtkLineSource()
-                co_append = vtk.vtkAppendPolyData()
-                co_append.AddInputConnection(self.crosshair_lines['co_x'].GetOutputPort())
-                co_append.AddInputConnection(self.crosshair_lines['co_z'].GetOutputPort())
+                self.crosshair_appenders['coronal'] = vtk.vtkAppendPolyData()
+                self.crosshair_appenders['coronal'].AddInputConnection(self.crosshair_lines['co_x'].GetOutputPort())
+                self.crosshair_appenders['coronal'].AddInputConnection(self.crosshair_lines['co_z'].GetOutputPort())
                 co_mapper = vtk.vtkPolyDataMapper()
-                co_mapper.SetInputConnection(co_append.GetOutputPort())
+                co_mapper.SetInputConnection(self.crosshair_appenders['coronal'].GetOutputPort())
+                co_mapper.SetResolveCoincidentTopologyToPolygonOffset()
+                co_mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(-1, -1)
                 self.coronal_crosshair_actor = vtk.vtkActor()
                 self.coronal_crosshair_actor.SetMapper(co_mapper)
                 self.coronal_crosshair_actor.GetProperty().SetColor(1, 1, 0)
@@ -800,41 +1047,49 @@ class VTKPanel:
                 # --- Sagittal ---
                 self.crosshair_lines['sa_y'] = vtk.vtkLineSource()
                 self.crosshair_lines['sa_z'] = vtk.vtkLineSource()
-                sa_append = vtk.vtkAppendPolyData()
-                sa_append.AddInputConnection(self.crosshair_lines['sa_y'].GetOutputPort())
-                sa_append.AddInputConnection(self.crosshair_lines['sa_z'].GetOutputPort())
+                self.crosshair_appenders['sagittal'] = vtk.vtkAppendPolyData()
+                self.crosshair_appenders['sagittal'].AddInputConnection(self.crosshair_lines['sa_y'].GetOutputPort())
+                self.crosshair_appenders['sagittal'].AddInputConnection(self.crosshair_lines['sa_z'].GetOutputPort())
                 sa_mapper = vtk.vtkPolyDataMapper()
-                sa_mapper.SetInputConnection(sa_append.GetOutputPort())
+                sa_mapper.SetInputConnection(self.crosshair_appenders['sagittal'].GetOutputPort())
                 self.sagittal_crosshair_actor = vtk.vtkActor()
                 self.sagittal_crosshair_actor.SetMapper(sa_mapper)
                 self.sagittal_crosshair_actor.GetProperty().SetColor(1, 1, 0)
                 self.sagittal_crosshair_actor.GetProperty().SetLineWidth(1.0)
                 self.sagittal_crosshair_actor.GetProperty().SetOpacity(0.8)
-                self.sagittal_scene.add(self.sagittal_crosshair_actor)
+                # Disable depth testing so crosshair always renders on top
+                self.sagittal_crosshair_actor.GetProperty().SetLighting(False)
+                self.sagittal_overlay_renderer.AddActor(self.sagittal_crosshair_actor)
 
             # --- 3. Update the line source endpoints ---
-            self.crosshair_lines['ax_x'].SetPoint1(ax_line_x_p1)
-            self.crosshair_lines['ax_x'].SetPoint2(ax_line_x_p2)
-            self.crosshair_lines['ax_y'].SetPoint1(ax_line_y_p1)
-            self.crosshair_lines['ax_y'].SetPoint2(ax_line_y_p2)
+            # Convert numpy arrays to tuples for VTK compatibility
+            self.crosshair_lines['ax_x'].SetPoint1(tuple(ax_line_x_p1))
+            self.crosshair_lines['ax_x'].SetPoint2(tuple(ax_line_x_p2))
+            self.crosshair_lines['ax_y'].SetPoint1(tuple(ax_line_y_p1))
+            self.crosshair_lines['ax_y'].SetPoint2(tuple(ax_line_y_p2))
             
-            self.crosshair_lines['co_x'].SetPoint1(co_line_x_p1)
-            self.crosshair_lines['co_x'].SetPoint2(co_line_x_p2)
-            self.crosshair_lines['co_z'].SetPoint1(co_line_z_p1)
-            self.crosshair_lines['co_z'].SetPoint2(co_line_z_p2)
+            self.crosshair_lines['co_x'].SetPoint1(tuple(co_line_x_p1))
+            self.crosshair_lines['co_x'].SetPoint2(tuple(co_line_x_p2))
+            self.crosshair_lines['co_z'].SetPoint1(tuple(co_line_z_p1))
+            self.crosshair_lines['co_z'].SetPoint2(tuple(co_line_z_p2))
 
-            self.crosshair_lines['sa_y'].SetPoint1(sa_line_y_p1)
-            self.crosshair_lines['sa_y'].SetPoint2(sa_line_y_p2)
-            self.crosshair_lines['sa_z'].SetPoint1(sa_line_z_p1)
-            self.crosshair_lines['sa_z'].SetPoint2(sa_line_z_p2)
+            self.crosshair_lines['sa_y'].SetPoint1(tuple(sa_line_y_p1))
+            self.crosshair_lines['sa_y'].SetPoint2(tuple(sa_line_y_p2))
+            self.crosshair_lines['sa_z'].SetPoint1(tuple(sa_line_z_p1))
+            self.crosshair_lines['sa_z'].SetPoint2(tuple(sa_line_z_p2))
             
-            # --- 4. Mark actors as modified (for 2D scenes) ---
+            # --- 4. Force pipeline update and mark actors as modified ---
+            for key in ['ax_x', 'ax_y', 'co_x', 'co_z', 'sa_y', 'sa_z']:
+                self.crosshair_lines[key].Update()
+            for key in ['axial', 'coronal', 'sagittal']:
+                self.crosshair_appenders[key].Update()
+                
             if self.axial_crosshair_actor: self.axial_crosshair_actor.Modified()
             if self.coronal_crosshair_actor: self.coronal_crosshair_actor.Modified()
             if self.sagittal_crosshair_actor: self.sagittal_crosshair_actor.Modified()
 
         except Exception as e:
-            print(f"Error creating/updating crosshairs: {e}\n{traceback.format_exc()}")
+            logger.error(f"Error creating/updating crosshairs:", exc_info=True)
             self._clear_crosshairs()
 
     # --- Move Slice ---
@@ -861,12 +1116,14 @@ class VTKPanel:
         # --- Delegate to the master update function ---
         kwargs = {axis: new_index}
         self.set_slice_indices(**kwargs)
-
+ 
+        self._update_slow_slice_components() 
+ 
     # --- Master Slice Update Function ---
     def set_slice_indices(self, x: Optional[int] = None, y: Optional[int] = None, z: Optional[int] = None) -> None:
         """
-        Sets the slice indices, updates all 3 slice actors and crosshairs,
-        and renders.
+        Sets the slice indices, updates anatomical slices and crosshairs.
+        This is called rapidly during a mouse drag.
         """
         if (not self.image_shape_vox or
             not self.axial_slice_actor or
@@ -893,7 +1150,7 @@ class VTKPanel:
         self.current_slice_indices = {'x': new_x, 'y': new_y, 'z': new_z}
 
         try:
-            # --- 4. Update all 3D slice actors ---
+            # --- 4. Update all 3D slice actors (FAST) ---
             x_ext = self.image_extents['x']
             y_ext = self.image_extents['y']
             z_ext = self.image_extents['z']
@@ -912,8 +1169,56 @@ class VTKPanel:
             if new_z != current['z']:
                 self.axial_slice_actor.display_extent(x_ext[0], x_ext[1], y_ext[0], y_ext[1], new_z, new_z)
                 slice_moved['z'] = True
+                
+            # --- 5. Update all ROI Slicers ---
+            if self.main_window and self.roi_slice_actors and self.image_extents['x']:
+                c_x = (self.image_extents['x'][0] + self.image_extents['x'][1]) / 2.0
+                c_y = (self.image_extents['y'][0] + self.image_extents['y'][1]) / 2.0
+                c_z = (self.image_extents['z'][0] + self.image_extents['z'][1]) / 2.0
 
-            # --- 5. Update 2D crosshair actors ---
+                sag_plane_vox_center = np.array([new_x, c_y, c_z, 1.0])
+                cor_plane_vox_center = np.array([c_x, new_y, c_z, 1.0])
+                ax_plane_vox_center = np.array([c_x, c_y, new_z, 1.0])
+
+                for key, actor_dict in self.roi_slice_actors.items():
+                    roi_info = self.main_window.roi_layers.get(key)
+                    if not roi_info or 'T_main_to_roi' not in roi_info: continue
+                    
+                    T_main_to_roi = roi_info['T_main_to_roi']
+                    roi_shape = roi_info['data'].shape
+                    roi_x_ext = (0, roi_shape[0] - 1)
+                    roi_y_ext = (0, roi_shape[1] - 1)
+                    roi_z_ext = (0, roi_shape[2] - 1)
+
+                    try:
+                        if slice_moved['x']:
+                            roi_vox_c = T_main_to_roi.dot(sag_plane_vox_center)
+                            new_roi_x = max(roi_x_ext[0], min(int(round(roi_vox_c[0])), roi_x_ext[1]))
+                            # Update both 3D and 2D actors
+                            if actor_dict.get('sagittal_3d'):
+                                actor_dict['sagittal_3d'].display_extent(new_roi_x, new_roi_x, roi_y_ext[0], roi_y_ext[1], roi_z_ext[0], roi_z_ext[1])
+                            if actor_dict.get('sagittal_2d'):
+                                actor_dict['sagittal_2d'].display_extent(new_roi_x, new_roi_x, roi_y_ext[0], roi_y_ext[1], roi_z_ext[0], roi_z_ext[1])
+
+                        if slice_moved['y']:
+                            roi_vox_c = T_main_to_roi.dot(cor_plane_vox_center)
+                            new_roi_y = max(roi_y_ext[0], min(int(round(roi_vox_c[1])), roi_y_ext[1]))
+                            if actor_dict.get('coronal_3d'):
+                                actor_dict['coronal_3d'].display_extent(roi_x_ext[0], roi_x_ext[1], new_roi_y, new_roi_y, roi_z_ext[0], roi_z_ext[1])
+                            if actor_dict.get('coronal_2d'):
+                                actor_dict['coronal_2d'].display_extent(roi_x_ext[0], roi_x_ext[1], new_roi_y, new_roi_y, roi_z_ext[0], roi_z_ext[1])
+
+                        if slice_moved['z']:
+                            roi_vox_c = T_main_to_roi.dot(ax_plane_vox_center)
+                            new_roi_z = max(roi_z_ext[0], min(int(round(roi_vox_c[2])), roi_z_ext[1]))
+                            if actor_dict.get('axial_3d'):
+                                actor_dict['axial_3d'].display_extent(roi_x_ext[0], roi_x_ext[1], roi_y_ext[0], roi_y_ext[1], new_roi_z, new_roi_z)
+                            if actor_dict.get('axial_2d'):
+                                actor_dict['axial_2d'].display_extent(roi_x_ext[0], roi_x_ext[1], roi_y_ext[0], roi_y_ext[1], new_roi_z, new_roi_z)
+
+                    except Exception as e:
+                        logger.error(f"Error updating ROI layer {key} slice: {e}")
+
             self._create_or_update_crosshairs()
 
             # --- 6. Update 2D cameras for moved slices ---
@@ -925,14 +1230,89 @@ class VTKPanel:
                 self._update_axial_camera()
 
             # --- 7. Update status and render ---
-            status_msg = f"Slice View: X={new_x}/{self.image_extents['x'][1]}  Y={new_y}/{self.image_extents['y'][1]}  Z={new_z}/{self.image_extents['z'][1]}"
-            self.update_status(status_msg)
             self._render_all()
 
         except Exception as e:
             error_msg = f"Error in set_slice_indices: {e}"
-            print(error_msg); traceback.print_exc()
-            self.update_status(f"Error setting slices.")
+            logger.error(error_msg, exc_info=True)
+    
+    def _update_slow_slice_components(self) -> None:
+            """
+            Updates the "slow" components of the slice view (status text, RAS coords)
+            after a drag-navigate is finished.
+            """
+            if (self.main_window is None or 
+                not all(self.current_slice_indices.values()) or
+                not self.image_extents['x']):
+                
+                # Still try to clear the coordinate display if no image
+                if self.main_window:
+                    self.main_window.update_ras_coordinate_display(None)
+                return
+            
+            c = self.current_slice_indices
+            
+            # --- 1. Update status text ---
+            status_msg = f"Slice View: X={c['x']}/{self.image_extents['x'][1]}  Y={c['y']}/{self.image_extents['y'][1]}  Z={c['z']}/{self.image_extents['z'][1]}"
+            self.update_status(status_msg)
+
+            # --- 2. Update RAS Coordinate Display ---
+            try:
+                main_affine = self.main_window.anatomical_image_affine
+                if main_affine is not None:
+                    # Get world coordinates
+                    world_coord = self._voxel_to_world([c['x'], c['y'], c['z']], main_affine)
+                    
+                    # Update the main window's new display
+                    self.main_window.update_ras_coordinate_display(world_coord)
+                    
+                else:
+                    self.main_window.update_ras_coordinate_display(None)
+            except Exception as e:
+                logger.error(f"Error updating RAS coordinate display: {e}")
+                self.main_window.update_ras_coordinate_display(None) # Pass None to signal error/clear
+                
+    def set_slices_from_ras(self, ras_coords: np.ndarray) -> None:
+        """
+        Moves the slice crosshairs to the specified RAS coordinate.
+        Converts RAS -> Voxel, then calls set_slice_indices.
+        
+        Args:
+            ras_coords: A (3,) numpy array of [X, Y, Z] world coordinates.
+        """
+        # 1. Check if we have the necessary info
+        if (self.main_window is None or
+            self.main_window.anatomical_image_affine is None or
+            not all(self.image_extents.values()) or
+            self.image_extents['x'] is None): # Check one specifically
+            
+            self.update_status("Error: Cannot set slices from RAS, no anatomical image loaded.")
+            return
+
+        try:
+            # 2. Convert RAS world coordinate to (float) voxel coordinate
+            inv_affine = np.linalg.inv(self.main_window.anatomical_image_affine)
+            voxel_pos_float = self._world_to_voxel(ras_coords, inv_affine)
+
+            # 3. Round to nearest integer voxel index
+            new_x = int(round(voxel_pos_float[0]))
+            new_y = int(round(voxel_pos_float[1]))
+            new_z = int(round(voxel_pos_float[2]))
+            
+            # 4. Clamp to valid voxel range
+            new_x = max(self.image_extents['x'][0], min(new_x, self.image_extents['x'][1]))
+            new_y = max(self.image_extents['y'][0], min(new_y, self.image_extents['y'][1]))
+            new_z = max(self.image_extents['z'][0], min(new_z, self.image_extents['z'][1]))
+            
+            # 5. Call the master update function
+            self.set_slice_indices(x=new_x, y=new_y, z=new_z)
+            
+            # 6. Update the status bar and text input
+            self._update_slow_slice_components()
+
+        except Exception as e:
+            self.update_status(f"Error setting slice from RAS: {e}")
+            logger.error(f"Error setting slice from RAS:", exc_info=True)
          
     def _navigate_2d_view(self, obj: vtk.vtkObject, event_id: str) -> None:
         """
@@ -942,7 +1322,8 @@ class VTKPanel:
         # 1. Check if anatomical image is loaded
         if (self.main_window is None or
             self.main_window.anatomical_image_data is None or
-            not all(self.current_slice_indices.values())):
+            None in self.current_slice_indices.values()):
+            self.is_navigating_2d = False # avoid freeze
             return
 
         # 2. Get interactor and click position (display coords)
@@ -960,6 +1341,7 @@ class VTKPanel:
 
         # Check if the picker missed 
         if picker.GetCellId() < 0:
+            # self.is_navigating_2d = False
             return
             
         # Get the 3D position of the pick
@@ -967,12 +1349,25 @@ class VTKPanel:
 
         try:
             # 4. Convert this world coordinate back to a (float) voxel coordinate
-            voxel_pos_float = self._world_to_voxel(world_pos)
+            inv_affine = np.linalg.inv(self.main_window.anatomical_image_affine)
+            voxel_pos_float = self._world_to_voxel(world_pos, inv_affine)
 
             # 5. Round to nearest integer voxel index
             new_x = int(round(voxel_pos_float[0]))
             new_y = int(round(voxel_pos_float[1]))
             new_z = int(round(voxel_pos_float[2]))
+            
+            # --- Clamp to valid voxel range ---
+            new_x = max(self.image_extents['x'][0], min(new_x, self.image_extents['x'][1]))
+            new_y = max(self.image_extents['y'][0], min(new_y, self.image_extents['y'][1]))
+            new_z = max(self.image_extents['z'][0], min(new_z, self.image_extents['z'][1]))
+            
+            # Abort if the pick produced an out-of-range index
+            if (new_x < self.image_extents['x'][0] or new_x > self.image_extents['x'][1] or
+                new_y < self.image_extents['y'][0] or new_y > self.image_extents['y'][1] or
+                new_z < self.image_extents['z'][0] or new_z > self.image_extents['z'][1]):
+                self.is_navigating_2d = False   
+                return
 
             # 6. Call the master update function
             if interactor == self.axial_interactor:
@@ -994,8 +1389,9 @@ class VTKPanel:
                 self.set_slice_indices(x=new_x, y=new_y, z=new_z)
 
         except Exception as e:
-            print(f"Error during 2D window click navigation: {e}\n{traceback.format_exc()}")
+            logger.error(f"Error during 2D window click navigation:", exc_info=True)
             self.update_status("Error navigating with click.")
+            
 
     # --- Streamline Actor Management ---
     def update_highlight(self) -> None:
@@ -1009,7 +1405,8 @@ class VTKPanel:
                 self.scene.rm(self.highlight_actor)
                 actor_removed = True
             except (ValueError, AttributeError): actor_removed = True 
-            except Exception as e: print(f"  Error removing highlight actor: {e}. Proceeding cautiously.")
+            except Exception as e: 
+                logger.error(f"  Error removing highlight actor: {e}. Proceeding cautiously.")
             finally: self.highlight_actor = None
 
         # Check prerequisites
@@ -1040,12 +1437,15 @@ class VTKPanel:
                 try:
                     highlight_linewidth = 6 
                     self.highlight_actor = actor.line(
-                        selected_sl_data_list, # Pass the list
+                        selected_sl_data_list,     # Pass the list
                         colors=(1, 1, 0),          # Bright Yellow
                         linewidth=highlight_linewidth,
                         opacity=1.0                # Fully opaque
                     )
                     self.scene.add(self.highlight_actor)
+                    
+                    if self.main_window and not self.main_window.bundle_is_visible:
+                        self.highlight_actor.SetVisibility(0)
                     
                     if self.highlight_actor:
                         try:
@@ -1054,10 +1454,10 @@ class VTKPanel:
                                 mapper.SetResolveCoincidentTopologyToPolygonOffset()
                                 mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(-1, -15)
                         except Exception as e:
-                            print(f"Warning: Could not apply mapper offset to highlight_actor: {e}")
+                            logger.warning(f"Warning: Could not apply mapper offset to highlight_actor: {e}")
                     
                 except Exception as e:
-                     print(f"Error creating highlight actor: {e}\n{traceback.format_exc()}")
+                     logger.error(f"Error creating highlight actor:", exc_info=True)
                      self.highlight_actor = None
 
         # Update UI action states
@@ -1081,7 +1481,7 @@ class VTKPanel:
             lut.SetHueRange(0.667, 0.0) # Blue to Red (standard)
             lut.Build()
         except Exception as e:
-            print(f"Error creating scalar LUT: {e}. Defaulting to grey.")
+            logger.error(f"Error creating scalar LUT: {e}. Defaulting to grey.")
             return None # Fallback to grey
         
         # --- 3. Build the list of color arrays (one per *non-empty* streamline) ---
@@ -1119,7 +1519,7 @@ class VTKPanel:
         try:
             concatenated_colors = np.concatenate(vertex_colors_list, axis=0)
         except ValueError as ve:
-             print(f"CRITICAL: Failed to concatenate color arrays: {ve}")
+             logger.error(f"Failed to concatenate color arrays: {ve}")
              return None # Fallback to grey
 
         return {'colors': concatenated_colors, 'opacity': 0.8, 'linewidth': 3}
@@ -1157,7 +1557,8 @@ class VTKPanel:
                 # Pass the concrete list
                 params['colors'] = colormap.line_colors(visible_streamlines_list)
                 params['opacity'] = 0.8
-            except Exception as e: print(f"Error calculating orientation colors: {e}. Using default.")
+            except Exception as e: 
+                logger.warning(f"Error calculating orientation colors: {e}. Using default.")
         
         elif current_mode == ColorMode.SCALAR:
             scalar_data = self.main_window.scalar_data_per_point
@@ -1197,8 +1598,10 @@ class VTKPanel:
                 actor_removed = True
             except ValueError:
                 actor_removed = True
-            except Exception as e: print(f"  Error removing streamline actor: {e}. Proceeding cautiously.")
-            finally: self.streamlines_actor = None
+            except Exception as e: 
+                logger.warning(f"  Error removing streamline actor: {e}. Proceeding cautiously.")
+            finally: 
+                self.streamlines_actor = None
 
         if not self.main_window or not self.main_window.tractogram_data:
             self.update_highlight()
@@ -1225,6 +1628,8 @@ class VTKPanel:
 
         try:
             self.streamlines_actor = actor.line(streamlines_to_draw_list, **actor_params) 
+            if self.main_window and not self.main_window.bundle_is_visible:
+                self.streamlines_actor.SetVisibility(0)
             self.scene.add(self.streamlines_actor)
             
             if self.streamlines_actor:
@@ -1234,10 +1639,10 @@ class VTKPanel:
                         mapper.SetResolveCoincidentTopologyToPolygonOffset()
                         mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(-1, -15)
                 except Exception as e:
-                    print(f"Warning: Could not apply mapper offset to streamlines_actor: {e}")
+                    logger.warning(f"Warning: Could not apply mapper offset to streamlines_actor: {e}")
                     
         except Exception as e:
-            print(f"Error creating main streamlines actor: {e}\n{traceback.format_exc()}")
+            logger.error(f"Error creating main streamlines actor:", exc_info=True)
             QMessageBox.warning(self.main_window, "Actor Error", f"Could not display streamlines: {e}")
             try:
                 if self.streamlines_actor:
@@ -1256,13 +1661,13 @@ class VTKPanel:
                                 mapper.SetResolveCoincidentTopologyToPolygonOffset()
                                 mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(-1, -15)
                         except Exception as e:
-                            print(f"Warning: Could not apply mapper offset to fallback_actor: {e}")   
+                            logger.warning(f"Warning: Could not apply mapper offset to fallback_actor: {e}")   
                 
                 if self.main_window:
                      self.main_window.current_color_mode = ColorMode.DEFAULT
                      self.main_window.color_default_action.setChecked(True)
             except Exception as fallback_e:
-                print(f"CRITICAL: Error creating fallback streamlines actor: {fallback_e}")
+                logger.error(f"Error creating fallback streamlines actor: {fallback_e}")
                 self.streamlines_actor = None
 
         self.update_highlight()
@@ -1293,7 +1698,10 @@ class VTKPanel:
         else: self.main_window._decrease_radius()
 
     def _find_streamlines_in_radius(self, center_point: np.ndarray, radius: float) -> Set[int]:
-        """Finds indices of streamlines intersecting a sphere."""
+        """
+        Finds indices of streamlines intersecting a sphere.
+        Uses Bounding Box check (speed) and Segment Distance (precision). 
+        """
         if not self.main_window or not self.main_window.tractogram_data: 
             return set()
             
@@ -1302,6 +1710,10 @@ class VTKPanel:
         
         indices_in_radius: Set[int] = set()
         radius_sq = radius * radius
+        
+        # Pre-calculate bounds for the sphere for fast rejection
+        sphere_min = center_point - radius
+        sphere_max = center_point + radius
         
         for idx in indices_to_search:
             if not isinstance(tractogram, nib.streamlines.ArraySequence) or idx >= len(tractogram):
@@ -1312,9 +1724,52 @@ class VTKPanel:
                 if not isinstance(sl, np.ndarray) or sl.ndim != 2 or sl.shape[1] != 3 or sl.size == 0: 
                     continue
             
+                # --- Bounding Box Check ---
+                # If the streamline's bounding box doesn't overlap the sphere's box, skip it.
+                sl_min = np.min(sl, axis=0)
+                sl_max = np.max(sl, axis=0)
+                
+                if np.any(sl_max < sphere_min) or np.any(sl_min > sphere_max):
+                    continue
+
+                # --- Segment Distance ---
+                # Check distance to points first (fastest)
                 diff_sq = np.sum((sl - center_point)**2, axis=1)
-                if np.min(diff_sq) < radius_sq: indices_in_radius.add(idx)
-            except Exception as e: print(f"Warning: Error processing streamline {idx} for selection: {e}")
+                if np.min(diff_sq) < radius_sq:
+                    indices_in_radius.add(idx)
+                    continue
+                
+                # If points didn't trigger, check the segments between points (slowest).
+                # This catches the case where the sphere is *between* two points. We vectorize the calculation for the whole streamline.
+                p1 = sl[:-1]
+                p2 = sl[1:]
+                
+                segment_vec = p2 - p1 # Vector from p1 to p2
+                point_vec = center_point - p1 # Vector from p1 to center
+
+                # Project point_vec onto segment_vec (dot product)
+                seg_len_sq = np.sum(segment_vec**2, axis=1)
+                
+                # Avoid division by zero
+                seg_len_sq[seg_len_sq == 0] = 1.0
+                
+                t = np.sum(point_vec * segment_vec, axis=1) / seg_len_sq
+                
+                # Clamp t to segment [0, 1]
+                t = np.clip(t, 0, 1)
+                
+                # Find closest point on segment
+                closest_points = p1 + segment_vec * t[:, np.newaxis]
+                
+                # Check distances
+                seg_dists_sq = np.sum((closest_points - center_point)**2, axis=1)
+                
+                if np.min(seg_dists_sq) < radius_sq:
+                    indices_in_radius.add(idx)
+
+            except Exception as e: 
+                logger.warning(f"Warning: Error processing streamline {idx} for selection: {e}")
+                
         return indices_in_radius
 
     def _toggle_selection(self, indices_to_toggle: Set[int]) -> None:
@@ -1369,6 +1824,9 @@ class VTKPanel:
              self._toggle_selection(set())
         else:
              self._toggle_selection(indices_in_radius)
+        
+        # --- Hide selection sphere after selection is applied ---
+        self.update_radius_actor(visible=False)
 
     def key_press_callback(self, obj: vtk.vtkObject, event_id: str) -> None:
         """Handles key press events forwarded from the VTK interactor."""
@@ -1433,7 +1891,203 @@ class VTKPanel:
 
         if key in streamline_data_handlers and not ctrl and not shift:
              streamline_data_handlers[key]()
+             
+    # --- ROI Layer Actor Management ---
+    def add_roi_layer(self, key: str, data: np.ndarray, affine: np.ndarray) -> None:
+        """Creates and adds slicer actors for a new ROI layer (separating 2D/3D actors)."""
+        if not self.scene or not self.main_window or self.main_window.anatomical_image_affine is None:
+            logger.error("Cannot add ROI layer: Main scene or image not initialized.")
+            return
 
+        # 1. Determine value range
+        data_min = np.min(data)
+        data_max = np.max(data)
+        value_range = (data_min, data_max)
+        
+        if data_max <= data_min:
+            value_range = (data_min - 0.5, data_max + 0.5)
+        elif data_min == 0 and data_max > 0:
+            value_range = (0.1, data_max) 
+        
+        slicer_opacity = 0.5 
+        interpolation_mode = 'nearest'
+
+        # 2. Get current slice indices
+        c_idx = self.current_slice_indices
+        if c_idx['x'] is None:
+            self.update_status("Error: Slices not initialized.")
+            return
+
+        # 3. Calculate initial ROI slice indices
+        main_img_affine = self.main_window.anatomical_image_affine
+        roi_info = self.main_window.roi_layers.get(key)
+        if not roi_info or 'inv_affine' not in roi_info:
+            return
+            
+        inv_roi_affine = roi_info['inv_affine']
+        c_x, c_y, c_z = c_idx['x'], c_idx['y'], c_idx['z']
+        world_c = self._voxel_to_world([c_x, c_y, c_z], main_img_affine)
+        roi_vox_c = self._world_to_voxel(world_c, inv_roi_affine)
+        roi_x, roi_y, roi_z = int(round(roi_vox_c[0])), int(round(roi_vox_c[1])), int(round(roi_vox_c[2]))
+
+        # 4. Get ROI extents
+        roi_shape = data.shape
+        roi_x_ext = (0, roi_shape[0] - 1)
+        roi_y_ext = (0, roi_shape[1] - 1)
+        roi_z_ext = (0, roi_shape[2] - 1)
+
+        try:
+            slicer_params = {
+                'affine': affine,
+                'value_range': value_range,
+                'opacity': slicer_opacity,
+                'interpolation': interpolation_mode
+            }
+            
+            # --- Create TWO sets of actors ---
+            # Set 1: For the main 3D Scene (No artificial flipping)
+            ax_3d = actor.slicer(data, **slicer_params)
+            cor_3d = actor.slicer(data, **slicer_params)
+            sag_3d = actor.slicer(data, **slicer_params)
+            
+            # Set 2: For the 2D Ortho Views (Will get display correction)
+            ax_2d = actor.slicer(data, **slicer_params)
+            cor_2d = actor.slicer(data, **slicer_params)
+            sag_2d = actor.slicer(data, **slicer_params)
+            
+            is_visible = True
+            if self.main_window:
+                is_visible = self.main_window.roi_visibility.get(key, True)
+            vis_flag = 1 if is_visible else 0
+            
+            for act in [ax_3d, cor_3d, sag_3d, ax_2d, cor_2d, sag_2d]:
+                act.SetVisibility(vis_flag)
+            
+            # Set initial display extents for ALL actors
+            for ax in [ax_3d, ax_2d]:
+                ax.display_extent(roi_x_ext[0], roi_x_ext[1], roi_y_ext[0], roi_y_ext[1], roi_z, roi_z)
+            for cor in [cor_3d, cor_2d]:
+                cor.display_extent(roi_x_ext[0], roi_x_ext[1], roi_y, roi_y, roi_z_ext[0], roi_z_ext[1])
+            for sag in [sag_3d, sag_2d]:
+                sag.display_extent(roi_x, roi_x, roi_y_ext[0], roi_y_ext[1], roi_z_ext[0], roi_z_ext[1])
+            
+            # Store in expanded dictionary
+            self.roi_slice_actors[key] = {
+                'axial_3d': ax_3d, 'coronal_3d': cor_3d, 'sagittal_3d': sag_3d,
+                'axial_2d': ax_2d, 'coronal_2d': cor_2d, 'sagittal_2d': sag_2d
+            }
+            
+            # 6. Add to respective scenes
+            self.scene.add(ax_3d); self.scene.add(cor_3d); self.scene.add(sag_3d)
+            self.axial_scene.add(ax_2d)
+            self.coronal_scene.add(cor_2d)
+            self.sagittal_scene.add(sag_2d)
+            
+            # --- Apply transformation ONLY to 2D actors ---
+            self._apply_display_correction(key)
+            
+            # ---Set default color to Dark Grey (0.25, 0.25, 0.25) --
+            self.set_roi_layer_color(key, (1.0, 0.0, 0.0))
+            
+            self.update_status(f"Added ROI layer: {os.path.basename(key)}")
+            self._render_all()
+
+        except Exception as e:
+            logger.error(f"Error creating ROI slicer actors:", exc_info=True)
+            QMessageBox.critical(self.main_window, "ROI Actor Error", f"Could not create slicer actors for ROI:\n{e}")
+            if key in self.main_window.roi_layers: del self.main_window.roi_layers[key]
+            if key in self.roi_slice_actors: del self.roi_slice_actors[key]
+
+    def _apply_display_correction(self, roi_key: str) -> None:
+        """Applies display correction only to 2D ROI slices."""
+        if roi_key not in self.roi_slice_actors:
+            return
+            
+        roi_actors = self.roi_slice_actors[roi_key]
+        
+        # Only correct the 2D actors
+        targets = ['axial_2d', 'coronal_2d']
+        
+        for actor_type in targets:
+            actor_obj = roi_actors.get(actor_type)
+            if actor_obj:
+                current_pos = actor_obj.GetPosition()
+                # Flip in X direction
+                actor_obj.SetScale(-1, 1, 1)
+                
+                # Heuristic adjustment for position
+                bounds = actor_obj.GetBounds()
+                if bounds[0] != 1.0 and bounds[1] != 1.0:
+                    actor_obj.SetPosition(-current_pos[0], current_pos[1], current_pos[2])
+                        
+    def set_roi_layer_visibility(self, key: str, visible: bool) -> None:
+        """Sets visibility for all 2D and 3D actors of an ROI."""
+        if key not in self.roi_slice_actors: return
+        
+        vis_flag = 1 if visible else 0
+        changed = False
+        
+        # Iterate over all actors stored for this key
+        for act in self.roi_slice_actors[key].values():
+            if act and act.GetVisibility() != vis_flag:
+                act.SetVisibility(vis_flag)
+                changed = True
+        
+        if changed: self._render_all()
+
+    def remove_roi_layer(self, key: str) -> None:
+        """Removes a specific ROI layer's actors from all scenes."""
+        if key not in self.roi_slice_actors: return
+
+        scenes_to_check = [self.scene, self.axial_scene, self.coronal_scene, self.sagittal_scene]
+        
+        for act in self.roi_slice_actors[key].values():
+            if act is not None:
+                for scn in scenes_to_check:
+                    try: scn.rm(act)
+                    except: pass
+
+        del self.roi_slice_actors[key]
+        self._render_all()
+
+
+    def clear_all_roi_layers(self) -> None:
+        """Removes all ROI slice actors from all scenes."""
+        if not self.roi_slice_actors: return
+            
+        scenes_to_check = [self.scene, self.axial_scene, self.coronal_scene, self.sagittal_scene]
+        
+        for actor_dict in self.roi_slice_actors.values():
+            for act in actor_dict.values():
+                if act:
+                    for scn in scenes_to_check:
+                        try: scn.rm(act)
+                        except: pass
+
+        self.roi_slice_actors.clear()
+        self._render_all()
+
+    def set_roi_layer_color(self, key: str, color: Tuple[float, float, float]) -> None:
+        """Sets the color (tint) for a specific ROI layer."""
+        if key not in self.roi_slice_actors: return
+        
+        r, g, b = color
+        for act in self.roi_slice_actors[key].values():
+            if act:
+                prop = act.GetProperty()
+                lut = vtk.vtkLookupTable()
+                lut.SetNumberOfTableValues(256)
+                w = prop.GetColorWindow()
+                l = prop.GetColorLevel()
+                lut.SetTableRange(l - w/2, l + w/2)
+                lut.Build()
+                for i in range(256):
+                    alpha = 0.0 if i == 0 else 1.0
+                    lut.SetTableValue(i, r * i/255, g * i/255, b * i/255, alpha)
+                prop.SetLookupTable(lut)
+        
+        self._render_all()
+            
     def take_screenshot(self) -> None:
         """Saves a screenshot of the VTK view with an opaque black background, hiding UI overlays."""
         if not self.render_window or not self.scene:
@@ -1509,8 +2163,9 @@ class VTKPanel:
             self.update_status(f"Screenshot saved: {os.path.basename(output_path)}")
 
         except Exception as e:
-            error_msg = f"Error taking screenshot:\n{e}\n\n{traceback.format_exc()}"
-            print(error_msg); QMessageBox.critical(self.main_window, "Screenshot Error", error_msg)
+            error_msg = f"Error taking screenshot:"
+            logger.error(error_msg, exc_info=True)
+            QMessageBox.critical(self.main_window, "Screenshot Error", error_msg)
             self.update_status(f"Error saving screenshot.")
         finally:
             if original_background: self.scene.background(original_background)

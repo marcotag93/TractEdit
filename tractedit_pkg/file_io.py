@@ -6,86 +6,341 @@ and loading anatomical image files (NIfTI).
 """
 
 import os
-import traceback
 import ast
+import logging
 import numpy as np
 import nibabel as nib
 import trx.trx_file_memmap as tbx
-from PyQt6.QtWidgets import QFileDialog, QMessageBox, QApplication
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QFileDialog, QMessageBox, QApplication, QProgressDialog, QWidget
 from .utils import ColorMode
 from typing import Optional, List, Dict, Any, Tuple, Type, Union
 
+logger = logging.getLogger(__name__)
+
 # --- Helper Function ---
-# This is a mess, will be updated to be cleaner in the future 
-def parse_numeric_tuple_from_string(value_str: Any, target_type: Type = float, expected_length: Optional[Union[int, Tuple[int, ...]]] = None) -> Any:
-    if not isinstance(value_str, str):
-        # If it's already a list or tuple, try to convert types and check length
-        if isinstance(value_str, (list, tuple)):
-            try:
-                converted_tuple = tuple(target_type(x) for x in value_str)
-                if expected_length is not None and len(converted_tuple) != expected_length:
-                    # print(f"Warning: Input sequence {value_str} has length {len(converted_tuple)}, expected {expected_length}.") # debug
-                    return value_str # Return original if length mismatch after conversion
-                return converted_tuple
-            except (ValueError, TypeError): # e.g. target_type(x) fails
-                return value_str # Return original on conversion error
-        elif isinstance(value_str, np.ndarray):
-            try:
-                converted_array = value_str.astype(target_type)
-                if isinstance(expected_length, tuple): # For matrix shapes
-                    if converted_array.shape != expected_length:
-                        return value_str
-                elif expected_length is not None: # For 1D array/tuple lengths
-                        if converted_array.ndim == 1 and len(converted_array) != expected_length:
-                            return value_str
-                        elif converted_array.ndim != 1 : # Or if not 1D when expected_length is int
-                            return value_str
-                return converted_array
-            except (ValueError, TypeError):
-                return value_str # Return original on type conversion error for ndarray
-        else: # Not a string, list, tuple, or ndarray
-            return value_str
+def parse_numeric_tuple_from_string(
+    input_value: Union[str, List, Tuple, np.ndarray, Any], 
+    target_type: Type = float, 
+    expected_length: Optional[Union[int, Tuple[int, ...]]] = None
+) -> Any:
+    """
+    Parses an input (string, list, tuple, or ndarray) into a tuple/array of a specific numeric type.
+    
+    If parsing or validation fails, the original input_value is returned.
 
-    # --- If input is a string, proceed with parsing ---
+    Args:
+        input_value: The input data to parse. Can be a string representation (e.g. "(1, 2, 3)", "1 2 3"),
+                     a sequence, or a numpy array.
+        target_type: The desired type for the elements (default: float).
+        expected_length: The expected length (int) or shape (tuple) of the result.
+    
+    Returns:
+        The parsed tuple/array cast to target_type, or input_value if parsing/validation fails.
+    """
+    
+    # 1. Handle non-string inputs (Already lists, tuples, or arrays)
+    if not isinstance(input_value, str):
+        return _process_existing_sequence(input_value, target_type, expected_length)
+
+    # 2. Strategy A: Try safe python syntax parsing (e.g., "(1, 2)", "[1, 2]")
     try:
-        parsed_val = ast.literal_eval(value_str)
-        if isinstance(parsed_val, (list, tuple)):
-            result = tuple(target_type(x) for x in parsed_val)
-            if expected_length is not None and len(result) != expected_length:
-                # print(f"Warning: Parsed tuple {result} from '{value_str}' has length {len(result)}, expected {expected_length}.")
-                return value_str # Return original string if length mismatch
-            return result
-        elif isinstance(parsed_val, (int, float)): 
-            result_scalar = target_type(parsed_val)
-            # If expected_length is 1, wrap in a tuple
-            if expected_length == 1:
-                return (result_scalar,)
-            # If expected_length is None (e.g. for a single scalar not in a tuple), return scalar
-            elif expected_length is None: 
-                return result_scalar
-            else: # Mismatch if expected_length is other than 1 or None for a single number
-                return value_str 
-    except (ValueError, SyntaxError, TypeError): # ast.literal_eval failed or target_type(x) failed
-        # Fallback: try splitting the string
-        cleaned_str = value_str.strip('()[] ') # Added space to strip
-        parts = [p.strip() for p in cleaned_str.split(',') if p.strip()] if ',' in cleaned_str else \
-                [p.strip() for p in cleaned_str.split() if p.strip()]
+        parsed_val = ast.literal_eval(input_value)
+        return _process_parsed_value(parsed_val, input_value, target_type, expected_length)
+    except (ValueError, SyntaxError, TypeError):
+        pass
 
-        if not parts: # If splitting results in no parts
-            return value_str
+    # 3. Strategy B: Fallback to string splitting (e.g., "1 2 3", "1, 2, 3")
+    # Clean brackets and split by comma or whitespace
+    cleaned_str = input_value.translate(str.maketrans('', '', '[]()'))
+    parts = cleaned_str.replace(',', ' ').split()
+    
+    if not parts:
+        return input_value
 
+    try:
+        # Convert parts to target type
+        converted = tuple(target_type(p) for p in parts)
+        return _validate_length(converted, expected_length, input_value)
+    except (ValueError, TypeError):
+        return input_value
+
+
+# --- Helper Functions ---
+def _process_existing_sequence(data: Any, dtype: Type, length_req: Any) -> Any:
+    """Handles inputs that are already lists, tuples, or numpy arrays."""
+    if isinstance(data, (list, tuple)):
         try:
-            result = tuple(target_type(p) for p in parts)
-            if expected_length is not None and len(result) != expected_length:
-                # print(f"Warning: Parsed tuple {result} from splitting '{value_str}' has length {len(result)}, expected {expected_length}.")
-                return value_str # Return original string if length mismatch
-            return result
-        except (ValueError, TypeError): # target_type(p) failed
-            # print(f"Warning: Could not parse '{value_str}' as a tuple of {target_type} after splitting.")
-            return value_str
-    # Fallback if ast.literal_eval results in an unexpected type or other issues
-    return value_str
+            converted = tuple(dtype(x) for x in data)
+            return _validate_length(converted, length_req, data)
+        except (ValueError, TypeError):
+            return data
 
+    if isinstance(data, np.ndarray):
+        try:
+            # Check shape/length before casting
+            if not _check_numpy_shape(data, length_req):
+                return data
+            return data.astype(dtype)
+        except (ValueError, TypeError):
+            return data
+            
+    return data
+
+def _process_parsed_value(parsed: Any, original: Any, dtype: Type, length_req: Any) -> Any:
+    """Handles the result of ast.literal_eval."""
+    # Handle Sequences
+    if isinstance(parsed, (list, tuple)):
+        try:
+            converted = tuple(dtype(x) for x in parsed)
+            return _validate_length(converted, length_req, original)
+        except (ValueError, TypeError):
+            return original
+            
+    # Handle Scalars
+    if isinstance(parsed, (int, float)):
+        val = dtype(parsed)
+        if length_req == 1:
+            return (val,)
+        elif length_req is None:
+            return val
+            
+    return original
+
+def _validate_length(data: tuple, expected: Optional[Union[int, Tuple[int, ...]]], original: Any) -> Any:
+    """Validates that the data tuple matches the expected length."""
+    if expected is None:
+        return data
+    
+    # If expected is a tuple (usually for numpy shapes), we only check dimension 0 here for tuples
+    if isinstance(expected, tuple):
+        # This function primarily handles 1D tuples. Complex matrix strings are rare in this context.
+        return data if len(data) == expected[0] else original
+
+    return data if len(data) == expected else original
+
+def _check_numpy_shape(arr: np.ndarray, expected: Optional[Union[int, Tuple[int, ...]]]) -> bool:
+    """Validates numpy array shape or length."""
+    if expected is None:
+        return True
+    if isinstance(expected, tuple):
+        return arr.shape == expected
+    return arr.ndim == 1 and len(arr) == expected
+
+def _resample_streamline(streamline: np.ndarray, nb_points: int = 100) -> np.ndarray:
+    """
+    Resamples a streamline to a fixed number of points using linear interpolation.
+    Necessary for calculating mean or distance matrices.
+    """
+    if len(streamline) <= 1:
+        return streamline
+        
+    # Calculate cumulative distance along the streamline
+    dists = np.sqrt(np.sum(np.diff(streamline, axis=0)**2, axis=1))
+    cum_dists = np.concatenate(([0], np.cumsum(dists)))
+    total_length = cum_dists[-1]
+    
+    if total_length == 0:
+        return np.repeat(streamline[0][None, :], nb_points, axis=0)
+        
+    # Generate new distances
+    new_dists = np.linspace(0, total_length, nb_points)
+    
+    # Interpolate X, Y, Z
+    new_x = np.interp(new_dists, cum_dists, streamline[:, 0])
+    new_y = np.interp(new_dists, cum_dists, streamline[:, 1])
+    new_z = np.interp(new_dists, cum_dists, streamline[:, 2])
+    
+    return np.stack((new_x, new_y, new_z), axis=1)
+
+def _compute_centroid_math(streamlines: List[np.ndarray], nb_points: int = 100) -> np.ndarray:
+    """
+    Computes the mean streamline (centroid).
+    Handles orientation flipping to ensure streamlines align before averaging.
+    """
+    if not streamlines:
+        return None
+    
+    # 1. Resample all to same number of points
+    resampled = [_resample_streamline(s, nb_points) for s in streamlines]
+    ref = resampled[0]
+    
+    aligned_streamlines = [ref]
+    
+    # 2. Align all subsequent streamlines to the reference (the first one)
+    # MDF (Mean Direct Flip) distance logic for alignment
+    for i in range(1, len(resampled)):
+        s = resampled[i]
+        
+        # Direct distance
+        dist_direct = np.mean(np.linalg.norm(ref - s, axis=1))
+        # Flipped distance
+        dist_flipped = np.mean(np.linalg.norm(ref - s[::-1], axis=1))
+        
+        if dist_flipped < dist_direct:
+            aligned_streamlines.append(s[::-1])
+        else:
+            aligned_streamlines.append(s)
+            
+    # 3. Compute arithmetic mean
+    centroid = np.mean(aligned_streamlines, axis=0)
+    return centroid
+
+def _compute_medoid_math(streamlines: List[np.ndarray], nb_points: int = 100, parent: Optional[QWidget] = None) -> int:
+    """
+    Identifies the index of the medoid streamline.
+    The medoid is the streamline that minimizes the sum of distances (MDF) to all other streamlines.
+    """
+    if not streamlines:
+        return -1
+    
+    n = len(streamlines)
+    if n == 1:
+        return 0
+        
+    # Resample streamlines for consistent distance calculation
+    resampled = np.array([_resample_streamline(s, nb_points) for s in streamlines])
+        
+    # 2. Compute Distance Matrix (MDF - Minimum Direct Flip)
+    # This is O(N^2), but for typical editing bundles it's acceptable.
+    # For very large N, this might freeze the UI briefly. Added a progress dialog. 
+    dist_matrix = np.zeros((n, n))
+    
+    # Progress dialog
+    progress = QProgressDialog("Calculating Medoid... ", "Cancel", 0, n, parent)
+    progress.setWindowModality(Qt.WindowModality.WindowModal)
+    progress.setMinimumDuration(500) # Only show if calculation takes > 0.5s
+    progress.setValue(0)
+    
+    # O(N^2) Distance calculation
+    for i in range(n):
+        if progress.wasCanceled():
+            return -1 # Return error code if cancelled
+        progress.setValue(i)
+        
+        for j in range(i + 1, n):
+            s1 = resampled[i]
+            s2 = resampled[j]
+            
+            # MDF (Mean Direct Flip) Distance
+            d_direct = np.mean(np.linalg.norm(s1 - s2, axis=1))
+            d_flipped = np.mean(np.linalg.norm(s1 - s2[::-1], axis=1))
+            dist = min(d_direct, d_flipped)
+            
+            dist_matrix[i, j] = dist
+            dist_matrix[j, i] = dist 
+            
+    progress.setValue(n) # Ensure bar fills completely
+            
+    # Sum rows to find total distance for each candidate
+    total_dists = np.sum(dist_matrix, axis=1)
+    
+    # 4. Argmin is the medoid index
+    return int(np.argmin(total_dists))
+
+def calculate_and_save_statistic(main_window: Any, method: str) -> None:
+    """
+    Calculates and saves a statistic (centroid or medoid) of the visible streamlines.
+    Unifies logic for calculate_and_save_centroid and calculate_and_save_medoid
+    while preserving exact UX and logic.
+
+    Args:
+        main_window: The main application window instance.
+        method: 'centroid' or 'medoid'.
+    """
+    # Ensure method is lowercase for logic, capitalize for UI strings
+    method = method.lower()
+    if method not in ['centroid', 'medoid']:
+        logger.error(f"Invalid method for statistic calculation: {method}")
+        return
+
+    method_ui = method.capitalize()
+    status_updater = getattr(main_window.vtk_panel, 'update_status', lambda msg: logger.info(f"Status: {msg}"))
+
+    # 1. Validation
+    if not _validate_save_prerequisites(main_window):
+        return
+    if not main_window.visible_indices:
+        QMessageBox.warning(main_window, "Calculation Error", f"No visible streamlines to calculate {method}.")
+        return
+
+    # --- Medoid Specific Safety Check ---
+    if method == 'medoid' and len(main_window.visible_indices) > 100000:
+        QMessageBox.warning(main_window, "Safety Warning", 
+                            f"Too many streamlines selected ({len(main_window.visible_indices)}).\n"
+                            "Medoid calculation is computationally intensive (O(N²)) and would freeze the application.\n"
+                            "Please reduce the selection to below 100,000 streamlines.")
+        status_updater("Medoid calculation aborted (too many streamlines).")
+        return
+    
+    # 2. Extract Visible Data
+    tractogram_data = main_window.tractogram_data
+    visible_streamlines = [tractogram_data[i] for i in main_window.visible_indices]
+    
+    # Status Update
+    if method == 'medoid':
+        status_updater("Calculating medoid (O(N^2) complexity)...")
+    else:
+        status_updater("Calculating centroid (this may take a moment)...")
+        
+    QApplication.processEvents()
+
+    try:
+        # 3. Calculate
+        result_streamline = None
+        
+        if method == 'centroid':
+            result_streamline = _compute_centroid_math(visible_streamlines)
+        elif method == 'medoid':
+            # Medoid math returns an index, need to check for cancellation (-1)
+            medoid_local_index = _compute_medoid_math(visible_streamlines, parent=main_window)
+            if medoid_local_index == -1:
+                status_updater("Medoid calculation cancelled by user.")
+                return
+            result_streamline = visible_streamlines[medoid_local_index]
+
+        # 4. Prepare for Saving
+        # The result is a single new streamline. Reuse the original affine.
+        affine = main_window.original_trk_affine
+        
+        new_tractogram = nib.streamlines.Tractogram(
+            [result_streamline], 
+            affine_to_rasmm=affine
+        )
+        
+        # 5. Get Save Path
+        original_path = main_window.original_trk_path
+        base, ext = os.path.splitext(original_path)
+        suggested_name = f"{base}_{method}{ext}"
+        
+        file_filter = "TrackVis TRK Files (*.trk);;TCK Files (*.tck);;TRX Files (*.trx)"
+        output_path, _ = QFileDialog.getSaveFileName(
+            main_window, f"Save {method_ui} As", suggested_name, file_filter
+        )
+        
+        if not output_path:
+            status_updater(f"{method_ui} save cancelled.")
+            return
+
+        _, out_ext = os.path.splitext(output_path)
+        
+        # 6. Save Logic
+        header = {}
+        if out_ext.lower() == '.trk':
+            header = _prepare_trk_header(main_window.original_trk_header, 1, main_window.anatomical_image_affine)
+        elif out_ext.lower() == '.tck':
+            header = _prepare_tck_header(main_window.original_trk_header, 1)
+        elif out_ext.lower() == '.trx':
+            header = _prepare_trx_header(main_window.original_trk_header, 1)
+            
+        _save_tractogram_file(new_tractogram, header, output_path, out_ext.lower())
+        status_updater(f"{method_ui} saved: {os.path.basename(output_path)}")
+
+    except Exception as e:
+        logger.error(f"Failed to calculate {method}: {e}", exc_info=True)
+        QMessageBox.critical(main_window, "Error", f"Failed to calculate {method}:\n{e}")
+        status_updater(f"Error calculating {method}.")
+        
 # --- Helper Function for VTK/UI Update ---
 def _update_vtk_and_ui_after_load(main_window: Any, status_msg: str) -> None:
     """Updates VTK panel and main window UI elements after loading."""
@@ -95,17 +350,17 @@ def _update_vtk_and_ui_after_load(main_window: Any, status_msg: str) -> None:
             main_window.vtk_panel.scene.reset_camera()
             main_window.vtk_panel.scene.reset_clipping_range()
         elif not main_window.vtk_panel.scene:
-            print("Warning: vtk_panel.scene not available for camera reset.")
+            logger.warning("vtk_panel.scene not available for camera reset.")
 
         main_window.vtk_panel.update_status(status_msg)
 
         if main_window.vtk_panel.render_window:
             main_window.vtk_panel.render_window.Render()
         else:
-            print("Warning: render_window not available.")
+            logger.warning("render_window not available.")
     else:
-        print("Error: vtk_panel not available to update actors.")
-        print(f"Status: {status_msg}")
+        logger.error("Error: vtk_panel not available to update actors.")
+        logger.error(f"Status: {status_msg}")
 
     # Ensure radio button reflects default state if no scalars loaded
     if hasattr(main_window, 'color_orientation_action'):
@@ -128,7 +383,7 @@ def load_anatomical_image(main_window: Any) -> Tuple[Optional[np.ndarray], Optio
                affine matrix, and file path, or (None, None, None) on failure/cancel.
     """
     if not hasattr(main_window, 'vtk_panel') or not main_window.vtk_panel.scene:
-        print("Error: Scene not initialized in vtk_panel.")
+        logger.error("Scene not initialized in vtk_panel.")
         QMessageBox.critical(main_window, "Error", "VTK Scene not initialized.")
         return None, None, None
 
@@ -142,11 +397,11 @@ def load_anatomical_image(main_window: Any) -> Tuple[Optional[np.ndarray], Optio
     input_path, _ = QFileDialog.getOpenFileName(main_window, "Select Input Anatomical Image File", start_dir, file_filter)
 
     if not input_path:
-        status_updater = getattr(main_window.vtk_panel, 'update_status', lambda msg: print(f"Status: {msg}"))
+        status_updater = getattr(main_window.vtk_panel, 'update_status', lambda msg: logger.info(f"Status: {msg}"))
         status_updater("Anatomical image load cancelled.")
         return None, None, None
 
-    status_updater = getattr(main_window.vtk_panel, 'update_status', lambda msg: print(f"Status: {msg}"))
+    status_updater = getattr(main_window.vtk_panel, 'update_status', lambda msg: logger.info(f"Status: {msg}"))
     status_updater(f"Loading image: {os.path.basename(input_path)}...")
     QApplication.processEvents()
 
@@ -168,23 +423,87 @@ def load_anatomical_image(main_window: Any) -> Tuple[Optional[np.ndarray], Optio
 
     except FileNotFoundError:
         error_msg = f"Error: Anatomical image file not found:\n{input_path}"
-        print(error_msg)
+        logger.error(error_msg)
         QMessageBox.critical(main_window, "Load Error", error_msg)
         status_updater(f"Error: File not found - {os.path.basename(input_path)}")
         return None, None, None
     except nib.filebasedimages.ImageFileError as e:
         error_msg = f"Nibabel Error loading anatomical image:\n{e}\n\nIs '{os.path.basename(input_path)}' a valid NIfTI file?"
-        print(error_msg)
+        logger.error(error_msg)
         QMessageBox.critical(main_window, "Load Error", error_msg)
         status_updater(f"Error loading NIfTI: {os.path.basename(input_path)}")
         return None, None, None
     except Exception as e:
         error_msg = f"An unexpected error occurred loading the anatomical image:\n{type(e).__name__}: {e}\n\nPath: {input_path}\n\nSee console for details."
-        print(error_msg)
-        traceback.print_exc()
+        logger.error(error_msg)
         QMessageBox.critical(main_window, "Load Error", error_msg)
         status_updater(f"Error loading image: {os.path.basename(input_path)}")
         return None, None, None
+    
+# --- ROI Image Loading Function ---
+def load_roi_images(main_window: Any) -> List[Tuple[np.ndarray, np.ndarray, str]]:
+    """
+    Loads multiple NIfTI ROI files (.nii, .nii.gz).
+    Returns a list of tuples, where each tuple is: (image data, affine matrix, file path).
+
+    Args:
+        main_window: The instance of the main application window.
+
+    Returns:
+        List[Tuple[...]]: A list containing data for all successfully loaded ROIs.
+    """
+    if not hasattr(main_window, 'vtk_panel') or not main_window.vtk_panel.scene:
+        logger.error("Error: Scene not initialized in vtk_panel.")
+        QMessageBox.critical(main_window, "Error", "VTK Scene not initialized.")
+        return []
+
+    file_filter = "NIfTI Image Files (*.nii *.nii.gz);;All Files (*.*)"
+    start_dir = ""
+    if main_window.anatomical_image_path:
+        start_dir = os.path.dirname(main_window.anatomical_image_path)
+    elif main_window.original_trk_path:
+        start_dir = os.path.dirname(main_window.original_trk_path)
+
+    # CHANGED: Use getOpenFileNames (plural) to allow multiple selection
+    input_paths, _ = QFileDialog.getOpenFileNames(main_window, "Select Input ROI Image File(s)", start_dir, file_filter)
+
+    if not input_paths:
+        status_updater = getattr(main_window.vtk_panel, 'update_status', lambda msg: logger.info(f"Status: {msg}"))
+        status_updater("ROI image load cancelled.")
+        return []
+
+    status_updater = getattr(main_window.vtk_panel, 'update_status', lambda msg: logger.info(f"Status: {msg}"))
+    
+    loaded_rois = []
+
+    # CHANGED: Iterate through all selected paths
+    for input_path in input_paths:
+        status_updater(f"Loading ROI: {os.path.basename(input_path)}...")
+        QApplication.processEvents()
+
+        try:
+            img = nib.load(input_path)
+
+            image_data = img.get_fdata(dtype=np.float32) # Ensure float
+            image_affine = img.affine
+
+            if image_data.ndim < 3:
+                logger.warning(f"Skipping {os.path.basename(input_path)}: Has {image_data.ndim} dims, expected 3+.")
+                continue
+            if image_affine.shape != (4, 4):
+                logger.warning(f"Skipping {os.path.basename(input_path)}: Invalid affine shape.")
+                continue
+
+            loaded_rois.append((image_data, image_affine, input_path))
+            status_updater(f"Successfully loaded ROI: {os.path.basename(input_path)}")
+
+        except Exception as e:
+            error_msg = f"Error loading {os.path.basename(input_path)}:\n{type(e).__name__}: {e}"
+            logger.error(error_msg)
+            # Optional: Show error for specific file but continue loading others
+            QMessageBox.warning(main_window, "Load Error", error_msg)
+
+    return loaded_rois
 
 # --- Streamline File I/O Functions ---
 def load_streamlines_file(main_window: Any) -> None:
@@ -196,7 +515,7 @@ def load_streamlines_file(main_window: Any) -> None:
         main_window: The instance of the main application window.
     """
     if not hasattr(main_window, 'vtk_panel') or not main_window.vtk_panel.scene:
-        print("Error: Scene not initialized in vtk_panel.")
+        logger.error("Error: Scene not initialized in vtk_panel.")
         QMessageBox.critical(main_window, "Error", "VTK Scene not initialized.")
         return
 
@@ -212,7 +531,7 @@ def load_streamlines_file(main_window: Any) -> None:
     input_path, _ = QFileDialog.getOpenFileName(main_window, "Select Input Streamline File", start_dir, all_filters)
 
     if not input_path:
-        status_updater = getattr(main_window.vtk_panel, 'update_status', lambda msg: print(f"Status: {msg}"))
+        status_updater = getattr(main_window.vtk_panel, 'update_status', lambda msg: logger.info(f"Status: {msg}"))
         status_updater("Streamline file load cancelled.")
         return
 
@@ -220,7 +539,7 @@ def load_streamlines_file(main_window: Any) -> None:
     if main_window.tractogram_data:
         main_window._close_bundle()
 
-    status_updater = getattr(main_window.vtk_panel, 'update_status', lambda msg: print(f"Status: {msg}"))
+    status_updater = getattr(main_window.vtk_panel, 'update_status', lambda msg: logger.info(f"Status: {msg}"))
     status_updater(f"Loading streamlines: {os.path.basename(input_path)}...")
     QApplication.processEvents()
 
@@ -245,14 +564,12 @@ def load_streamlines_file(main_window: Any) -> None:
         main_window.trx_file_reference = None
 
         if ext in ['.trk', '.tck']:
-            # --- Load File using Nibabel ---
             # lazy_load=True returns a generator for .trk/.tck.
             trk_file = nib.streamlines.load(input_path, lazy_load=True)
             
-            # This is the memory-intensive step
             streamlines_list = list(trk_file.streamlines)
             num_streamlines = len(streamlines_list)
-            print(f"Info: Loaded {num_streamlines} streamlines from {ext} file into memory.")
+            logger.info(f"Loaded {num_streamlines} streamlines from {ext} file into memory.")
 
             # Store as an ArraySequence for a consistent API
             loaded_streamlines_obj = nib.streamlines.ArraySequence(streamlines_list)
@@ -266,28 +583,27 @@ def load_streamlines_file(main_window: Any) -> None:
                 if isinstance(nib_affine, np.ndarray) and nib_affine.shape == (4, 4):
                     loaded_affine = nib_affine
                 else:
-                    print(f"Warning: loaded affine_to_rasmm is not a valid 4x4 numpy array (type: {type(nib_affine)}). Using identity affine.")
+                    logger.warning(f"Loaded affine_to_rasmm is not a valid 4x4 numpy array (type: {type(nib_affine)}). Using identity affine.")
             else:
-                print("Warning: affine_to_rasmm not found in loaded file object. Using identity affine.")
+                logger.warning("affine_to_rasmm not found in loaded file object. Using identity affine.")
             
             # --- Load Scalar Data ---
             if hasattr(tractogram_obj, 'data_per_point') and tractogram_obj.data_per_point:
-                print("Scalar data found in file (data_per_point).")
-                # For nibabel, data_per_point is a PerPointDict (dict of lists)
-                # We MUST convert it to a dict of ArraySequences for our new model.
+                logger.info("Scalar data found in file (data_per_point).")
+                # For nibabel, data_per_point is a PerPointDict (dict of lists). We MUST convert it to a dict of ArraySequences for our new model.
                 scalar_data = {}
                 try:
                     for key, value_list in tractogram_obj.data_per_point.items():
                         scalar_data[key] = nib.streamlines.ArraySequence(value_list)
                     if scalar_data:
                         active_scalar = list(scalar_data.keys())[0]
-                        print(f"Assigned scalars. Active scalar: '{active_scalar}'")
+                        logger.info(f"Assigned scalars. Active scalar: '{active_scalar}'") 
                 except Exception as scalar_e:
-                    print(f"Warning: Could not process scalar data: {scalar_e}\n{traceback.format_exc()}")
+                    logger.warning(f"Could not process scalar data:", exc_info=True)
                     scalar_data = None
                     active_scalar = None
             else:
-                 print("No scalar data found in file (data_per_point).")
+                 logger.info("No scalar data found in file (data_per_point).") 
 
         elif ext == '.trx':
             
@@ -297,7 +613,7 @@ def load_streamlines_file(main_window: Any) -> None:
             # trx_obj.streamlines IS a lazy ArraySequence. 
             loaded_streamlines_obj = trx_obj.streamlines # Get streamlines
             num_streamlines = len(loaded_streamlines_obj) # This is fast
-            print(f"Info: Loaded {num_streamlines} streamlines from {ext} file (lazy-loaded).")
+            logger.info(f"Loaded {num_streamlines} streamlines from {ext} file (lazy-loaded).") 
             
             loaded_header = trx_obj.header.copy() # Get header
             tractogram_obj = trx_obj # This has the data_per_point
@@ -308,20 +624,20 @@ def load_streamlines_file(main_window: Any) -> None:
                 if isinstance(trx_affine, np.ndarray) and trx_affine.shape == (4, 4):
                     loaded_affine = trx_affine
                 else:
-                    print(f"Warning: TRX affine_to_rasmm is not a valid 4x4 numpy array (type: {type(trx_affine)}). Using identity affine.")
+                    logger.warning("affine_to_rasmm not found in loaded TRX file. Using identity affine.") 
             else:
-                print("Warning: affine_to_rasmm not found in loaded TRX file. Using identity affine.")
+                    logger.warning("affine_to_rasmm not found in loaded TRX file. Using identity affine.") 
 
-            # --- Load Scalar Data (REFACTORED) ---
+            # --- Load Scalar Data ---
             if hasattr(trx_obj, 'data_per_point') and trx_obj.data_per_point:
-                print("Scalar data found in file (data_per_point).")
+                logger.info("Scalar data found in file (data_per_point).")
                 # For trx-python, data_per_point is *already* a PerPointArraySequenceDict (dict of ArraySequences).
                 scalar_data = trx_obj.data_per_point
                 if scalar_data:
                     active_scalar = list(scalar_data.keys())[0]
-                    print(f"Assigned scalars. Active scalar: '{active_scalar}'")
+                    logger.info(f"Assigned scalars. Active scalar: '{active_scalar}'")
             else:
-                print("No scalar data found in file (data_per_point).")
+                logger.info("No scalar data found in file (data_per_point).")
             
             main_window.trx_file_reference = trx_obj
 
@@ -331,7 +647,7 @@ def load_streamlines_file(main_window: Any) -> None:
 
         # --- Guard Clause: Check if streamlines were loaded ---
         if not loaded_streamlines_obj or num_streamlines == 0:
-            print("No streamlines found in file.")
+            logger.info("No streamlines found in file.")
             QMessageBox.information(main_window, "Load Info", "No streamlines found in the selected file.")
             status_updater(f"Loaded 0 streamlines from {os.path.basename(input_path)}")
             main_window.tractogram_data = None
@@ -383,10 +699,8 @@ def load_streamlines_file(main_window: Any) -> None:
         _update_vtk_and_ui_after_load(main_window, status_msg)
 
     except Exception as e:
-        print(f"Error during streamline loading or processing: {type(e).__name__}")
-        print(f"Error details: {e}")
-        print("Traceback (detailed):")
-        traceback.print_exc()
+        logger.error(f"Error during streamline loading or processing: {type(e).__name__}", exc_info=True)
+        logger.error(f"Error details: {e}")
 
         error_title = "Load Error"
         if isinstance(e, nib.filebasedimages.ImageFileError):
@@ -399,10 +713,10 @@ def load_streamlines_file(main_window: Any) -> None:
         try:
             QMessageBox.critical(main_window, error_title, error_msg)
         except Exception as qm_e:
-            print(f"ERROR: Could not display QMessageBox: {qm_e}")
+            logger.error(f"Could not display QMessageBox: {qm_e}")
 
         # Update status and attempt to reset state cleanly
-        status_updater = getattr(main_window.vtk_panel, 'update_status', lambda msg: print(f"Status: {msg}"))
+        status_updater = getattr(main_window.vtk_panel, 'update_status', lambda msg: logger.info(f"Status: {msg}"))
         status_updater(f"Error loading file: {os.path.basename(input_path)}")
         try:
             # Reset only streamline-related vars, keep anatomical if loaded
@@ -424,25 +738,25 @@ def load_streamlines_file(main_window: Any) -> None:
             main_window._update_bundle_info_display()
             main_window._update_action_states()
         except Exception as cleanup_e:
-            print(f"ERROR during error cleanup after streamline load failure: {cleanup_e}")
+            logger.error(f"During error cleanup after streamline load failure: {cleanup_e}")
 
 
 def _validate_save_prerequisites(main_window: Any) -> bool:
     """Checks if prerequisites for saving streamlines are met."""
     if main_window.tractogram_data is None:
-        print("Save Error: No streamline data to save.")
+        logger.error("Save Error: No streamline data to save.")
         QMessageBox.warning(main_window, "Save Error", "No streamline data to save.")
         return False
     if main_window.original_trk_affine is None:
-        print("Save Error: Original streamline affine info missing.")
+        logger.error("Save Error: Original streamline affine info missing.")
         QMessageBox.critical(main_window, "Save Error", "Original streamline file affine info missing (needed for saving).")
         return False
     if main_window.original_trk_header is None:
-        print("Warning: Original streamline header info missing. Saving with minimal header.")
+        logger.warning("Warning: Original streamline header info missing. Saving with minimal header.")
         main_window.original_trk_header = {} # Ensure it's a dict
     
     if main_window.original_file_extension not in ['.trk', '.tck', '.trx']:
-        print(f"Save Error: Cannot determine original format ('{main_window.original_file_extension}').")
+        logger.error(f"Save Error: Cannot determine original format ('{main_window.original_file_extension}').")
         QMessageBox.critical(main_window, "Save Error", f"Cannot determine original format ('{main_window.original_file_extension}').")
         return False
     return True
@@ -482,21 +796,19 @@ def _get_save_path_and_extension(main_window: Any) -> Tuple[Optional[str], Optio
     # Enforce correct extension, inform user if corrected
     if output_ext_from_dialog != required_ext:
         old_output_path = output_path
-        # Correct the path to have the required extension
         output_path = os.path.splitext(output_path)[0] + required_ext
         if output_ext_from_dialog == "": # No extension was provided
-            print(f"Save Info: Appended required extension '{required_ext}'. New path: {output_path}")
-        else: # A different extension was provided
+            logger.info(f"Save Info: Appended required extension '{required_ext}'. New path: {output_path}")
+        else:
             QMessageBox.warning(main_window, "Save Format Corrected",
                                 f"File extension was corrected from '{output_ext_from_dialog}' to the required '{required_ext}'.\n"
                                 f"Saving as: {os.path.basename(output_path)}")
-            print(f"Save Info: Corrected extension from '{output_ext_from_dialog}' to '{required_ext}'. Path changed from '{old_output_path}' to '{output_path}'.")
+            logger.info(f"Save Info: Corrected extension from '{output_ext_from_dialog}' to '{required_ext}'. Path changed from '{old_output_path}' to '{output_path}'.")
     return output_path, required_ext
 
 def _prepare_tractogram_and_affine(main_window: Any) -> nib.streamlines.Tractogram:
     """Prepares the Tractogram object and validates the affine matrix."""
     tractogram = main_window.tractogram_data
-    # Get the sorted list of indices to save
     indices_to_save = sorted(list(main_window.visible_indices))
     
     # Create a generator for the streamlines to save
@@ -505,7 +817,7 @@ def _prepare_tractogram_and_affine(main_window: Any) -> nib.streamlines.Tractogr
     affine_matrix = main_window.original_trk_affine
 
     if not isinstance(affine_matrix, np.ndarray) or affine_matrix.shape != (4, 4):
-        print(f"Warning: Affine matrix invalid. Using identity.")
+        logger.warning(f"Warning: Affine matrix invalid. Using identity.")
         affine_matrix = np.identity(4)
 
     # Handle potential scalar data
@@ -518,7 +830,7 @@ def _prepare_tractogram_and_affine(main_window: Any) -> nib.streamlines.Tractogr
                 # We must save it as a list of arrays
                 data_per_point_to_save[key] = list(scalars_for_key_gen)
         except Exception as e:
-            print(f"Warning: Could not filter scalar data for saving. Saving without scalars. Error: {e}")
+            logger.warning(f"Warning: Could not filter scalar data for saving. Saving without scalars. Error: {e}")
             data_per_point_to_save = {}
     
     # Use Nibabel's Tractogram object as a generic container
@@ -536,7 +848,7 @@ def _prepare_trk_header(base_header: Dict[str, Any], nb_streamlines: int, anatom
     anatomical_img_affine, otherwise defaults to 'RAS'.
     """
     header = base_header.copy()
-    print("Preparing TRK header for saving...")
+    logger.info("Preparing TRK header for saving...") 
 
     # --- Voxel Order Logic ---
     raw_voxel_order_from_trk = header.get('voxel_order')
@@ -545,9 +857,9 @@ def _prepare_trk_header(base_header: Dict[str, Any], nb_streamlines: int, anatom
     if isinstance(raw_voxel_order_from_trk, bytes):
         try:
             processed_voxel_order_from_trk = raw_voxel_order_from_trk.decode('utf-8', errors='strict')
-            print(f"      - Info: Decoded 'voxel_order' (bytes: {raw_voxel_order_from_trk}) to string: '{processed_voxel_order_from_trk}'")
+            logger.debug(f"Decoded 'voxel_order': '{processed_voxel_order_from_trk}'") 
         except UnicodeDecodeError:
-            print(f"      - Warning: 'voxel_order' field in TRK header (bytes: {raw_voxel_order_from_trk}) could not be decoded. Treating as invalid.")
+            logger.warning(f"'voxel_order' field in TRK header (bytes: {raw_voxel_order_from_trk}) could not be decoded.") 
     elif isinstance(raw_voxel_order_from_trk, str):
         processed_voxel_order_from_trk = raw_voxel_order_from_trk
 
@@ -555,12 +867,12 @@ def _prepare_trk_header(base_header: Dict[str, Any], nb_streamlines: int, anatom
 
     if is_valid_trk_voxel_order:
         header['voxel_order'] = processed_voxel_order_from_trk.upper()
-        print(f"      - Info: Using existing 'voxel_order' from TRK header: {header['voxel_order']}.")
+        logger.info(f"      - Info: Using existing 'voxel_order' from TRK header: {header['voxel_order']}.")
     else:
         if raw_voxel_order_from_trk is not None:
-            print(f"      - Warning: 'voxel_order' from TRK header ('{raw_voxel_order_from_trk}') is invalid or in an unexpected format.")
+            logger.warning(f"      - Warning: 'voxel_order' from TRK header ('{raw_voxel_order_from_trk}') is invalid or in an unexpected format.")
         else:
-            print(f"      - Info: 'voxel_order' missing in TRK header.")
+            logger.warning(f"      - Info: 'voxel_order' missing in TRK header.")
 
         derived_from_anat = False
         if anatomical_img_affine is not None and \
@@ -572,21 +884,20 @@ def _prepare_trk_header(base_header: Dict[str, Any], nb_streamlines: int, anatom
                 if len(derived_vo_str) == 3:
                     header['voxel_order'] = derived_vo_str
                     derived_from_anat = True
-                    print(f"      - Info: Derived 'voxel_order' from loaded anatomical image: {header['voxel_order']}.")
+                    logger.info(f"      - Info: Derived 'voxel_order' from loaded anatomical image: {header['voxel_order']}.")
                 else:
-                    print(f"      - Warning: Could not derive a valid 3-character 'voxel_order' from anatomical image affine (got: '{derived_vo_str}').")
+                    logger.warning(f"      - Warning: Could not derive a valid 3-character 'voxel_order' from anatomical image affine (got: '{derived_vo_str}').")
             except Exception as e:
-                print(f"      - Warning: Error deriving 'voxel_order' from anatomical image affine: {e}.")
+                logger.warning(f"      - Warning: Error deriving 'voxel_order' from anatomical image affine: {e}.")
 
         if not derived_from_anat:
             header['voxel_order'] = 'RAS'
-            # Contextual print for defaulting voxel_order
             if raw_voxel_order_from_trk is None and anatomical_img_affine is None:
-                print(f"      - Info: 'voxel_order' missing, no anatomical image. Defaulting to 'RAS'.")
+                logger.info(f"      - Info: 'voxel_order' missing, no anatomical image. Defaulting to 'RAS'.")
             elif not is_valid_trk_voxel_order and anatomical_img_affine is None:
-                print(f"      - Info: Original 'voxel_order' invalid/missing, no anatomical image. Defaulting to 'RAS'.")
+                logger.info(f"      - Info: Original 'voxel_order' invalid/missing, no anatomical image. Defaulting to 'RAS'.")
             else: # Covers cases where derivation from anat failed or anat_img_affine was invalid
-                print(f"      - Info: Could not use original or derive 'voxel_order' from anatomical image. Defaulting to 'RAS'.")
+                logger.info(f"      - Info: Could not use original or derive 'voxel_order' from anatomical image. Defaulting to 'RAS'.")
 
     # --- Process other specific TRK header fields ---
     keys_to_process = {
@@ -606,9 +917,9 @@ def _prepare_trk_header(base_header: Dict[str, Any], nb_streamlines: int, anatom
             try:
                 processed_value = processed_value.decode('utf-8', errors='strict')
             except UnicodeDecodeError:
-                print(f"      - Warning: Could not decode bytes for '{key}'. Original value: {original_value}")
+                logger.warning(f"      - Warning: Could not decode bytes for '{key}'. Original value: {original_value}")
                 header[key] = K_props['default']
-                print(f"      - Info: Set '{key}' to default: {header[key]}")
+                logger.warning(f"      - Info: Set '{key}' to default: {header[key]}")
                 continue 
 
         # 2. Parse if string, or use if already suitable type
@@ -622,8 +933,7 @@ def _prepare_trk_header(base_header: Dict[str, Any], nb_streamlines: int, anatom
             if not (isinstance(parsed_val, str) and parsed_val == processed_value):
                 processed_value = parsed_val # Successfully parsed
             else:
-                # Parsing failed
-                print(f"      - Info: Could not parse string '{processed_value}' for '{key}'.")
+                logger.info(f"      - Info: Could not parse string '{processed_value}' for '{key}'.")
         
         # 3. Validate and set
         valid_structure = False
@@ -642,13 +952,13 @@ def _prepare_trk_header(base_header: Dict[str, Any], nb_streamlines: int, anatom
                     final_value = tuple(processed_value.astype(expected_item_type))
                     valid_structure = True
         except (ValueError, TypeError) as e: # Catch errors from type conversion 
-            print(f"      - Warning: Type conversion error for '{key}' (value: '{processed_value}'): {e}")
+            logger.warning(f"      - Warning: Type conversion error for '{key}' (value: '{processed_value}'): {e}")
             valid_structure = False 
 
         if valid_structure:
             header[key] = final_value
         else:
-            print(f"      - Warning: '{key}' ('{original_value}') was invalid, missing, or failed processing. Defaulted to {K_props['default']}.")
+            logger.warning(f"      - Warning: '{key}' ('{original_value}') was invalid, missing, or failed processing. Defaulted to {K_props['default']}.")
             header[key] = K_props['default']
 
     header['nb_streamlines'] = nb_streamlines
@@ -688,13 +998,13 @@ def _save_tractogram_file(tractogram: nib.streamlines.Tractogram, header: Dict[s
     if file_ext == '.trk':
         trk_file = nib.streamlines.TrkFile(tractogram, header=header)
         nib.streamlines.save(trk_file, output_path)
-        print("File saved successfully (TRK)")
+        logger.info("File saved successfully (TRK)") 
         return f"File saved successfully (TRK): {os.path.basename(output_path)}"
     
     elif file_ext == '.tck':
         tck_file = nib.streamlines.TckFile(tractogram, header=header)
         nib.streamlines.save(tck_file, output_path)
-        print("File saved successfully (TCK)")
+        logger.info("File saved successfully (TCK)")
         return f"File saved successfully (TCK): {os.path.basename(output_path)}"
     
     elif file_ext == '.trx':        
@@ -706,7 +1016,7 @@ def _save_tractogram_file(tractogram: nib.streamlines.Tractogram, header: Dict[s
         
         # 2. Save the newly created object using tbx.save()
         tbx.save(trx_obj_to_save, output_path)
-        print("File saved successfully (TRX)")
+        logger.info("File saved successfully (TRX)")
         return f"File saved successfully (TRX): {os.path.basename(output_path)}"
     
     else:
@@ -717,7 +1027,7 @@ def save_streamlines_file(main_window: Any) -> None:
     """
     Saves the current streamlines to a trk, tck, or trx file.
     """
-    status_updater = getattr(main_window.vtk_panel, 'update_status', lambda msg: print(f"Status: {msg}"))
+    status_updater = getattr(main_window.vtk_panel, 'update_status', lambda msg: logger.info(f"Status: {msg}"))
 
     # --- 1. Pre-checks ---
     if not _validate_save_prerequisites(main_window):
@@ -756,8 +1066,7 @@ def save_streamlines_file(main_window: Any) -> None:
         status_updater(success_msg)
 
     except Exception as e:
-        print(f"Error during file saving:\nType: {type(e).__name__}\nError: {e}")
-        traceback.print_exc()
+        logger.error(f"Error during file saving:\nType: {type(e).__name__}\nError: {e}")
         error_msg = f"Error saving file:\n{type(e).__name__}: {e}\n\nCheck console for details."
         QMessageBox.critical(main_window, "Save Error", error_msg)
         status_updater(f"Error saving file: {os.path.basename(output_path)}")

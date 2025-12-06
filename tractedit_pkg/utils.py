@@ -6,12 +6,15 @@ Utility functions, constants, and enums for the TractEdit application.
 
 import os
 import ast
+import logging 
 import numpy as np
 import vtk
 import pytz
 import enum
 from datetime import datetime
 from typing import Optional, Any, Union, List, Tuple
+
+logger = logging.getLogger(__name__)
 
 # --- Constants ---
 MAX_STACK_LEVELS: int = 20
@@ -26,21 +29,6 @@ class ColorMode(enum.Enum):
     ORIENTATION: int = 1
     SCALAR: int = 2
 
-# --- Helper Function ---
-def numpy_matrix_to_vtk_matrix(np_matrix: Optional[np.ndarray]) -> vtk.vtkMatrix4x4:
-    """Converts a 4x4 NumPy matrix to a vtkMatrix4x4."""
-    if np_matrix is None or np_matrix.shape != (4, 4):
-        print("Warning: Invalid or None NumPy matrix provided to numpy_matrix_to_vtk_matrix. Returning identity.")
-        vtk_matrix = vtk.vtkMatrix4x4()
-        vtk_matrix.Identity()
-        return vtk_matrix
-
-    vtk_matrix = vtk.vtkMatrix4x4()
-    for i in range(4):
-        for j in range(4):
-            vtk_matrix.SetElement(i, j, np_matrix[i, j])
-    return vtk_matrix
-
 def get_formatted_datetime() -> str:
     """
     Gets the current local date, time, and timezone formatted for the status bar.
@@ -51,8 +39,7 @@ def get_formatted_datetime() -> str:
         now_aware = datetime.now().astimezone()
         return now_aware.strftime("%d/%m/%Y %H:%M:%S %Z")
     except Exception as e:
-        # Fallback in case astimezone()
-        print(f"Could not get local aware time: {e}. Using system naive time.")
+        logger.info(f"Could not get local aware time: {e}. Using system naive time.")
         now_naive = datetime.now()
         return now_naive.strftime("%Y-%m-%d %H:%M:%S")
 
