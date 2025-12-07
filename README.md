@@ -32,6 +32,7 @@ Center for Mind/Brain Sciences (CIMeC), University of Trento Italy
 ## Key Features
 
 - **Load & Save** streamline bundles (`.trk`, `.tck`, `.trx`)
+- **Whole-Brain Tractogram Support:** Optimized rendering for large datasets (tested with >2 million streamlines) using stride-based visualization and toggleable "skip".
 - **Multi-View Orthogonal Visualization:** Integrated 3D viewer and three linked 2D orthogonal slice views (Axial, Coronal, Sagittal).
 - **Anatomical Image:** Load NIfTI images (`.nii`, `.nii.gz`) as backgrounds for anatomical context and **interactive slice navigation**.
 - **Multi-Layer Anatomical ROI Support:** - Load multiple NIfTI images (`.nii`, `.nii.gz`) as background Region of Interest (ROI) layers.
@@ -50,8 +51,14 @@ Center for Mind/Brain Sciences (CIMeC), University of Trento Italy
     - File name, streamline count, voxel size, bounding box, etc.
     - Vertical data panel with hover details 
 - **Keyboard Shortcuts** for fast interaction (see full list below)
+- **Fast Startup:** Splash screen implementation for immediate feedback and optimized library loading.
 
-> ⚠️ **Note:** TractEdit is optimized for refining *bundles*, not whole-brain tractograms. Files with a large number of streamlines may cause slowdowns or freezing depending on your system.
+> ⚠️ **Note:** While TractEdit supports **whole-brain tractograms**, rendering density may be automatically reduced (skipped) for extremely large files to maintain interactivity. You can adjust this manually in the toolbar.
+>
+> **Selection Strategy:**
+> * **Sphere Selection:** Recommended for refining specific **bundles** or small bundle complexes. Note that this method is **ineffective** on whole-brain datasets if streamlines are being "skipped" (hidden) for performance, as the sphere can only interact with visible fibers.
+> * **ROI Filtering:** Recommended for **whole-brain tractograms**. Loading NIfTI images as logic filters (Include/Exclude) works on the entire dataset regardless of visual density.
+> * *(Future Roadmap):* Hand-drawing ROIs directly on slices is planned for a future update to provide an additional layer of flexible filtering.
 ---
 
 ## Getting Started (Manual Install)
