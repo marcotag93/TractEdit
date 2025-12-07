@@ -17,11 +17,11 @@ import logging
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QMenuBar, QFileDialog,
     QMessageBox, QLabel, QStatusBar, QApplication,
-    QToolBar, QDoubleSpinBox, 
+    QToolBar, QDoubleSpinBox, QSpinBox,
     QSlider, 
     QHBoxLayout, QSpacerItem, QSizePolicy,
     QDockWidget, QTreeWidget, QTreeWidgetItem, QStyle, 
-    QLineEdit, QMenu, QColorDialog
+    QLineEdit, QMenu, QColorDialog, QCheckBox
 )
 from PyQt6.QtGui import QAction, QKeySequence, QActionGroup, QIcon, QCloseEvent, QPixmap
 from PyQt6.QtCore import Qt, pyqtSlot
@@ -62,6 +62,7 @@ class MainWindow(QMainWindow):
         self.active_scalar_name: Optional[str] = None # Key for the currently active scalar
         self.selected_streamline_indices: Set[int] = set() # Indices of selected streamlines
         self.selection_radius_3d: float = DEFAULT_SELECTION_RADIUS # Radius for sphere selection
+        self.render_stride: int = 1  # 1 = Show all, 100 = Show 1%
 
         # --- Initialize Anatomical Image Data Variables ---
         self.anatomical_image_path: Optional[str] = None
@@ -122,6 +123,7 @@ class MainWindow(QMainWindow):
         # --- Setup UI Components ---
         self._create_actions()
         self._create_menus()
+        self._create_main_toolbar() 
         self._create_scalar_toolbar() 
         self._create_data_panel()  
         self._setup_status_bar()
@@ -340,6 +342,110 @@ class MainWindow(QMainWindow):
         # --- Help Menu ---
         help_menu = main_bar.addMenu("&Help")
         help_menu.addAction(self.about_action)
+        
+    # --- Main Toolbar for Skip ---
+    def _create_main_toolbar(self) -> None:
+        self.main_toolbar = QToolBar("Main Tools", self)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self.main_toolbar)
+        
+        # --- Skip / Density Control ---
+        container = QWidget()
+        l = QHBoxLayout(container)
+        l.setContentsMargins(0, 0, 0, 0)
+        
+        self.skip_checkbox = QCheckBox()
+        self.skip_checkbox.setChecked(False) 
+        self.skip_checkbox.toggled.connect(self._on_skip_toggled)
+        l.addWidget(self.skip_checkbox)
+        
+        l.addWidget(QLabel("Skip %: "))
+        self.skip_spinbox = QSpinBox()
+        self.skip_spinbox.setRange(0, 99) 
+        self.skip_spinbox.setValue(0)
+        self.skip_spinbox.setToolTip("Percentage of streamlines to skip for rendering (0 = Show All, 99 = Show 1%)")
+        self.skip_spinbox.setEnabled(False) 
+        self.skip_spinbox.editingFinished.connect(self._on_skip_changed)
+        l.addWidget(self.skip_spinbox)
+        
+        self.main_toolbar.addWidget(container)
+        
+    def _on_skip_toggled(self, checked: bool) -> None:
+        """Enables/Disables the skip feature and resets view if turned off."""
+        self.skip_spinbox.setEnabled(checked)
+        
+        if checked:
+            # If enabled, apply whatever value is currently in the spinbox
+            self._on_skip_changed()
+        else:
+            # If disabled, force reset to 0% skip (Show All)
+            self.render_stride = 1
+            if self.vtk_panel:
+                self.vtk_panel.update_main_streamlines_actor()
+        
+    def _on_skip_changed(self) -> None:
+        """Calculates stride from skip percentage and updates VTK."""
+        # Safety: Do not update if the feature is toggled off
+        if not self.skip_checkbox.isChecked():
+            return
+
+        value = self.skip_spinbox.value()
+        
+        percent_shown = 100 - value
+        self.render_stride = max(1, int(100 / percent_shown))
+        
+        # Update VTK
+        if self.vtk_panel:
+            self.vtk_panel.update_main_streamlines_actor()
+            
+    def _auto_calculate_skip_level(self) -> None:
+        """
+        Automatically sets the skip percentage based on the number of streamlines.
+        Target: Render approximately 20,000 streamlines for optimal performance.
+        """
+        if not self.tractogram_data:
+            return
+
+        total_fibers = len(self.tractogram_data)
+        TARGET_RENDER_COUNT = 20000 # Target render
+
+        # Block signals to prevent VTK updates while adjusting widgets
+        self.skip_checkbox.blockSignals(True)
+        self.skip_spinbox.blockSignals(True)
+
+        if total_fibers > TARGET_RENDER_COUNT:
+            # Calculate how many we want to KEEP (ratio)
+            keep_ratio = TARGET_RENDER_COUNT / total_fibers
+            
+            # Convert to percentage to SKIP
+            # Example: 100k fibers. Target 20k. Keep 0.2. Skip 0.8 (80%)
+            skip_percent = int((1.0 - keep_ratio) * 100)
+            
+            # Clamp between 0 and 99
+            skip_percent = max(0, min(99, skip_percent))
+
+            self.skip_checkbox.setChecked(True)
+            self.skip_spinbox.setEnabled(True)
+            self.skip_spinbox.setValue(skip_percent)
+            
+            # Update internal stride variable manually
+            self.render_stride = max(1, int(100 / (100 - skip_percent)))
+            
+            if self.vtk_panel:
+                self.vtk_panel.update_status(f"Auto-Skip: {skip_percent}% skipped for performance.")
+        else:
+            # Bundle is small enough, show all
+            self.skip_checkbox.setChecked(False)
+            self.skip_spinbox.setEnabled(False)
+            self.skip_spinbox.setValue(0)
+            self.render_stride = 1
+
+        # Unblock signals
+        self.skip_checkbox.blockSignals(False)
+        self.skip_spinbox.blockSignals(False)
+
+        # Trigger Visual Update
+        if self.vtk_panel:
+            self.vtk_panel.update_main_streamlines_actor()
 
     # --- Scalar Toolbar ---
     def _create_scalar_toolbar(self) -> None:
@@ -885,6 +991,7 @@ class MainWindow(QMainWindow):
         
         file_io.load_streamlines_file(self)
         if self.tractogram_data:
+            self._auto_calculate_skip_level() # Automatic skip level based on count
             self.manual_visible_indices = set(range(len(self.tractogram_data)))
             # Clear caches on new load
             self.roi_states = {}
@@ -1256,9 +1363,11 @@ class MainWindow(QMainWindow):
     def _compute_roi_intersection(self, roi_path: str) -> bool:
         if not self.tractogram_data or roi_path not in self.roi_layers: return False
         
+        total_fibers = len(self.tractogram_data)
         self.vtk_panel.update_status(f"Computing intersection: {os.path.basename(roi_path)}...")
+        self.vtk_panel.update_progress_bar(0, total_fibers, visible=True)
         QApplication.processEvents()
-        
+                
         try:
             roi_data = self.roi_layers[roi_path]['data']
             inv_affine = self.roi_layers[roi_path]['inv_affine']
@@ -1267,6 +1376,12 @@ class MainWindow(QMainWindow):
             
             # Check basic bounds first or stride points
             for idx, sl in enumerate(self.tractogram_data):
+                
+                # --- Update Progress ---
+                if idx % 2000 == 0: # Check every 2000 fibers
+                    self.vtk_panel.update_progress_bar(idx, total_fibers, visible=True)
+                    QApplication.processEvents()
+
                 if sl is None or len(sl) == 0: continue
                 # Map to voxel space
                 vox = nib.affines.apply_affine(inv_affine, sl)
@@ -1288,9 +1403,14 @@ class MainWindow(QMainWindow):
             self.roi_intersection_cache[roi_path] = intersecting
             self.vtk_panel.update_status(f"Intersection done. Found {len(intersecting)}.")
             return True
+
         except Exception as e:
             logger.warning(f"Intersection Error: {e}")
+            self.vtk_panel.update_status("Intersection failed.")
             return False
+            
+        finally:
+            self.vtk_panel.update_progress_bar(0, 0, visible=False)
         
     def _update_roi_visual_selection(self) -> None:
         active_selects = [p for p, s in self.roi_states.items() if s['select']]
@@ -1754,7 +1874,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.warning(f"Could not load logo for About dialog: {e}")
 
-        about_text = """<b>TractEdit version 2.0.1</b><br><br>
+        about_text = """<b>TractEdit version 2.1.0</b><br><br>
         Author: Marco Tagliaferri, PhD Candidate in Neuroscience<br>
         Center for Mind/Brain Sciences (CIMeC)
         University of Trento, Italy

@@ -11,7 +11,7 @@ import vtk
 import logging
 from PyQt6.QtWidgets import (
     QVBoxLayout, QMessageBox, QApplication, QFileDialog, 
-    QWidget, QHBoxLayout, QSplitter, QMenu
+    QWidget, QHBoxLayout, QSplitter, QMenu, QProgressBar
 )
 from PyQt6.QtCore import Qt, QPoint
 from PyQt6.QtGui import QAction
@@ -208,6 +208,23 @@ class VTKPanel:
         self.roi_slice_actors: Dict[str, Dict[str, vtk.vtkActor]] = {} # Key: path, Val: {'axial':, 'coronal':, 'sagittal':}
         
         self.roi_highlight_actor: Optional[vtk.vtkActor] = None 
+        
+        # --- Overlay Progress Bar ---
+        self.overlay_progress_bar = QProgressBar(self.vtk_widget)
+        self.overlay_progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #555;
+                border-radius: 4px;
+                background-color: #333;
+                color: white;
+                text-align: center;
+                font-size: 10px;
+            }
+            QProgressBar::chunk {
+                background-color: #05B8CC;
+            }
+        """)
+        self.overlay_progress_bar.hide()
         
         # --- Slice Navigation State ---
         self.current_slice_indices: Dict[str, Optional[int]] = {'x': None, 'y': None, 'z': None}
@@ -661,6 +678,35 @@ class VTKPanel:
                 self.render_window.Render()
         except Exception as e:
             logger.error(f"Error updating status text actor:", exc_info=e)
+            
+    def update_progress_bar(self, value: int, maximum: int, visible: bool = True) -> None:
+        """
+        Updates the overlay progress bar positioned at the bottom of the VTK window.
+        """
+        if not visible:
+            self.overlay_progress_bar.hide()
+            return
+
+        # Position it dynamically at the bottom, to the right of the status text
+        w = self.vtk_widget.width()
+        h = self.vtk_widget.height()
+        
+        # Size
+        bar_w = 200
+        bar_h = 15
+        
+        # Position
+        x_pos = 500 
+        y_pos = h - bar_h - 9 # 9px margin from bottom
+        
+        if x_pos + bar_w > w:
+            x_pos = max(10, w - bar_w - 5)
+            
+        self.overlay_progress_bar.setGeometry(x_pos, y_pos, bar_w, bar_h)
+        
+        self.overlay_progress_bar.setRange(0, maximum)
+        self.overlay_progress_bar.setValue(value)
+        self.overlay_progress_bar.show()
 
     # --- Selection Sphere Actor Management ---
     def _ensure_radius_actor_exists(self, radius: float, center_point: Tuple[float, float, float]) -> None:
@@ -1525,154 +1571,98 @@ class VTKPanel:
         return {'colors': concatenated_colors, 'opacity': 0.8, 'linewidth': 3}
 
     def _get_streamline_actor_params(self) -> Dict[str, Any]:
-        """Determines parameters for the main streamlines actor."""
+        """
+        Determines parameters for the main streamlines actor using STRIDE.
+        """
         params: Dict[str, Any] = {'colors': (0.8, 0.8, 0.8), 'opacity': 0.5, 'linewidth': 2}
         if not self.main_window or not self.main_window.tractogram_data: 
             return params
 
-        tractogram: 'nib.streamlines.ArraySequence' = self.main_window.tractogram_data
-        indices_to_draw: Set[int] = self.main_window.visible_indices
+        tractogram = self.main_window.tractogram_data
         
-        # Create a list of *only the visible, non-empty* streamlines.
-        visible_streamlines_list = []
-        visible_indices_list = [] # Keep track of indices for scalars
-        for i in indices_to_draw:
-             try:
-                 sl = tractogram[i]
-                 if sl is not None and len(sl) > 0:
-                     visible_streamlines_list.append(sl)
-                     visible_indices_list.append(i)
-             except Exception:
-                 pass # Ignore if an index fails
+        # 1. Get ALL Visible Indices (sorted)
+        visible_indices_list = sorted(list(self.main_window.visible_indices))
         
-        # If no non-empty streamlines are visible, return default grey
-        if not visible_streamlines_list:
-             params['streamlines_list'] = [] # Pass empty list
+        # 2. Apply STRIDE (Skip Logic)
+        stride = self.main_window.render_stride
+        subset_indices = visible_indices_list[::stride] # Only pick 1 every N
+        
+        if not subset_indices:
+             params['streamlines_list'] = []
              return params
 
-        current_mode: ColorMode = self.main_window.current_color_mode
+        # 3. Create List of Streamlines
+        # (This is still a list creation, but only for 1% of data if stride=100)
+        visible_streamlines_list = [tractogram[i] for i in subset_indices]
+
+        # 4. Coloring Logic
+        current_mode = self.main_window.current_color_mode
 
         if current_mode == ColorMode.ORIENTATION:
-            try:
-                # Pass the concrete list
-                params['colors'] = colormap.line_colors(visible_streamlines_list)
-                params['opacity'] = 0.8
-            except Exception as e: 
-                logger.warning(f"Error calculating orientation colors: {e}. Using default.")
+             params['colors'] = colormap.line_colors(visible_streamlines_list)
+             params['opacity'] = 0.8
         
         elif current_mode == ColorMode.SCALAR:
             scalar_data = self.main_window.scalar_data_per_point
             active_scalar = self.main_window.active_scalar_name
-            if scalar_data and active_scalar and active_scalar in scalar_data:
-                scalar_sequence = scalar_data.get(active_scalar)
-                if scalar_sequence:
-                    vmin = self.main_window.scalar_min_val
-                    vmax = self.main_window.scalar_max_val
-                    
-                    # We need to get the scalars *corresponding to the non-empty streamlines*
-                    visible_scalars_list = [
-                        scalar_sequence[i] for i in visible_indices_list
-                    ]
-                    
-                    scalar_params = self._calculate_scalar_colors(
-                        iter(visible_streamlines_list), 
-                        iter(visible_scalars_list), 
-                        vmin, vmax
-                    )
-                    # if scalar_params is None, we just keep the default grey
-                    if scalar_params: 
-                        params = scalar_params
+            if scalar_data and active_scalar:
+                scalar_seq = scalar_data[active_scalar]
+                # Get scalars for the SUBSET
+                subset_scalars = [scalar_seq[i] for i in subset_indices]
+                
+                vmin = self.main_window.scalar_min_val
+                vmax = self.main_window.scalar_max_val
+                
+                scalar_params = self._calculate_scalar_colors(
+                    iter(visible_streamlines_list), 
+                    iter(subset_scalars), 
+                    vmin, vmax
+                )
+                if scalar_params: params = scalar_params
 
         params['streamlines_list'] = visible_streamlines_list
         return params
                      
     def update_main_streamlines_actor(self) -> None:
-        """Recreates the main streamlines actor based on current data and color mode."""
-        if not self.scene: 
-            return
+        """
+        Recreates the main actor using the skipped/strided dataset.
+        """
+        if not self.scene: return
 
-        actor_removed = False
+        # 1. Remove old actor
         if self.streamlines_actor is not None:
-            try:
-                self.scene.rm(self.streamlines_actor)
-                actor_removed = True
-            except ValueError:
-                actor_removed = True
-            except Exception as e: 
-                logger.warning(f"  Error removing streamline actor: {e}. Proceeding cautiously.")
-            finally: 
-                self.streamlines_actor = None
+            self.scene.rm(self.streamlines_actor)
+            self.streamlines_actor = None
 
         if not self.main_window or not self.main_window.tractogram_data:
-            self.update_highlight()
+            self.render_window.Render()
             return
 
-        # Get original data
-        tractogram: 'nib.streamlines.ArraySequence' = self.main_window.tractogram_data
-        indices_to_draw: Set[int] = self.main_window.visible_indices
-        
-        if not indices_to_draw: 
-             self.update_highlight()
-             return
-             
-        # Get parameters
-        actor_params = self._get_streamline_actor_params()
-        
-        # Pop the streamlines list from the params
-        streamlines_to_draw_list = actor_params.pop('streamlines_list', None)
-        
-        # If the list is empty or None there's nothing to draw.
-        if not streamlines_to_draw_list:
-             self.update_highlight()
-             return
+        # 2. Get Params (includes subsampled list)
+        params = self._get_streamline_actor_params()
+        sl_list = params.get('streamlines_list', [])
 
-        try:
-            self.streamlines_actor = actor.line(streamlines_to_draw_list, **actor_params) 
-            if self.main_window and not self.main_window.bundle_is_visible:
-                self.streamlines_actor.SetVisibility(0)
-            self.scene.add(self.streamlines_actor)
-            
-            if self.streamlines_actor:
-                try:
-                    mapper = self.streamlines_actor.GetMapper()
-                    if mapper:
-                        mapper.SetResolveCoincidentTopologyToPolygonOffset()
-                        mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(-1, -15)
-                except Exception as e:
-                    logger.warning(f"Warning: Could not apply mapper offset to streamlines_actor: {e}")
-                    
-        except Exception as e:
-            logger.error(f"Error creating main streamlines actor:", exc_info=True)
-            QMessageBox.warning(self.main_window, "Actor Error", f"Could not display streamlines: {e}")
-            try:
-                if self.streamlines_actor:
-                    try: self.scene.rm(self.streamlines_actor)
-                    except: 
-                        pass
-                
-                if streamlines_to_draw_list:
-                    self.streamlines_actor = actor.line(streamlines_to_draw_list, colors=(0.8, 0.8, 0.8), opacity=0.5, linewidth=2)
-                    self.scene.add(self.streamlines_actor)
-                    
-                    if self.streamlines_actor:
-                        try:
-                            mapper = self.streamlines_actor.GetMapper()
-                            if mapper:
-                                mapper.SetResolveCoincidentTopologyToPolygonOffset()
-                                mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(-1, -15)
-                        except Exception as e:
-                            logger.warning(f"Warning: Could not apply mapper offset to fallback_actor: {e}")   
-                
-                if self.main_window:
-                     self.main_window.current_color_mode = ColorMode.DEFAULT
-                     self.main_window.color_default_action.setChecked(True)
-            except Exception as fallback_e:
-                logger.error(f"Error creating fallback streamlines actor: {fallback_e}")
-                self.streamlines_actor = None
-
-        self.update_highlight()
-        if self.render_window and self.render_window.GetInteractor().GetInitialized():
+        if not sl_list:
             self.render_window.Render()
+            return
+            
+        # 3. Create Actor
+        self.streamlines_actor = actor.line(
+            sl_list, 
+            colors=params.get('colors'),
+            opacity=params.get('opacity', 0.5),
+            linewidth=params.get('linewidth', 2),
+            lod=False
+        )
+        
+        self.scene.add(self.streamlines_actor)
+        
+        # 4. Apply visibility toggle
+        if not self.main_window.bundle_is_visible:
+            self.streamlines_actor.SetVisibility(0)
+            
+        self.update_highlight()
+        self.render_window.Render()
 
     # --- Interaction Callbacks ---
     def _handle_save_shortcut(self) -> None:
@@ -1699,79 +1689,55 @@ class VTKPanel:
 
     def _find_streamlines_in_radius(self, center_point: np.ndarray, radius: float) -> Set[int]:
         """
-        Finds indices of streamlines intersecting a sphere.
-        Uses Bounding Box check (speed) and Segment Distance (precision). 
+        Selection only searches the rendered (strided) streamlines.
+        This makes selection instant.
         """
         if not self.main_window or not self.main_window.tractogram_data: 
             return set()
             
         tractogram = self.main_window.tractogram_data
-        indices_to_search = self.main_window.visible_indices
+        
+        # 1. Search only the Subset
+        visible_indices = sorted(list(self.main_window.visible_indices))
+        stride = self.main_window.render_stride
+        indices_to_search = visible_indices[::stride]
         
         indices_in_radius: Set[int] = set()
         radius_sq = radius * radius
-        
-        # Pre-calculate bounds for the sphere for fast rejection
         sphere_min = center_point - radius
         sphere_max = center_point + radius
         
         for idx in indices_to_search:
-            if not isinstance(tractogram, nib.streamlines.ArraySequence) or idx >= len(tractogram):
-                continue 
-            
             try:
                 sl = tractogram[idx]
-                if not isinstance(sl, np.ndarray) or sl.ndim != 2 or sl.shape[1] != 3 or sl.size == 0: 
-                    continue
-            
-                # --- Bounding Box Check ---
-                # If the streamline's bounding box doesn't overlap the sphere's box, skip it.
+                if sl is None or sl.size == 0: continue
+                
+                # BBox Check
                 sl_min = np.min(sl, axis=0)
                 sl_max = np.max(sl, axis=0)
-                
-                if np.any(sl_max < sphere_min) or np.any(sl_min > sphere_max):
-                    continue
+                if np.any(sl_max < sphere_min) or np.any(sl_min > sphere_max): continue
 
-                # --- Segment Distance ---
-                # Check distance to points first (fastest)
+                # Distance Check
                 diff_sq = np.sum((sl - center_point)**2, axis=1)
                 if np.min(diff_sq) < radius_sq:
                     indices_in_radius.add(idx)
                     continue
                 
-                # If points didn't trigger, check the segments between points (slowest).
-                # This catches the case where the sphere is *between* two points. We vectorize the calculation for the whole streamline.
-                p1 = sl[:-1]
-                p2 = sl[1:]
-                
-                segment_vec = p2 - p1 # Vector from p1 to p2
-                point_vec = center_point - p1 # Vector from p1 to center
-
-                # Project point_vec onto segment_vec (dot product)
+                # Segment Check
+                p1 = sl[:-1]; p2 = sl[1:]
+                segment_vec = p2 - p1
+                point_vec = center_point - p1
                 seg_len_sq = np.sum(segment_vec**2, axis=1)
-                
-                # Avoid division by zero
                 seg_len_sq[seg_len_sq == 0] = 1.0
-                
                 t = np.sum(point_vec * segment_vec, axis=1) / seg_len_sq
-                
-                # Clamp t to segment [0, 1]
                 t = np.clip(t, 0, 1)
-                
-                # Find closest point on segment
-                closest_points = p1 + segment_vec * t[:, np.newaxis]
-                
-                # Check distances
-                seg_dists_sq = np.sum((closest_points - center_point)**2, axis=1)
-                
-                if np.min(seg_dists_sq) < radius_sq:
+                closest = p1 + segment_vec * t[:, np.newaxis]
+                if np.min(np.sum((closest - center_point)**2, axis=1)) < radius_sq:
                     indices_in_radius.add(idx)
-
-            except Exception as e: 
-                logger.warning(f"Warning: Error processing streamline {idx} for selection: {e}")
-                
+                    
+            except: pass
+            
         return indices_in_radius
-
     def _toggle_selection(self, indices_to_toggle: Set[int]) -> None:
         """Toggles the selection state for given indices and updates status/highlight."""
         if not self.main_window or not hasattr(self.main_window, 'selected_streamline_indices'): 

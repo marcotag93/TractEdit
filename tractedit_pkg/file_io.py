@@ -208,6 +208,7 @@ def _compute_medoid_math(streamlines: List[np.ndarray], nb_points: int = 100, pa
     
     # Progress dialog
     progress = QProgressDialog("Calculating Medoid... ", "Cancel", 0, n, parent)
+    progress.setWindowTitle("TractEdit") 
     progress.setWindowModality(Qt.WindowModality.WindowModal)
     progress.setMinimumDuration(500) # Only show if calculation takes > 0.5s
     progress.setValue(0)
@@ -342,10 +343,21 @@ def calculate_and_save_statistic(main_window: Any, method: str) -> None:
         status_updater(f"Error calculating {method}.")
         
 # --- Helper Function for VTK/UI Update ---
-def _update_vtk_and_ui_after_load(main_window: Any, status_msg: str) -> None:
-    """Updates VTK panel and main window UI elements after loading."""
+def _update_vtk_and_ui_after_load(main_window: Any, status_msg: str, render: bool = True) -> None:
+    """
+    Updates VTK panel and main window UI elements after loading.
+    
+    Args:
+        main_window: Reference to the main window.
+        status_msg: Status message to display.
+        render: If True, calls update_main_streamlines_actor(). Set to False if
+                actor has already been updated (e.g., by auto-skip logic).
+    """
     if main_window.vtk_panel:
-        main_window.vtk_panel.update_main_streamlines_actor()
+        # Only update the actor if requested
+        if render:
+            main_window.vtk_panel.update_main_streamlines_actor()
+            
         if main_window.vtk_panel.scene and not main_window.anatomical_image_data:
             main_window.vtk_panel.scene.reset_camera()
             main_window.vtk_panel.scene.reset_clipping_range()
@@ -510,9 +522,6 @@ def load_streamlines_file(main_window: Any) -> None:
     """
     Loads a trk, tck, or trx file.
     Updates the MainWindow state.
-
-    Args:
-        main_window: The instance of the main application window.
     """
     if not hasattr(main_window, 'vtk_panel') or not main_window.vtk_panel.scene:
         logger.error("Error: Scene not initialized in vtk_panel.")
@@ -552,7 +561,7 @@ def load_streamlines_file(main_window: Any) -> None:
         loaded_affine: np.ndarray = np.identity(4)
         scalar_data: Optional[Dict[str, 'nib.streamlines.ArraySequence']] = None
         active_scalar: Optional[str] = None
-        tractogram_obj: Any = None # To hold the object with .data_per_point
+        tractogram_obj: Any = None 
         num_streamlines = 0
         
         # Clear any old trx file reference
@@ -567,30 +576,62 @@ def load_streamlines_file(main_window: Any) -> None:
             # lazy_load=True returns a generator for .trk/.tck.
             trk_file = nib.streamlines.load(input_path, lazy_load=True)
             
-            streamlines_list = list(trk_file.streamlines)
+            # --- START PROGRESS BAR LOGIC (Added) ---
+            total_sl = 0
+            if hasattr(trk_file, 'header'):
+                h = trk_file.header
+                if 'nb_streamlines' in h:
+                    try: total_sl = int(h['nb_streamlines'])
+                    except: pass
+                elif 'count' in h:
+                    try: total_sl = int(h['count'])
+                    except: pass
+            
+            progress = QProgressDialog("Loading File... ", "Cancel", 0, total_sl, main_window)
+            progress.setWindowTitle("TractEdit")
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setMinimumDuration(500) 
+            progress.setValue(0)
+            
+            if total_sl <= 0: progress.setRange(0, 0) 
+
+            streamlines_list = []
+            load_canceled = False
+
+            for i, sl in enumerate(trk_file.streamlines):
+                streamlines_list.append(sl)
+                # Update every 2000 items to avoid UI overhead
+                if i % 2000 == 0:
+                    progress.setValue(i)
+                    if progress.wasCanceled():
+                        load_canceled = True
+                        break
+            
+            progress.setValue(total_sl if total_sl > 0 else len(streamlines_list))
+            progress.close()
+
+            if load_canceled:
+                status_updater("Load cancelled by user.")
+                return
+            
             num_streamlines = len(streamlines_list)
             logger.info(f"Loaded {num_streamlines} streamlines from {ext} file into memory.")
 
-            # Store as an ArraySequence for a consistent API
             loaded_streamlines_obj = nib.streamlines.ArraySequence(streamlines_list)
-            
             loaded_header = trk_file.header.copy() if hasattr(trk_file, 'header') else {}
-            tractogram_obj = trk_file.tractogram # This has the data_per_point
+            tractogram_obj = trk_file.tractogram 
 
-            # Load Affine from Nibabel object
             if hasattr(tractogram_obj, 'affine_to_rasmm'):
                 nib_affine = tractogram_obj.affine_to_rasmm
                 if isinstance(nib_affine, np.ndarray) and nib_affine.shape == (4, 4):
                     loaded_affine = nib_affine
                 else:
-                    logger.warning(f"Loaded affine_to_rasmm is not a valid 4x4 numpy array (type: {type(nib_affine)}). Using identity affine.")
+                    logger.warning(f"Loaded affine_to_rasmm is not a valid 4x4 numpy array. Using identity affine.")
             else:
-                logger.warning("affine_to_rasmm not found in loaded file object. Using identity affine.")
+                logger.warning("affine_to_rasmm not found. Using identity affine.")
             
-            # --- Load Scalar Data ---
             if hasattr(tractogram_obj, 'data_per_point') and tractogram_obj.data_per_point:
                 logger.info("Scalar data found in file (data_per_point).")
-                # For nibabel, data_per_point is a PerPointDict (dict of lists). We MUST convert it to a dict of ArraySequences for our new model.
                 scalar_data = {}
                 try:
                     for key, value_list in tractogram_obj.data_per_point.items():
@@ -598,58 +639,50 @@ def load_streamlines_file(main_window: Any) -> None:
                     if scalar_data:
                         active_scalar = list(scalar_data.keys())[0]
                         logger.info(f"Assigned scalars. Active scalar: '{active_scalar}'") 
-                except Exception as scalar_e:
-                    logger.warning(f"Could not process scalar data:", exc_info=True)
+                except Exception:
+                    logger.warning(f"Could not process scalar data.", exc_info=True)
                     scalar_data = None
                     active_scalar = None
             else:
-                 logger.info("No scalar data found in file (data_per_point).") 
+                 logger.info("No scalar data found in file.") 
 
         elif ext == '.trx':
-            
-            # --- Load File using trx-python ---
             trx_obj = tbx.load(input_path)
-            
-            # trx_obj.streamlines IS a lazy ArraySequence. 
-            loaded_streamlines_obj = trx_obj.streamlines # Get streamlines
-            num_streamlines = len(loaded_streamlines_obj) # This is fast
+            loaded_streamlines_obj = trx_obj.streamlines
+            num_streamlines = len(loaded_streamlines_obj)
             logger.info(f"Loaded {num_streamlines} streamlines from {ext} file (lazy-loaded).") 
             
-            loaded_header = trx_obj.header.copy() # Get header
-            tractogram_obj = trx_obj # This has the data_per_point
+            loaded_header = trx_obj.header.copy()
+            tractogram_obj = trx_obj
             
-            # Load Affine from TRX object
             if hasattr(trx_obj, 'affine_to_rasmm'):
                 trx_affine = trx_obj.affine_to_rasmm
                 if isinstance(trx_affine, np.ndarray) and trx_affine.shape == (4, 4):
                     loaded_affine = trx_affine
                 else:
-                    logger.warning("affine_to_rasmm not found in loaded TRX file. Using identity affine.") 
+                    logger.warning("affine_to_rasmm not found. Using identity affine.") 
             else:
-                    logger.warning("affine_to_rasmm not found in loaded TRX file. Using identity affine.") 
+                    logger.warning("affine_to_rasmm not found. Using identity affine.") 
 
-            # --- Load Scalar Data ---
             if hasattr(trx_obj, 'data_per_point') and trx_obj.data_per_point:
                 logger.info("Scalar data found in file (data_per_point).")
-                # For trx-python, data_per_point is *already* a PerPointArraySequenceDict (dict of ArraySequences).
                 scalar_data = trx_obj.data_per_point
                 if scalar_data:
                     active_scalar = list(scalar_data.keys())[0]
                     logger.info(f"Assigned scalars. Active scalar: '{active_scalar}'")
             else:
-                logger.info("No scalar data found in file (data_per_point).")
+                logger.info("No scalar data found in file.")
             
             main_window.trx_file_reference = trx_obj
 
         else:
-            raise ValueError(f"Unsupported file extension: '{ext}'. Only .trk, .tck, and .trx are supported.")
+            raise ValueError(f"Unsupported file extension: '{ext}'.")
 
-
-        # --- Guard Clause: Check if streamlines were loaded ---
         if not loaded_streamlines_obj or num_streamlines == 0:
             logger.info("No streamlines found in file.")
             QMessageBox.information(main_window, "Load Info", "No streamlines found in the selected file.")
             status_updater(f"Loaded 0 streamlines from {os.path.basename(input_path)}")
+            
             main_window.tractogram_data = None
             main_window.visible_indices = set()
             main_window.original_trk_header = None
@@ -662,13 +695,13 @@ def load_streamlines_file(main_window: Any) -> None:
             main_window.undo_stack = []
             main_window.redo_stack = []
             main_window.current_color_mode = ColorMode.ORIENTATION
-            # Trigger UI updates
+            
             main_window._update_bundle_info_display()
             main_window._update_action_states()
             if main_window.vtk_panel:
-                main_window.vtk_panel.update_main_streamlines_actor() # Clears streamline actor
-                main_window.vtk_panel.update_highlight() # Clears highlight actor
-                main_window.vtk_panel.update_radius_actor(visible=False) # Hides selection sphere
+                main_window.vtk_panel.update_main_streamlines_actor()
+                main_window.vtk_panel.update_highlight()
+                main_window.vtk_panel.update_radius_actor(visible=False)
                 if main_window.vtk_panel.render_window:
                         main_window.vtk_panel.render_window.Render()
             return
@@ -682,26 +715,33 @@ def load_streamlines_file(main_window: Any) -> None:
         main_window.original_trk_path = input_path
         main_window.original_file_extension = ext 
 
-        # Reset state variables specific to streamlines
         main_window.selected_streamline_indices = set()
         main_window.undo_stack = []
         main_window.redo_stack = []
         main_window.current_color_mode = ColorMode.ORIENTATION
 
-        # --- Assign Scalar Data ---
         main_window.scalar_data_per_point = scalar_data
         main_window.active_scalar_name = active_scalar
+
+        # Calculate skip level BEFORE the initial render.
+        # This prevents rendering 500k fibers only to immediately clear them and render 20k.
+        should_render_in_update = True
+        
+        if hasattr(main_window, '_auto_calculate_skip_level'):
+             main_window._auto_calculate_skip_level()
+             should_render_in_update = False 
 
         # --- Update VTK and UI ---
         status_msg = f"Loaded {len(main_window.tractogram_data)} streamlines from {os.path.basename(input_path)}"
         if main_window.active_scalar_name:
             status_msg += f" | Active Scalar: {main_window.active_scalar_name}"
-        _update_vtk_and_ui_after_load(main_window, status_msg)
+        
+        # Pass False to render
+        _update_vtk_and_ui_after_load(main_window, status_msg, render=should_render_in_update)
 
     except Exception as e:
-        logger.error(f"Error during streamline loading or processing: {type(e).__name__}", exc_info=True)
-        logger.error(f"Error details: {e}")
-
+        logger.error(f"Error during streamline loading: {e}", exc_info=True)
+        
         error_title = "Load Error"
         if isinstance(e, nib.filebasedimages.ImageFileError):
             error_msg = f"Nibabel Error: {e}\n\nIs the file a valid TRK or TCK format?"
@@ -712,34 +752,18 @@ def load_streamlines_file(main_window: Any) -> None:
 
         try:
             QMessageBox.critical(main_window, error_title, error_msg)
-        except Exception as qm_e:
-            logger.error(f"Could not display QMessageBox: {qm_e}")
+        except Exception:
+            pass
 
-        # Update status and attempt to reset state cleanly
-        status_updater = getattr(main_window.vtk_panel, 'update_status', lambda msg: logger.info(f"Status: {msg}"))
         status_updater(f"Error loading file: {os.path.basename(input_path)}")
         try:
-            # Reset only streamline-related vars, keep anatomical if loaded
             main_window.tractogram_data = None
-            main_window.visible_indices = set()
-            main_window.original_trk_header = None
-            main_window.original_trk_affine = None
-            main_window.original_trk_path = None
-            main_window.original_file_extension = None
-            main_window.scalar_data_per_point = None
-            main_window.active_scalar_name = None
-            main_window.selected_streamline_indices = set()
-            main_window.undo_stack = []
-            main_window.redo_stack = []
-            main_window.current_color_mode = ColorMode.ORIENTATION 
             if main_window.vtk_panel:
                 main_window.vtk_panel.update_main_streamlines_actor()
-                main_window.vtk_panel.update_highlight()
             main_window._update_bundle_info_display()
             main_window._update_action_states()
-        except Exception as cleanup_e:
-            logger.error(f"During error cleanup after streamline load failure: {cleanup_e}")
-
+        except Exception:
+            pass
 
 def _validate_save_prerequisites(main_window: Any) -> bool:
     """Checks if prerequisites for saving streamlines are met."""
