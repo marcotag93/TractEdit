@@ -32,7 +32,7 @@ Center for Mind/Brain Sciences (CIMeC), University of Trento Italy
 ## Key Features
 
 - **Load & Save** streamline bundles (`.trk`, `.tck`, `.trx`)
-- **Whole-Brain Tractogram Support:** Optimized rendering for large datasets (tested with >2 million streamlines) using stride-based visualization and toggleable "skip".
+- **Whole-Brain Tractogram Support:** Optimized for large datasets (>2 million streamlines) using **asynchronous file loading**, **Numba-optimized** geometry calculations, and **vectorized VTK rendering**. Includes a stride-based "skip" feature for smooth interaction. 
 - **Multi-View Orthogonal Visualization:** Integrated 3D viewer and three linked 2D orthogonal slice views (Axial, Coronal, Sagittal).
 - **Anatomical Image:** Load NIfTI images (`.nii`, `.nii.gz`) as backgrounds for anatomical context and **interactive slice navigation**.
 - **Multi-Layer Anatomical ROI Support:** - Load multiple NIfTI images (`.nii`, `.nii.gz`) as background Region of Interest (ROI) layers.
@@ -41,12 +41,14 @@ Center for Mind/Brain Sciences (CIMeC), University of Trento Italy
 - **3D Visualization** with [VTK](https://vtk.org/) and [FURY](https://fury.gl/)
     - Default orientation (RGB), or scalar-based coloring with dynamic colormap range adjustment, or greyscale.
     - Interactive RAS coordinate bar for precise navigation.
+    - ODF/Glyph Visualization: View Spherical Harmonics (SH) coefficients with a "Tunnel View" that masks glyphs to the bundle's path.
 - **Interactive Editing Tools:**
     - Sphere-based streamline selection (with adjustable radius)
     - Streamline deletion and undo/redo support.
     - Screenshot export
 - **Bundle Analytics:**
     - Calculate **Centroid** and **Medoid** of the edited bundle.
+    - Generate and save **Density Map (TDI)** from the edited bundle.
 - **Streamline Info Display:**
     - File name, streamline count, voxel size, bounding box, etc.
     - Vertical data panel with hover details 
@@ -80,6 +82,8 @@ The project dependencies (including PyQt6, VTK, and Nibabel) are defined in pypr
 - NumPy
 - pytz
 - [trx-python](https://pypi.org/project/trx-python/)
+- Numba
+- Scipy
   
 Recommend a virtual environment:
 ```bash
@@ -95,7 +99,7 @@ The application can now be launched using the tractedit command installed via pi
 tractedit
 ```
 
-> On certain Linux systems (e.g., Ubuntu on Wayland), you may encounter Qt platform errors. If so, try the xcb workaround below. Please note that this mode is known to cause rendering artifacts in the 2D panels.
+> On certain Linux systems (e.g., Ubuntu on Wayland), you may encounter Qt platform errors. If so, try the xcb workaround below.
 ```bash
 QT_QPA_PLATFORM=xcb tractedit
 ```
@@ -133,15 +137,17 @@ Use **pre-built executable** Tractedit.exe (no Python setup required).
 
 ## Sample Workflow
 
-1. Open a `.trk`, `.tck` or `.trx` file via **File → Open**
-2. Load an anatomical image via **File → Load Image** to enable 2D slice views.
+1. Open a `.trk`, `.tck` or `.trx` file via **File → Open**.
+2. Load an anatomical image via **File → Load Image**.
 3. Load anatomical ROIs via **File → Load ROI** and right-click ROI layers to set them as Include or Exclude regions to automatically filter streamlines.
 4. Use the mouse click-drag in the 2D slice views or the arrow keys (see shortcuts above) to navigate the anatomical slices.
-5. Use the mouse and `S` key to select streamlines
-6. Press `D` to delete, or `C` to clear selection. Use Ctrl+Z to undo deletions.
-8. If needed, change streamline color in **View → Streamline Color**. If using Color by Scalar, use the Scalar Range toolbar at the top of the window to adjust the min/max range of the colormap.
-9. Save the centroid and/or the medoid of your edited bundle with **File → Calculate Centroid** and **File → Calculate Medoid**
-10. Save your edited bundle with **File → Save As**
+5. Use the mouse and `S` key to select streamlines.
+6. Press `D` to delete, or `C` to clear selection. Use **Ctrl+Z** to undo deletions.
+7. Customize the view using **View → Streamline Geometry** (Lines/Tubes) or load ODFs via **File → Load ODF**.
+8. If needed, change streamline color in **View → Streamline Color**. If using Color by Scalar, use the Scalar Range toolbar. If using ODF, use **View → Show ODF Tunnel**. 
+9. Save the centroid and/or the medoid of your edited bundle with **File → Calculate Centroid** and **File → Calculate Medoid**.
+10. Generate a density map of your edited bundle via **File → Save Density Map**.
+11. Save your edited bundle with **File → Save As**.
 
 ---
 
