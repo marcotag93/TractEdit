@@ -11,12 +11,189 @@ import logging
 import numpy as np
 import nibabel as nib
 import trx.trx_file_memmap as tbx
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import QFileDialog, QMessageBox, QApplication, QProgressDialog, QWidget
 from .utils import ColorMode
 from typing import Optional, List, Dict, Any, Tuple, Type, Union
+from numba import njit
 
 logger = logging.getLogger(__name__)
+
+class StreamlineLoaderThread(QThread):
+    """
+    Background thread to load streamline files without freezing the GUI.
+    """
+    progress = pyqtSignal(int, str)  # Signal to update progress bar (percent, message)
+    finished = pyqtSignal(dict)      # Signal when loading is done
+    error = pyqtSignal(str)          # Signal if an error occurs
+
+    def __init__(self, input_path):
+        super().__init__()
+        self.input_path = input_path
+
+    def run(self):
+        try:
+            _, ext = os.path.splitext(self.input_path)
+            ext = ext.lower()
+            results = {'path': self.input_path, 'ext': ext}
+
+            if ext in ['.trk', '.tck']:
+                # Loading
+                self.progress.emit(20, "Reading file...")
+                trk_file = nib.streamlines.load(self.input_path, lazy_load=False) # lazy_load=False reads the whole file (blocking but fast C-execution)
+                tractogram_obj = trk_file.tractogram
+                loaded_streamlines = tractogram_obj.streamlines
+
+                # Optimization
+                self.progress.emit(50, "Rendering...")
+                if hasattr(loaded_streamlines, '_data') and loaded_streamlines._data.dtype != np.float32:
+                    loaded_streamlines._data = np.ascontiguousarray(loaded_streamlines._data, dtype=np.float32) # to ensure arrays passed to Numba are contiguous.
+                
+                results['streamlines'] = loaded_streamlines
+                results['header'] = trk_file.header.copy() if hasattr(trk_file, 'header') else {}
+                
+                # Handle Affine
+                aff = np.identity(4)
+                if hasattr(tractogram_obj, 'affine_to_rasmm'):
+                    temp_aff = tractogram_obj.affine_to_rasmm
+                    if isinstance(temp_aff, np.ndarray) and temp_aff.shape == (4, 4):
+                        aff = temp_aff
+                results['affine'] = aff
+
+                # Handle Scalars
+                scalars = {}
+                active_scalar = None
+                if hasattr(tractogram_obj, 'data_per_point') and tractogram_obj.data_per_point:
+                    for k, v in tractogram_obj.data_per_point.items():
+                        scalars[k] = nib.streamlines.ArraySequence(v)
+                    if scalars: active_scalar = list(scalars.keys())[0]
+                results['scalars'] = scalars
+                results['active_scalar'] = active_scalar
+
+                # Geometry (BBox)
+                self.progress.emit(70, "Finalizing...")
+                # Attempt fast Numba calc
+                if hasattr(loaded_streamlines, '_data') and hasattr(loaded_streamlines, '_offsets'):
+                    flat_data = loaded_streamlines._data
+                    offsets = loaded_streamlines._offsets
+                    lengths = loaded_streamlines._lengths
+                     # Check offsets/lengths types just in case
+                    if not isinstance(offsets, np.ndarray):
+                        offsets = np.array(offsets, dtype=np.int64)
+                    if not isinstance(lengths, np.ndarray):
+                        lengths = np.array(lengths, dtype=np.int64)
+                    results['bboxes'] = _compute_bboxes_numba(flat_data, offsets, lengths)
+                else:
+                    # Fallback slow calc
+                    bboxes = []
+                    for sl in loaded_streamlines:
+                        if len(sl) > 0: bboxes.append([np.min(sl, axis=0), np.max(sl, axis=0)])
+                        else: bboxes.append([np.zeros(3), np.zeros(3)])
+                    results['bboxes'] = np.array(bboxes, dtype=np.float32)
+
+            elif ext == '.trx':
+                self.progress.emit(10, "Loading TRX file...")
+                trx_obj = tbx.load(self.input_path)
+                results['trx_obj'] = trx_obj
+                results['streamlines'] = trx_obj.streamlines
+                results['header'] = trx_obj.header.copy()
+                
+                # Affine
+                aff = np.identity(4)
+                if hasattr(trx_obj, 'affine_to_rasmm'):
+                    temp_aff = trx_obj.affine_to_rasmm
+                    if isinstance(temp_aff, np.ndarray) and temp_aff.shape == (4, 4):
+                        aff = temp_aff
+                results['affine'] = aff
+                
+                # Scalars (Basic check)
+                scalars = {}
+                dpp = getattr(trx_obj, 'data_per_vertex', None)
+                if dpp: scalars.update(dpp)
+                results['scalars'] = scalars
+                results['active_scalar'] = list(scalars.keys())[0] if scalars else None
+
+                # Geometry (Progressive)
+                self.progress.emit(30, "Finalizing...")
+                bboxes = []
+                total = len(trx_obj.streamlines)
+                step = max(1, total // 50) # Update every 2%
+                
+                for i, sl in enumerate(trx_obj.streamlines):
+                    if i % step == 0:
+                         pct = 30 + int(60 * (i / total))
+                         self.progress.emit(pct, f"Calculating geometry {int(i/total*100)}%...")
+                    
+                    if len(sl) > 0: bboxes.append([np.min(sl, axis=0), np.max(sl, axis=0)])
+                    else: bboxes.append([np.zeros(3), np.zeros(3)])
+                results['bboxes'] = np.array(bboxes, dtype=np.float32)
+
+            else:
+                self.error.emit(f"Unsupported file format: {ext}")
+                return
+
+            self.progress.emit(100, "Done")
+            self.finished.emit(results)
+
+        except Exception as e:
+            self.error.emit(str(e))
+            
+
+# Numba Optimized Helper 
+@njit(nogil=True)
+def _compute_bboxes_numba(flat_data: np.ndarray, offsets: np.ndarray, lengths: np.ndarray) -> np.ndarray:
+    """
+    Calculates bounding boxes for streamlines using Numba for high performance.
+    
+    Args:
+        flat_data: The flattened coordinates array (N_total_points, 3).
+        offsets: Array of start indices for each streamline.
+        lengths: Array of point counts for each streamline.
+        
+    Returns:
+        A (N_streamlines, 2, 3) array containing [min_coords, max_coords] for each streamline.
+    """
+    n_streamlines = len(lengths)
+    bboxes = np.zeros((n_streamlines, 2, 3), dtype=np.float32)
+    
+    for i in range(n_streamlines):
+        start = offsets[i]
+        length = lengths[i]
+        
+        if length == 0:
+            continue
+            
+        # Initialize min/max with the first point of the streamline
+        first_idx = start
+        min_x = flat_data[first_idx, 0]
+        max_x = flat_data[first_idx, 0]
+        min_y = flat_data[first_idx, 1]
+        max_y = flat_data[first_idx, 1]
+        min_z = flat_data[first_idx, 2]
+        max_z = flat_data[first_idx, 2]
+        
+        # Iterate over the rest of the points
+        for j in range(1, length):
+            idx = start + j
+            x = flat_data[idx, 0]
+            y = flat_data[idx, 1]
+            z = flat_data[idx, 2]
+            
+            if x < min_x: min_x = x
+            if x > max_x: max_x = x
+            if y < min_y: min_y = y
+            if y > max_y: max_y = y
+            if z < min_z: min_z = z
+            if z > max_z: max_z = z
+            
+        bboxes[i, 0, 0] = min_x
+        bboxes[i, 0, 1] = min_y
+        bboxes[i, 0, 2] = min_z
+        bboxes[i, 1, 0] = max_x
+        bboxes[i, 1, 1] = max_y
+        bboxes[i, 1, 2] = max_z
+        
+    return bboxes
 
 # --- Helper Function ---
 def parse_numeric_tuple_from_string(
@@ -114,7 +291,6 @@ def _validate_length(data: tuple, expected: Optional[Union[int, Tuple[int, ...]]
     
     # If expected is a tuple (usually for numpy shapes), we only check dimension 0 here for tuples
     if isinstance(expected, tuple):
-        # This function primarily handles 1D tuples. Complex matrix strings are rare in this context.
         return data if len(data) == expected[0] else original
 
     return data if len(data) == expected else original
@@ -161,13 +337,13 @@ def _compute_centroid_math(streamlines: List[np.ndarray], nb_points: int = 100) 
     if not streamlines:
         return None
     
-    # 1. Resample all to same number of points
+    # Resample all to same number of points
     resampled = [_resample_streamline(s, nb_points) for s in streamlines]
     ref = resampled[0]
     
     aligned_streamlines = [ref]
     
-    # 2. Align all subsequent streamlines to the reference (the first one)
+    # Align all subsequent streamlines to the reference (the first one)
     # MDF (Mean Direct Flip) distance logic for alignment
     for i in range(1, len(resampled)):
         s = resampled[i]
@@ -182,7 +358,7 @@ def _compute_centroid_math(streamlines: List[np.ndarray], nb_points: int = 100) 
         else:
             aligned_streamlines.append(s)
             
-    # 3. Compute arithmetic mean
+    # Compute arithmetic mean
     centroid = np.mean(aligned_streamlines, axis=0)
     return centroid
 
@@ -201,9 +377,8 @@ def _compute_medoid_math(streamlines: List[np.ndarray], nb_points: int = 100, pa
     # Resample streamlines for consistent distance calculation
     resampled = np.array([_resample_streamline(s, nb_points) for s in streamlines])
         
-    # 2. Compute Distance Matrix (MDF - Minimum Direct Flip)
-    # This is O(N^2), but for typical editing bundles it's acceptable.
-    # For very large N, this might freeze the UI briefly. Added a progress dialog. 
+    # Compute Distance Matrix (MDF - Minimum Direct Flip)
+    # This is O(N^2), but acceptable.
     dist_matrix = np.zeros((n, n))
     
     # Progress dialog
@@ -216,7 +391,7 @@ def _compute_medoid_math(streamlines: List[np.ndarray], nb_points: int = 100, pa
     # O(N^2) Distance calculation
     for i in range(n):
         if progress.wasCanceled():
-            return -1 # Return error code if cancelled
+            return -1 
         progress.setValue(i)
         
         for j in range(i + 1, n):
@@ -231,12 +406,12 @@ def _compute_medoid_math(streamlines: List[np.ndarray], nb_points: int = 100, pa
             dist_matrix[i, j] = dist
             dist_matrix[j, i] = dist 
             
-    progress.setValue(n) # Ensure bar fills completely
+    progress.setValue(n) 
             
     # Sum rows to find total distance for each candidate
     total_dists = np.sum(dist_matrix, axis=1)
     
-    # 4. Argmin is the medoid index
+    # Argmin is the medoid index
     return int(np.argmin(total_dists))
 
 def calculate_and_save_statistic(main_window: Any, method: str) -> None:
@@ -249,7 +424,6 @@ def calculate_and_save_statistic(main_window: Any, method: str) -> None:
         main_window: The main application window instance.
         method: 'centroid' or 'medoid'.
     """
-    # Ensure method is lowercase for logic, capitalize for UI strings
     method = method.lower()
     if method not in ['centroid', 'medoid']:
         logger.error(f"Invalid method for statistic calculation: {method}")
@@ -258,14 +432,14 @@ def calculate_and_save_statistic(main_window: Any, method: str) -> None:
     method_ui = method.capitalize()
     status_updater = getattr(main_window.vtk_panel, 'update_status', lambda msg: logger.info(f"Status: {msg}"))
 
-    # 1. Validation
+    # Validation
     if not _validate_save_prerequisites(main_window):
         return
     if not main_window.visible_indices:
         QMessageBox.warning(main_window, "Calculation Error", f"No visible streamlines to calculate {method}.")
         return
 
-    # --- Medoid Specific Safety Check ---
+    # Safety Check for Medoid
     if method == 'medoid' and len(main_window.visible_indices) > 100000:
         QMessageBox.warning(main_window, "Safety Warning", 
                             f"Too many streamlines selected ({len(main_window.visible_indices)}).\n"
@@ -274,7 +448,7 @@ def calculate_and_save_statistic(main_window: Any, method: str) -> None:
         status_updater("Medoid calculation aborted (too many streamlines).")
         return
     
-    # 2. Extract Visible Data
+    # Extract Visible Data
     tractogram_data = main_window.tractogram_data
     visible_streamlines = [tractogram_data[i] for i in main_window.visible_indices]
     
@@ -287,7 +461,7 @@ def calculate_and_save_statistic(main_window: Any, method: str) -> None:
     QApplication.processEvents()
 
     try:
-        # 3. Calculate
+        # Calculate
         result_streamline = None
         
         if method == 'centroid':
@@ -300,8 +474,7 @@ def calculate_and_save_statistic(main_window: Any, method: str) -> None:
                 return
             result_streamline = visible_streamlines[medoid_local_index]
 
-        # 4. Prepare for Saving
-        # The result is a single new streamline. Reuse the original affine.
+        # Prepare for Saving
         affine = main_window.original_trk_affine
         
         new_tractogram = nib.streamlines.Tractogram(
@@ -309,7 +482,7 @@ def calculate_and_save_statistic(main_window: Any, method: str) -> None:
             affine_to_rasmm=affine
         )
         
-        # 5. Get Save Path
+        # Get Save Path
         original_path = main_window.original_trk_path
         base, ext = os.path.splitext(original_path)
         suggested_name = f"{base}_{method}{ext}"
@@ -325,7 +498,7 @@ def calculate_and_save_statistic(main_window: Any, method: str) -> None:
 
         _, out_ext = os.path.splitext(output_path)
         
-        # 6. Save Logic
+        # Save Logic
         header = {}
         if out_ext.lower() == '.trk':
             header = _prepare_trk_header(main_window.original_trk_header, 1, main_window.anatomical_image_affine)
@@ -381,7 +554,7 @@ def _update_vtk_and_ui_after_load(main_window: Any, status_msg: str, render: boo
     main_window._update_action_states()
     main_window._update_bundle_info_display()
 
-# --- Anatomical Image Loading Function ---
+# Anatomical Image Loading Function
 def load_anatomical_image(main_window: Any) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[str]]:
     """
     Loads a NIfTI image file (.nii, .nii.gz).
@@ -420,7 +593,6 @@ def load_anatomical_image(main_window: Any) -> Tuple[Optional[np.ndarray], Optio
     try:
         # Load NIfTI file using nibabel
         img = nib.load(input_path)
-
         image_data = img.get_fdata(dtype=np.float32) # Ensure float for VTK/FURY
         image_affine = img.affine
 
@@ -452,7 +624,7 @@ def load_anatomical_image(main_window: Any) -> Tuple[Optional[np.ndarray], Optio
         status_updater(f"Error loading image: {os.path.basename(input_path)}")
         return None, None, None
     
-# --- ROI Image Loading Function ---
+# ROI Image Loading Function 
 def load_roi_images(main_window: Any) -> List[Tuple[np.ndarray, np.ndarray, str]]:
     """
     Loads multiple NIfTI ROI files (.nii, .nii.gz).
@@ -476,7 +648,7 @@ def load_roi_images(main_window: Any) -> List[Tuple[np.ndarray, np.ndarray, str]
     elif main_window.original_trk_path:
         start_dir = os.path.dirname(main_window.original_trk_path)
 
-    # CHANGED: Use getOpenFileNames (plural) to allow multiple selection
+    # se getOpenFileNames to allow multiple selection
     input_paths, _ = QFileDialog.getOpenFileNames(main_window, "Select Input ROI Image File(s)", start_dir, file_filter)
 
     if not input_paths:
@@ -488,15 +660,14 @@ def load_roi_images(main_window: Any) -> List[Tuple[np.ndarray, np.ndarray, str]
     
     loaded_rois = []
 
-    # CHANGED: Iterate through all selected paths
+    # Iterate through all selected paths
     for input_path in input_paths:
         status_updater(f"Loading ROI: {os.path.basename(input_path)}...")
         QApplication.processEvents()
 
         try:
             img = nib.load(input_path)
-
-            image_data = img.get_fdata(dtype=np.float32) # Ensure float
+            image_data = img.get_fdata(dtype=np.float32).astype(np.uint8) # load as float32 for get_fdata, then convert to uint8 for optimization  
             image_affine = img.affine
 
             if image_data.ndim < 3:
@@ -512,258 +683,148 @@ def load_roi_images(main_window: Any) -> List[Tuple[np.ndarray, np.ndarray, str]
         except Exception as e:
             error_msg = f"Error loading {os.path.basename(input_path)}:\n{type(e).__name__}: {e}"
             logger.error(error_msg)
-            # Optional: Show error for specific file but continue loading others
             QMessageBox.warning(main_window, "Load Error", error_msg)
 
     return loaded_rois
 
-# --- Streamline File I/O Functions ---
+# Streamline File I/O Functions
 def load_streamlines_file(main_window: Any) -> None:
     """
-    Loads a trk, tck, or trx file.
-    Updates the MainWindow state.
+    Loads a streamline file using a background thread and a progress bar.
     """
     if not hasattr(main_window, 'vtk_panel') or not main_window.vtk_panel.scene:
-        logger.error("Error: Scene not initialized in vtk_panel.")
         QMessageBox.critical(main_window, "Error", "VTK Scene not initialized.")
         return
 
+    # Get File Path
     base_filter = "Streamline Files (*.trk *.tck *.trx)"
     all_filters = f"{base_filter};;TrackVis Files (*.trk);;TCK Files (*.tck);;TRX Files (*.trx);;All Files (*.*)"
+    start_dir = os.path.dirname(main_window.original_trk_path or main_window.anatomical_image_path or "")
     
-    start_dir = ""
-    if main_window.original_trk_path:
-        start_dir = os.path.dirname(main_window.original_trk_path)
-    elif main_window.anatomical_image_path:
-        start_dir = os.path.dirname(main_window.anatomical_image_path)
-
     input_path, _ = QFileDialog.getOpenFileName(main_window, "Select Input Streamline File", start_dir, all_filters)
-
     if not input_path:
-        status_updater = getattr(main_window.vtk_panel, 'update_status', lambda msg: logger.info(f"Status: {msg}"))
-        status_updater("Streamline file load cancelled.")
         return
 
-    # Clean existing bundle first (if any)
+    # Close existing bundle to clean up state
     if main_window.tractogram_data:
         main_window._close_bundle()
 
-    status_updater = getattr(main_window.vtk_panel, 'update_status', lambda msg: logger.info(f"Status: {msg}"))
-    status_updater(f"Loading streamlines: {os.path.basename(input_path)}...")
-    QApplication.processEvents()
+    # Setup Progress Dialog (Modal)
+    progress = QProgressDialog("Initializing...", "Cancel", 0, 100, main_window)
+    progress.setWindowTitle("Loading Bundle")
+    progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+    progress.setMinimumDuration(0)
+    progress.setMinimumWidth(350) 
+    
+    # Apply custom style to match VTK panel theme and color (#05B8CC)
+    progress.setStyleSheet("""
+        QProgressDialog {
+            background-color: #2b2b2b;
+            color: #dddddd;
+        }
+        QLabel {
+            color: #dddddd;
+            font-size: 12px;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+        QProgressBar {
+            border: 1px solid #555;
+            border-radius: 4px;
+            background-color: #333;
+            color: white;
+            text-align: center;
+            font-size: 12px;
+            height: 25px;
+        }
+        QProgressBar::chunk {
+            background-color: #05B8CC;
+            border-radius: 3px;
+        }
+        QPushButton {
+            background-color: #444;
+            color: #ddd;
+            border: 1px solid #555;
+            border-radius: 4px;
+            padding: 4px 12px;
+        }
+        QPushButton:hover {
+            background-color: #555;
+        }
+    """)
+    
+    progress.setValue(0)
+    progress.show()
 
-    try:
-        _, ext = os.path.splitext(input_path)
-        ext = ext.lower()
+    # Create and Configure Thread
+    loader_thread = StreamlineLoaderThread(input_path)
 
-        loaded_streamlines_obj: Optional['nib.streamlines.ArraySequence'] = None
-        loaded_header: Dict[str, Any] = {}
-        loaded_affine: np.ndarray = np.identity(4)
-        scalar_data: Optional[Dict[str, 'nib.streamlines.ArraySequence']] = None
-        active_scalar: Optional[str] = None
-        tractogram_obj: Any = None 
-        num_streamlines = 0
+    def on_progress(val, msg):
+        progress.setValue(val)
+        progress.setLabelText(msg)
+
+    def on_error(msg):
+        progress.cancel()
+        QMessageBox.critical(main_window, "Load Error", f"Error loading file:\n{msg}")
+
+    def on_finished(data):
+        progress.setValue(100)
         
-        # Clear any old trx file reference
-        if hasattr(main_window, 'trx_file_reference'):
-             try:
-                 main_window.trx_file_reference.close()
-             except Exception:
-                 pass 
-        main_window.trx_file_reference = None
-
-        if ext in ['.trk', '.tck']:
-            # lazy_load=True returns a generator for .trk/.tck.
-            trk_file = nib.streamlines.load(input_path, lazy_load=True)
-            
-            # --- START PROGRESS BAR LOGIC (Added) ---
-            total_sl = 0
-            if hasattr(trk_file, 'header'):
-                h = trk_file.header
-                if 'nb_streamlines' in h:
-                    try: total_sl = int(h['nb_streamlines'])
-                    except: pass
-                elif 'count' in h:
-                    try: total_sl = int(h['count'])
-                    except: pass
-            
-            progress = QProgressDialog("Loading File... ", "Cancel", 0, total_sl, main_window)
-            progress.setWindowTitle("TractEdit")
-            progress.setWindowModality(Qt.WindowModality.WindowModal)
-            progress.setMinimumDuration(500) 
-            progress.setValue(0)
-            
-            if total_sl <= 0: progress.setRange(0, 0) 
-
-            streamlines_list = []
-            load_canceled = False
-
-            for i, sl in enumerate(trk_file.streamlines):
-                streamlines_list.append(sl)
-                # Update every 2000 items to avoid UI overhead
-                if i % 2000 == 0:
-                    progress.setValue(i)
-                    if progress.wasCanceled():
-                        load_canceled = True
-                        break
-            
-            progress.setValue(total_sl if total_sl > 0 else len(streamlines_list))
-            progress.close()
-
-            if load_canceled:
-                status_updater("Load cancelled by user.")
-                return
-            
-            num_streamlines = len(streamlines_list)
-            logger.info(f"Loaded {num_streamlines} streamlines from {ext} file into memory.")
-
-            loaded_streamlines_obj = nib.streamlines.ArraySequence(streamlines_list)
-            loaded_header = trk_file.header.copy() if hasattr(trk_file, 'header') else {}
-            tractogram_obj = trk_file.tractogram 
-
-            if hasattr(tractogram_obj, 'affine_to_rasmm'):
-                nib_affine = tractogram_obj.affine_to_rasmm
-                if isinstance(nib_affine, np.ndarray) and nib_affine.shape == (4, 4):
-                    loaded_affine = nib_affine
-                else:
-                    logger.warning(f"Loaded affine_to_rasmm is not a valid 4x4 numpy array. Using identity affine.")
-            else:
-                logger.warning("affine_to_rasmm not found. Using identity affine.")
-            
-            if hasattr(tractogram_obj, 'data_per_point') and tractogram_obj.data_per_point:
-                logger.info("Scalar data found in file (data_per_point).")
-                scalar_data = {}
-                try:
-                    for key, value_list in tractogram_obj.data_per_point.items():
-                        scalar_data[key] = nib.streamlines.ArraySequence(value_list)
-                    if scalar_data:
-                        active_scalar = list(scalar_data.keys())[0]
-                        logger.info(f"Assigned scalars. Active scalar: '{active_scalar}'") 
-                except Exception:
-                    logger.warning(f"Could not process scalar data.", exc_info=True)
-                    scalar_data = None
-                    active_scalar = None
-            else:
-                 logger.info("No scalar data found in file.") 
-
-        elif ext == '.trx':
-            trx_obj = tbx.load(input_path)
-            loaded_streamlines_obj = trx_obj.streamlines
-            num_streamlines = len(loaded_streamlines_obj)
-            logger.info(f"Loaded {num_streamlines} streamlines from {ext} file (lazy-loaded).") 
-            
-            loaded_header = trx_obj.header.copy()
-            tractogram_obj = trx_obj
-            
-            if hasattr(trx_obj, 'affine_to_rasmm'):
-                trx_affine = trx_obj.affine_to_rasmm
-                if isinstance(trx_affine, np.ndarray) and trx_affine.shape == (4, 4):
-                    loaded_affine = trx_affine
-                else:
-                    logger.warning("affine_to_rasmm not found. Using identity affine.") 
-            else:
-                    logger.warning("affine_to_rasmm not found. Using identity affine.") 
-
-            if hasattr(trx_obj, 'data_per_point') and trx_obj.data_per_point:
-                logger.info("Scalar data found in file (data_per_point).")
-                scalar_data = trx_obj.data_per_point
-                if scalar_data:
-                    active_scalar = list(scalar_data.keys())[0]
-                    logger.info(f"Assigned scalars. Active scalar: '{active_scalar}'")
-            else:
-                logger.info("No scalar data found in file.")
-            
-            main_window.trx_file_reference = trx_obj
-
-        else:
-            raise ValueError(f"Unsupported file extension: '{ext}'.")
-
-        if not loaded_streamlines_obj or num_streamlines == 0:
-            logger.info("No streamlines found in file.")
-            QMessageBox.information(main_window, "Load Info", "No streamlines found in the selected file.")
-            status_updater(f"Loaded 0 streamlines from {os.path.basename(input_path)}")
-            
-            main_window.tractogram_data = None
-            main_window.visible_indices = set()
-            main_window.original_trk_header = None
-            main_window.original_trk_affine = None
-            main_window.original_trk_path = None
-            main_window.original_file_extension = None
-            main_window.scalar_data_per_point = None
-            main_window.active_scalar_name = None
-            main_window.selected_streamline_indices = set()
-            main_window.undo_stack = []
-            main_window.redo_stack = []
-            main_window.current_color_mode = ColorMode.ORIENTATION
-            
-            main_window._update_bundle_info_display()
-            main_window._update_action_states()
-            if main_window.vtk_panel:
-                main_window.vtk_panel.update_main_streamlines_actor()
-                main_window.vtk_panel.update_highlight()
-                main_window.vtk_panel.update_radius_actor(visible=False)
-                if main_window.vtk_panel.render_window:
-                        main_window.vtk_panel.render_window.Render()
-            return
-
-        # --- Assign Core Data to MainWindow ---
-        main_window.tractogram_data = loaded_streamlines_obj
-        main_window.visible_indices = set(range(num_streamlines))
+        # Apply Data to MainWindow 
+        main_window.tractogram_data = data['streamlines']
+        main_window.streamline_bboxes = data['bboxes']
         
-        main_window.original_trk_header = loaded_header
-        main_window.original_trk_affine = loaded_affine
-        main_window.original_trk_path = input_path
-        main_window.original_file_extension = ext 
-
+        main_window.original_trk_header = data['header']
+        main_window.original_trk_affine = data['affine']
+        main_window.original_trk_path = data['path']
+        main_window.original_file_extension = data['ext']
+        
+        main_window.trx_file_reference = data.get('trx_obj', None)
+        main_window.scalar_data_per_point = data['scalars']
+        main_window.active_scalar_name = data['active_scalar']
+        
+        # Initialize Logic State 
+        total_fibers = len(main_window.tractogram_data)
+        main_window.manual_visible_indices = set(range(total_fibers))
+        main_window.visible_indices = set(range(total_fibers))
+        
+        # Reset Caches
+        main_window.roi_states = {}
+        main_window.roi_intersection_cache = {}
+        main_window.roi_highlight_indices = set()
+        
         main_window.selected_streamline_indices = set()
         main_window.undo_stack = []
         main_window.redo_stack = []
         main_window.current_color_mode = ColorMode.ORIENTATION
 
-        main_window.scalar_data_per_point = scalar_data
-        main_window.active_scalar_name = active_scalar
+        # Check for empty file
+        if not main_window.tractogram_data or len(main_window.tractogram_data) == 0:
+            QMessageBox.information(main_window, "Load Info", "No streamlines found in file.")
+            main_window._close_bundle()
+            return
 
-        # Calculate skip level BEFORE the initial render.
-        # This prevents rendering 500k fibers only to immediately clear them and render 20k.
-        should_render_in_update = True
-        
+        # Auto Skip Calculation
+        should_render = True
         if hasattr(main_window, '_auto_calculate_skip_level'):
              main_window._auto_calculate_skip_level()
-             should_render_in_update = False 
+             should_render = False 
 
-        # --- Update VTK and UI ---
-        status_msg = f"Loaded {len(main_window.tractogram_data)} streamlines from {os.path.basename(input_path)}"
-        if main_window.active_scalar_name:
-            status_msg += f" | Active Scalar: {main_window.active_scalar_name}"
-        
-        # Pass False to render
-        _update_vtk_and_ui_after_load(main_window, status_msg, render=should_render_in_update)
+        # Finalize UI
+        status_msg = f"Loaded {len(main_window.tractogram_data)} streamlines from {os.path.basename(data['path'])}"
+        _update_vtk_and_ui_after_load(main_window, status_msg, render=should_render)
 
-    except Exception as e:
-        logger.error(f"Error during streamline loading: {e}", exc_info=True)
-        
-        error_title = "Load Error"
-        if isinstance(e, nib.filebasedimages.ImageFileError):
-            error_msg = f"Nibabel Error: {e}\n\nIs the file a valid TRK or TCK format?"
-        elif isinstance(e, FileNotFoundError):
-            error_msg = f"Error: Streamline file not found:\n{input_path}"
-        else:
-            error_msg = f"Error loading streamline file:\n{type(e).__name__}: {e}\n\nSee console for details."
+    # Connect Signals
+    loader_thread.progress.connect(on_progress)
+    loader_thread.error.connect(on_error)
+    loader_thread.finished.connect(on_finished)
+    progress.canceled.connect(loader_thread.terminate)
 
-        try:
-            QMessageBox.critical(main_window, error_title, error_msg)
-        except Exception:
-            pass
-
-        status_updater(f"Error loading file: {os.path.basename(input_path)}")
-        try:
-            main_window.tractogram_data = None
-            if main_window.vtk_panel:
-                main_window.vtk_panel.update_main_streamlines_actor()
-            main_window._update_bundle_info_display()
-            main_window._update_action_states()
-        except Exception:
-            pass
+    # Keep reference
+    main_window._loader_thread = loader_thread
+    
+    # Start
+    loader_thread.start()
 
 def _validate_save_prerequisites(main_window: Any) -> bool:
     """Checks if prerequisites for saving streamlines are met."""
@@ -851,7 +912,6 @@ def _prepare_tractogram_and_affine(main_window: Any) -> nib.streamlines.Tractogr
             for key, scalar_sequence in main_window.scalar_data_per_point.items():
                 # Use the same generator logic to get scalars for visible indices
                 scalars_for_key_gen = (scalar_sequence[i] for i in indices_to_save)
-                # We must save it as a list of arrays
                 data_per_point_to_save[key] = list(scalars_for_key_gen)
         except Exception as e:
             logger.warning(f"Warning: Could not filter scalar data for saving. Saving without scalars. Error: {e}")
@@ -874,7 +934,7 @@ def _prepare_trk_header(base_header: Dict[str, Any], nb_streamlines: int, anatom
     header = base_header.copy()
     logger.info("Preparing TRK header for saving...") 
 
-    # --- Voxel Order Logic ---
+    # Voxel Order Logic 
     raw_voxel_order_from_trk = header.get('voxel_order')
     processed_voxel_order_from_trk = None
 
@@ -923,7 +983,7 @@ def _prepare_trk_header(base_header: Dict[str, Any], nb_streamlines: int, anatom
             else: # Covers cases where derivation from anat failed or anat_img_affine was invalid
                 logger.info(f"      - Info: Could not use original or derive 'voxel_order' from anatomical image. Defaulting to 'RAS'.")
 
-    # --- Process other specific TRK header fields ---
+    # Process other specific TRK header fields
     keys_to_process = {
         'voxel_sizes': {'type': float, 'length': 3, 'default': (1.0, 1.0, 1.0)},
         'dimensions': {'type': int, 'length': 3, 'default': (1, 1, 1)}, # Small valid default
@@ -936,7 +996,7 @@ def _prepare_trk_header(base_header: Dict[str, Any], nb_streamlines: int, anatom
         expected_item_type = K_props['type']
         is_matrix = 'shape' in K_props
 
-        # 1. Decode if bytes
+        # Decode if bytes
         if isinstance(processed_value, bytes):
             try:
                 processed_value = processed_value.decode('utf-8', errors='strict')
@@ -946,7 +1006,7 @@ def _prepare_trk_header(base_header: Dict[str, Any], nb_streamlines: int, anatom
                 logger.warning(f"      - Info: Set '{key}' to default: {header[key]}")
                 continue 
 
-        # 2. Parse if string, or use if already suitable type
+        # Parse if string, or use if already suitable type
         if isinstance(processed_value, str):
             parsed_val = parse_numeric_tuple_from_string(
                 processed_value,
@@ -955,11 +1015,11 @@ def _prepare_trk_header(base_header: Dict[str, Any], nb_streamlines: int, anatom
             )
             # Check if parse_numeric_tuple_from_string returned the original string (failure)
             if not (isinstance(parsed_val, str) and parsed_val == processed_value):
-                processed_value = parsed_val # Successfully parsed
+                processed_value = parsed_val 
             else:
                 logger.info(f"      - Info: Could not parse string '{processed_value}' for '{key}'.")
         
-        # 3. Validate and set
+        # Validate and set
         valid_structure = False
         final_value = None
 
@@ -1010,7 +1070,7 @@ def _prepare_trx_header(base_header: Optional[Dict[str, Any]], nb_streamlines: i
     header = base_header.copy() if base_header is not None else {}
     header['nb_streamlines'] = nb_streamlines
     
-    # Clean up fields
+    # Clean up 
     header.pop('count', None) # TCK specific
     
     return header
@@ -1032,13 +1092,13 @@ def _save_tractogram_file(tractogram: nib.streamlines.Tractogram, header: Dict[s
         return f"File saved successfully (TCK): {os.path.basename(output_path)}"
     
     elif file_ext == '.trx':        
-        # 1. 'tractogram' is our nib.streamlines.Tractogram object.
-        #    'header' is our prepared header.
+        # 'tractogram' is our nib.streamlines.Tractogram object.
+        #  'header' is our prepared header.
         trx_obj_to_save = tbx.TrxFile.from_lazy_tractogram(
             tractogram, header
         )
         
-        # 2. Save the newly created object using tbx.save()
+        # Save the newly created object using tbx.save()
         tbx.save(trx_obj_to_save, output_path)
         logger.info("File saved successfully (TRX)")
         return f"File saved successfully (TRX): {os.path.basename(output_path)}"
@@ -1046,24 +1106,24 @@ def _save_tractogram_file(tractogram: nib.streamlines.Tractogram, header: Dict[s
     else:
         raise ValueError(f"Unsupported save extension: {file_ext}")
 
-# --- Main Save Function ---
+# Main Save Function
 def save_streamlines_file(main_window: Any) -> None:
     """
     Saves the current streamlines to a trk, tck, or trx file.
     """
     status_updater = getattr(main_window.vtk_panel, 'update_status', lambda msg: logger.info(f"Status: {msg}"))
 
-    # --- 1. Pre-checks ---
+    # Pre-checks
     if not _validate_save_prerequisites(main_window):
         return
 
-    # --- 2. Get Output Path ---
+    # Get Output Path
     output_path, output_ext = _get_save_path_and_extension(main_window)
     if not output_path:
         status_updater("Save cancelled.")
         return
 
-    # --- 3. Prepare Data ---
+    # Prepare Data
     status_updater(f"Saving {len(main_window.visible_indices)} streamlines to: {os.path.basename(output_path)}...")
     QApplication.processEvents() # UI update
 
@@ -1085,7 +1145,7 @@ def save_streamlines_file(main_window: Any) -> None:
             header_to_save = _prepare_trx_header(
                 main_window.original_trk_header, len(tractogram.streamlines))
             
-        # --- 5. Save File ---
+        # Save File
         success_msg = _save_tractogram_file(tractogram, header_to_save, output_path, output_ext)
         status_updater(success_msg)
 

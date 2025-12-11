@@ -16,13 +16,13 @@ from typing import Optional, Any, Union, List, Tuple
 
 logger = logging.getLogger(__name__)
 
-# --- Constants ---
+# Constants 
 MAX_STACK_LEVELS: int = 20
 DEFAULT_SELECTION_RADIUS: float = 3.5
 MIN_SELECTION_RADIUS: float = 0.5
 RADIUS_INCREMENT: float = 0.5
 
-# --- Coloring Mode Enum ---
+# Coloring Mode Enum 
 class ColorMode(enum.Enum):
     """Enum defining the streamline coloring modes."""
     DEFAULT: int = 0
@@ -35,7 +35,6 @@ def get_formatted_datetime() -> str:
     Uses the system's configured local timezone.
     """
     try:
-        # Get the current time using the system's local timezone
         now_aware = datetime.now().astimezone()
         return now_aware.strftime("%d/%m/%Y %H:%M:%S %Z")
     except Exception as e:

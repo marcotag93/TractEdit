@@ -21,6 +21,7 @@ from .utils import ColorMode
 from typing import Optional, List, Dict, Any, Tuple, Set
 import nibabel as nib
 from functools import partial
+from vtk.util import numpy_support
 
 logger = logging.getLogger(__name__)
 
@@ -83,19 +84,19 @@ class VTKPanel:
         """
         self.main_window: Any = main_window_ref
 
-        # 1. Create the main vertical splitter (3D view on top, 2D views on bottom)
+        # Create the main vertical splitter (3D view on top, 2D views on bottom)
         main_splitter = QSplitter(Qt.Orientation.Vertical)
 
-        # 2. Create the main 3D VTK widget
+        # Create the main 3D VTK widget
         self.vtk_widget: QVTKRenderWindowInteractor = QVTKRenderWindowInteractor()
         main_splitter.addWidget(self.vtk_widget) # Add to top
 
-        # 3. Create the bottom container for 2D views
+        # Create the bottom container for 2D views
         ortho_container = QWidget()
         ortho_layout = QHBoxLayout(ortho_container)
         ortho_layout.setContentsMargins(0, 0, 0, 0)
         
-        # 4. Create the horizontal splitter for the three 2D views
+        # Create the horizontal splitter for the three 2D views
         ortho_splitter = QSplitter(Qt.Orientation.Horizontal)
         
         self.axial_vtk_widget: QVTKRenderWindowInteractor = QVTKRenderWindowInteractor()
@@ -123,13 +124,13 @@ class VTKPanel:
         ortho_layout.addWidget(ortho_splitter)
         ortho_container.setLayout(ortho_layout)
         
-        # 5. Add the 2D view container to the bottom 
+        # Add the 2D view container to the bottom 
         main_splitter.addWidget(ortho_container)
         
-        # 6. Set initial size ratio (e.g., 70% 3D, 30% 2D)
+        # Set initial size ratio (e.g., 70% 3D, 30% 2D)
         main_splitter.setSizes([700, 300])
 
-        # 7. Add the main splitter to the parent widget's layout
+        # Add the main splitter to the parent widget's layout
         layout = QVBoxLayout(parent_widget)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(main_splitter)
@@ -184,12 +185,16 @@ class VTKPanel:
 
         # --- Actor Placeholders ---
         self.streamlines_actor: Optional[vtk.vtkActor] = None
+        self.odf_actor: Optional[vtk.vtkActor] = None
         self.highlight_actor: Optional[vtk.vtkActor] = None
         self.radius_actor: Optional[vtk.vtkActor] = None
         self.current_radius_actor_radius: Optional[float] = None
         self.axial_slice_actor: Optional[vtk.vtkActor] = None
         self.coronal_slice_actor: Optional[vtk.vtkActor] = None
         self.sagittal_slice_actor: Optional[vtk.vtkActor] = None
+        self.axial_slice_actor_2d: Optional[vtk.vtkActor] = None
+        self.coronal_slice_actor_2d: Optional[vtk.vtkActor] = None
+        self.sagittal_slice_actor_2d: Optional[vtk.vtkActor] = None
         self.status_text_actor: Optional[vtk.vtkTextActor] = None
         self.instruction_text_actor: Optional[vtk.vtkTextActor] = None
         self.axes_actor: Optional[vtk.vtkActor] = None
@@ -202,12 +207,11 @@ class VTKPanel:
         self.sagittal_crosshair_actor: Optional[vtk.vtkActor] = None
         self.crosshair_lines: Dict[str, vtk.vtkLineSource] = {} # Stores vtkLineSource objects for updates
         self.crosshair_appenders: Dict[str, vtk.vtkAppendPolyData] = {} # Stores vtkAppendPolyData 
-        
         self.is_navigating_2d: bool = False
         
         self.roi_slice_actors: Dict[str, Dict[str, vtk.vtkActor]] = {} # Key: path, Val: {'axial':, 'coronal':, 'sagittal':}
-        
         self.roi_highlight_actor: Optional[vtk.vtkActor] = None 
+        self.scalar_bar_actor: Optional[vtk.vtkScalarBarActor] = None
         
         # --- Overlay Progress Bar ---
         self.overlay_progress_bar = QProgressBar(self.vtk_widget)
@@ -234,7 +238,6 @@ class VTKPanel:
         self._create_scene_ui()
 
         # --- Setup Interaction Callbacks ---
-        # KeyPress for all windows
         self.interactor.AddObserver(vtk.vtkCommand.KeyPressEvent, self.key_press_callback, 1.0)
         self.axial_interactor.AddObserver(vtk.vtkCommand.KeyPressEvent, self.key_press_callback, 1.0)
         self.coronal_interactor.AddObserver(vtk.vtkCommand.KeyPressEvent, self.key_press_callback, 1.0)
@@ -261,11 +264,15 @@ class VTKPanel:
         """Sets visibility for anatomical slices and associated crosshairs."""
         vis_flag = 1 if visible else 0
         
-        # 1. Update Slice Actors
+        # Update Slice Actors
         for act in [self.axial_slice_actor, self.coronal_slice_actor, self.sagittal_slice_actor]:
             if act: act.SetVisibility(vis_flag)
+
+        # Update 2D Slice Actors as well
+        for act in [self.axial_slice_actor_2d, self.coronal_slice_actor_2d, self.sagittal_slice_actor_2d]:
+            if act: act.SetVisibility(vis_flag)
             
-        # 2. Update Crosshair Actors
+        # Update Crosshair Actors
         for act in [self.axial_crosshair_actor, self.coronal_crosshair_actor, self.sagittal_crosshair_actor]:
             if act: act.SetVisibility(vis_flag)
             
@@ -336,6 +343,65 @@ class VTKPanel:
                 self.sagittal_render_window.Render()
         except Exception as e:
             logger.warning(f"Warning: Error during _render_all: {e}")
+            
+
+    def update_odf_actor(self, odf_amplitudes: np.ndarray, sphere: Any, affine: np.ndarray, extent: Optional[Tuple[int, ...]] = None) -> None:
+        """
+        Creates/Updates the ODF glyph actor.
+        
+        Args:
+            odf_amplitudes: 4D array (x, y, z, N_vertices) of SF amplitudes.
+            sphere: The SimpleSphere object used for reconstruction.
+            affine: The affine of the ODF volume.
+            extent: (min_x, max_x, min_y, max_y, min_z, max_z) in voxel coordinates.
+        """
+        if not self.scene: return
+
+        # Remove existing
+        if self.odf_actor:
+            self.scene.rm(self.odf_actor)
+            self.odf_actor = None
+            
+        if odf_amplitudes is None:
+            self.render_window.Render()
+            return
+
+        try:
+            # Create ODF Slicer Actor
+            self.odf_actor = actor.odf_slicer(
+                odf_amplitudes, 
+                sphere=sphere, 
+                affine=affine, 
+                scale=0.5, 
+                norm=True,
+                global_cm=False 
+            )
+            # Set the display extent 
+            if extent is not None:
+                self.odf_actor.display_extent(*extent)
+                
+            self.scene.add(self.odf_actor)
+            
+            # Optional: Add to 2D scenes if we want them visible there too (heavy on performance)
+            # if self.axial_scene: self.axial_scene.add(self.odf_actor)
+            # if self.coronal_scene: self.coronal_scene.add(self.odf_actor)
+            # if self.sagittal_scene: self.sagittal_scene.add(self.odf_actor)
+
+            self.render_window.Render()
+            self.update_status("ODF Glyphs updated.")
+            
+        except Exception as e:
+            logger.error(f"Error creating ODF actor: {e}", exc_info=True)
+            self.update_status("Error creating ODF actor.")
+            
+            
+    def remove_odf_actor(self) -> None:
+        """Removes the ODF actor from the scene."""
+        if self.odf_actor and self.scene:
+            self.scene.rm(self.odf_actor)
+            self.odf_actor = None
+            self.render_window.Render()
+            
             
     def _show_2d_context_menu(self, position: QPoint, widget: QVTKRenderWindowInteractor, view_type: str) -> None:
         """
@@ -494,7 +560,6 @@ class VTKPanel:
             self.sagittal_scene.reset_clipping_range()
             
             # Expand the clipping range to ensure the crosshair in the overlay is never clipped
-            # The crosshair sits at the same depth as the slice and can get clipped at edges
             near, far = cam.GetClippingRange()
             cam.SetClippingRange(near * 0.01, far * 100) 
             
@@ -542,19 +607,19 @@ class VTKPanel:
             if self.sagittal_scene: self.sagittal_scene.rm(actor)
         self.orientation_labels = []
         
-    # --- Axial View (A/P, R/L) ---
+        # Axial View (A/P, R/L) 
         self._create_2d_label_actor("A", self.axial_scene, (0.5, 0.98), v_align="Top")
         self._create_2d_label_actor("P", self.axial_scene, (0.5, 0.02), v_align="Bottom")
         self._create_2d_label_actor("L", self.axial_scene, (0.98, 0.5), h_align="Right") 
         self._create_2d_label_actor("R", self.axial_scene, (0.02, 0.5), h_align="Left") 
 
-        # --- Coronal View (S/I, R/L) ---
+        # Coronal View (S/I, R/L)
         self._create_2d_label_actor("S", self.coronal_scene, (0.5, 0.98), v_align="Top")
         self._create_2d_label_actor("I", self.coronal_scene, (0.5, 0.02), v_align="Bottom")
         self._create_2d_label_actor("L", self.coronal_scene, (0.98, 0.5), h_align="Right") 
         self._create_2d_label_actor("R", self.coronal_scene, (0.02, 0.5), h_align="Left")  
      
-        # --- Sagittal View (S/I, A/P) ---
+        # Sagittal View (S/I, A/P) 
         self._create_2d_label_actor("S", self.sagittal_scene, (0.5, 0.98), v_align="Top")
         self._create_2d_label_actor("I", self.sagittal_scene, (0.5, 0.02), v_align="Bottom")
         self._create_2d_label_actor("A", self.sagittal_scene, (0.98, 0.5), h_align="Right")
@@ -598,7 +663,7 @@ class VTKPanel:
         self.axes_actor = actor.axes(scale=(25, 25, 25))
         self.scene.add(self.axes_actor)
 
-        # --- Add 3D Orientation Cube ---
+        # 3D Orientation Cube
         try:
             cube_actor = vtk.vtkAnnotatedCubeActor()
             cube_actor.SetXPlusFaceText("R")  # Right
@@ -636,7 +701,7 @@ class VTKPanel:
         except Exception as e:
             logger.warning(f"Could not create 3D orientation cube: {e}")
 
-        # --- Add 2D Orientation Labels ---
+        # 2D Orientation Labels 
         self._create_2d_orientation_labels()
 
     def update_status(self, message: str) -> None:
@@ -708,7 +773,7 @@ class VTKPanel:
         self.overlay_progress_bar.setValue(value)
         self.overlay_progress_bar.show()
 
-    # --- Selection Sphere Actor Management ---
+    # Selection Sphere Actor 
     def _ensure_radius_actor_exists(self, radius: float, center_point: Tuple[float, float, float]) -> None:
         """Creates the VTK sphere actor if it doesn't exist."""
         if self.radius_actor is not None: 
@@ -788,7 +853,7 @@ class VTKPanel:
         if needs_render and self.render_window and self.render_window.GetInteractor().GetInitialized():
             self.render_window.Render()
 
-    # --- Anatomical Slice Actor Management ---
+    # Anatomical Slice Actor Management 
     def update_anatomical_slices(self) -> None:
         """Creates or updates the FURY slicer actors for anatomical image."""
         if not self.scene: 
@@ -835,11 +900,11 @@ class VTKPanel:
         y_extent = self.image_extents['y']
         z_extent = self.image_extents['z']
 
-        # --- Clear existing slicer actors ---
+        # Clear existing slicer actors 
         self.clear_anatomical_slices(reset_state=False) 
 
         try:
-            # --- Determine Value Range ---
+            # Determine Value Range 
             img_min = np.min(image_data)
             img_max = np.max(image_data)
 
@@ -853,12 +918,12 @@ class VTKPanel:
             if img_max <= img_min: value_range = (img_min - 1.0, img_max + 1.0)
             else: value_range = (float(img_min), float(img_max))
 
-            # Slicer parameters
-            slicer_opacity = 1.0 
+            # Get opacity from MainWindow state 
+            slicer_opacity = getattr(self.main_window, 'image_opacity', 1.0)
             interpolation_mode = 'nearest' 
 
-            # --- Create Slicer Actors using FURY's default gray LUT ---
-            # 1. Axial Slice (Z plane)
+            # Create Slicer Actors using FURY's default gray LUT 
+            # Axial Slice (Z plane)
             self.axial_slice_actor = actor.slicer(
                 image_data, affine=affine,
                 value_range=value_range,
@@ -866,9 +931,17 @@ class VTKPanel:
             )
             self.axial_slice_actor.display_extent(x_extent[0], x_extent[1], y_extent[0], y_extent[1], current_z, current_z)
             self.scene.add(self.axial_slice_actor)
-            if self.axial_scene: self.axial_scene.add(self.axial_slice_actor)
+            
+            # 2D Actor (Uses FIXED opacity of 1.0)
+            self.axial_slice_actor_2d = actor.slicer(
+                image_data, affine=affine,
+                value_range=value_range,
+                opacity=1.0, interpolation=interpolation_mode
+            )
+            self.axial_slice_actor_2d.display_extent(x_extent[0], x_extent[1], y_extent[0], y_extent[1], current_z, current_z)
+            if self.axial_scene: self.axial_scene.add(self.axial_slice_actor_2d)
 
-            # 2. Coronal Slice (Y plane)
+            # Coronal Slice (Y plane)
             self.coronal_slice_actor = actor.slicer(
                 image_data, affine=affine,
                 value_range=value_range,
@@ -876,9 +949,17 @@ class VTKPanel:
             )
             self.coronal_slice_actor.display_extent(x_extent[0], x_extent[1], current_y, current_y, z_extent[0], z_extent[1])
             self.scene.add(self.coronal_slice_actor)
-            if self.coronal_scene: self.coronal_scene.add(self.coronal_slice_actor)
+            
+            # 2D Actor
+            self.coronal_slice_actor_2d = actor.slicer(
+                image_data, affine=affine,
+                value_range=value_range,
+                opacity=1.0, interpolation=interpolation_mode
+            )
+            self.coronal_slice_actor_2d.display_extent(x_extent[0], x_extent[1], current_y, current_y, z_extent[0], z_extent[1])
+            if self.coronal_scene: self.coronal_scene.add(self.coronal_slice_actor_2d)
 
-            # 3. Sagittal Slice (X plane)
+            # Sagittal Slice (X plane)
             self.sagittal_slice_actor = actor.slicer(
                 image_data, affine=affine,
                 value_range=value_range,
@@ -886,9 +967,17 @@ class VTKPanel:
             )
             self.sagittal_slice_actor.display_extent(current_x, current_x, y_extent[0], y_extent[1], z_extent[0], z_extent[1])
             self.scene.add(self.sagittal_slice_actor)
-            if self.sagittal_scene: self.sagittal_scene.add(self.sagittal_slice_actor)
             
-            # --- Create crosshair actors ---
+            # 2D Actor
+            self.sagittal_slice_actor_2d = actor.slicer(
+                image_data, affine=affine,
+                value_range=value_range,
+                opacity=1.0, interpolation=interpolation_mode
+            )
+            self.sagittal_slice_actor_2d.display_extent(current_x, current_x, y_extent[0], y_extent[1], z_extent[0], z_extent[1])
+            if self.sagittal_scene: self.sagittal_scene.add(self.sagittal_slice_actor_2d)
+            
+            # Create crosshair actors 
             self._create_or_update_crosshairs()
 
         except TypeError as te:
@@ -916,7 +1005,10 @@ class VTKPanel:
 
         # Create lists of valid objects only (filter out None) to reduce nesting
         actors_to_remove = [
-            a for a in [self.axial_slice_actor, self.coronal_slice_actor, self.sagittal_slice_actor] 
+            a for a in [
+                self.axial_slice_actor, self.coronal_slice_actor, self.sagittal_slice_actor,
+                self.axial_slice_actor_2d, self.coronal_slice_actor_2d, self.sagittal_slice_actor_2d
+            ] 
             if a is not None
         ]
         
@@ -942,6 +1034,9 @@ class VTKPanel:
         self.axial_slice_actor = None
         self.coronal_slice_actor = None
         self.sagittal_slice_actor = None
+        self.axial_slice_actor_2d = None
+        self.coronal_slice_actor_2d = None
+        self.sagittal_slice_actor_2d = None
 
         if reset_state:
             self.current_slice_indices = {'x': None, 'y': None, 'z': None}
@@ -965,8 +1060,30 @@ class VTKPanel:
         roi_orient = nib.aff2axcodes(self.main_window.roi_layers[key]['affine'])
         logger.info(f"  Main orientation: {main_orient}")
         logger.info(f"  ROI orientation: {roi_orient}")
+        
+    def set_streamlines_opacity(self, value: float) -> None:
+        """Sets the opacity of the main streamlines actor."""
+        if self.streamlines_actor:
+            self.streamlines_actor.GetProperty().SetOpacity(value)
+            self.render_window.Render()
 
-    # --- Clear Crosshairs ---
+    def set_anatomical_opacity(self, value: float) -> None:
+        """Sets the opacity of the anatomical slices."""
+        for act in [self.axial_slice_actor, self.coronal_slice_actor, self.sagittal_slice_actor]:
+            if act:
+                act.GetProperty().SetOpacity(value)
+        self.render_window.Render()
+
+    def set_roi_opacity(self, key: str, value: float) -> None:
+        """Sets the opacity for a specific ROI layer."""
+        if key in self.roi_slice_actors:
+            for act in self.roi_slice_actors[key].values(): # Update the opacity for all the actors 
+                if act:
+                    act.GetProperty().SetOpacity(value)
+            
+            self._render_all()
+
+    # Clear Crosshairs 
     def _clear_crosshairs(self) -> None:
         """Removes the 2D crosshair actors from their scenes."""
         # Remove axial and coronal from their scenes
@@ -993,7 +1110,7 @@ class VTKPanel:
         self.crosshair_lines = {}
         self.crosshair_appenders = {}
     
-    # --- Voxel <-> World Coordinate Helpers ---
+    # Voxel <-> World Coordinate Helpers 
     def _voxel_to_world(self, vox_coord: List[float], affine: Optional[np.ndarray] = None) -> np.ndarray:
         """Converts a voxel index [i, j, k] to world RASmm coordinates [x, y, z]."""
         if affine is None:
@@ -1017,7 +1134,7 @@ class VTKPanel:
         vox_coord = np.dot(inv_affine, homog_world)
         return vox_coord[:3] # Return float voxel coords
 
-    # --- Create/Update Crosshairs ---
+    # Create/Update Crosshairs 
     def _create_or_update_crosshairs(self) -> None:
         """Creates or updates the 2D crosshair actors based on current slice indices."""
         if (self.main_window is None or 
@@ -1033,7 +1150,7 @@ class VTKPanel:
             y_min, y_max = self.image_extents['y']
             z_min, z_max = self.image_extents['z']
 
-            # --- 1. Define line endpoints in WORLD coordinates ---
+            # Define line endpoints in WORLD coordinates 
             main_affine = self.main_window.anatomical_image_affine
             # Axial View (X-Y plane):
             ax_line_x_p1 = self._voxel_to_world([x, y_min, z], main_affine)
@@ -1053,7 +1170,7 @@ class VTKPanel:
             sa_line_z_p1 = self._voxel_to_world([x, y, z_min], main_affine)
             sa_line_z_p2 = self._voxel_to_world([x, y, z_max], main_affine)
             
-            # --- 2. Check if actors need to be created ---
+            # Check if actors need to be created 
             if self.axial_crosshair_actor is None:
                 
                 # --- Axial ---
@@ -1107,7 +1224,7 @@ class VTKPanel:
                 self.sagittal_crosshair_actor.GetProperty().SetLighting(False)
                 self.sagittal_overlay_renderer.AddActor(self.sagittal_crosshair_actor)
 
-            # --- 3. Update the line source endpoints ---
+            # Update the line source endpoints 
             # Convert numpy arrays to tuples for VTK compatibility
             self.crosshair_lines['ax_x'].SetPoint1(tuple(ax_line_x_p1))
             self.crosshair_lines['ax_x'].SetPoint2(tuple(ax_line_x_p2))
@@ -1124,7 +1241,7 @@ class VTKPanel:
             self.crosshair_lines['sa_z'].SetPoint1(tuple(sa_line_z_p1))
             self.crosshair_lines['sa_z'].SetPoint2(tuple(sa_line_z_p2))
             
-            # --- 4. Force pipeline update and mark actors as modified ---
+            # Force pipeline update and mark actors as modified 
             for key in ['ax_x', 'ax_y', 'co_x', 'co_z', 'sa_y', 'sa_z']:
                 self.crosshair_lines[key].Update()
             for key in ['axial', 'coronal', 'sagittal']:
@@ -1138,7 +1255,7 @@ class VTKPanel:
             logger.error(f"Error creating/updating crosshairs:", exc_info=True)
             self._clear_crosshairs()
 
-    # --- Move Slice ---
+    # Move Slice 
     def move_slice(self, axis: str, direction: int) -> None:
         """Moves the specified slice ('x', 'y', 'z') by 'direction' (+1 or -1)."""
         if (not self.image_shape_vox or 
@@ -1159,13 +1276,12 @@ class VTKPanel:
             self.update_status(f"Slice View: Reached {axis.upper()} limit ({new_index}).")
             return
             
-        # --- Delegate to the master update function ---
+        # Delegate to the master update function 
         kwargs = {axis: new_index}
         self.set_slice_indices(**kwargs)
- 
         self._update_slow_slice_components() 
  
-    # --- Master Slice Update Function ---
+    # Master Slice Update Function 
     def set_slice_indices(self, x: Optional[int] = None, y: Optional[int] = None, z: Optional[int] = None) -> None:
         """
         Sets the slice indices, updates anatomical slices and crosshairs.
@@ -1177,7 +1293,7 @@ class VTKPanel:
             not self.sagittal_slice_actor):
             return 
 
-        # --- 1. Determine new indices and clamp them ---
+        # Determine new indices and clamp them 
         current = self.current_slice_indices
 
         new_x = x if x is not None else current['x']
@@ -1188,15 +1304,15 @@ class VTKPanel:
         new_y = max(self.image_extents['y'][0], min(new_y, self.image_extents['y'][1]))
         new_z = max(self.image_extents['z'][0], min(new_z, self.image_extents['z'][1]))
 
-        # --- 2. Check if anything changed ---
+        # Check if anything changed 
         if (new_x == current['x'] and new_y == current['y'] and new_z == current['z']):
             return
 
-        # --- 3. Update state ---
+        # Update state 
         self.current_slice_indices = {'x': new_x, 'y': new_y, 'z': new_z}
 
         try:
-            # --- 4. Update all 3D slice actors (FAST) ---
+            # Update all 3D slice actors (FAST) 
             x_ext = self.image_extents['x']
             y_ext = self.image_extents['y']
             z_ext = self.image_extents['z']
@@ -1206,17 +1322,23 @@ class VTKPanel:
 
             if new_x != current['x']:
                 self.sagittal_slice_actor.display_extent(new_x, new_x, y_ext[0], y_ext[1], z_ext[0], z_ext[1])
+                if self.sagittal_slice_actor_2d:
+                    self.sagittal_slice_actor_2d.display_extent(new_x, new_x, y_ext[0], y_ext[1], z_ext[0], z_ext[1])
                 slice_moved['x'] = True
 
             if new_y != current['y']:
                 self.coronal_slice_actor.display_extent(x_ext[0], x_ext[1], new_y, new_y, z_ext[0], z_ext[1])
+                if self.coronal_slice_actor_2d:
+                    self.coronal_slice_actor_2d.display_extent(x_ext[0], x_ext[1], new_y, new_y, z_ext[0], z_ext[1])
                 slice_moved['y'] = True
 
             if new_z != current['z']:
                 self.axial_slice_actor.display_extent(x_ext[0], x_ext[1], y_ext[0], y_ext[1], new_z, new_z)
+                if self.axial_slice_actor_2d:
+                    self.axial_slice_actor_2d.display_extent(x_ext[0], x_ext[1], y_ext[0], y_ext[1], new_z, new_z)
                 slice_moved['z'] = True
                 
-            # --- 5. Update all ROI Slicers ---
+            # Update all ROI Slicers 
             if self.main_window and self.roi_slice_actors and self.image_extents['x']:
                 c_x = (self.image_extents['x'][0] + self.image_extents['x'][1]) / 2.0
                 c_y = (self.image_extents['y'][0] + self.image_extents['y'][1]) / 2.0
@@ -1267,7 +1389,7 @@ class VTKPanel:
 
             self._create_or_update_crosshairs()
 
-            # --- 6. Update 2D cameras for moved slices ---
+            # Update 2D cameras for moved slices 
             if slice_moved['x']:
                 self._update_sagittal_camera()
             if slice_moved['y']:
@@ -1275,7 +1397,7 @@ class VTKPanel:
             if slice_moved['z']:
                 self._update_axial_camera()
 
-            # --- 7. Update status and render ---
+            # Update status and render 
             self._render_all()
 
         except Exception as e:
@@ -1298,11 +1420,11 @@ class VTKPanel:
             
             c = self.current_slice_indices
             
-            # --- 1. Update status text ---
+            # Update status text 
             status_msg = f"Slice View: X={c['x']}/{self.image_extents['x'][1]}  Y={c['y']}/{self.image_extents['y'][1]}  Z={c['z']}/{self.image_extents['z'][1]}"
             self.update_status(status_msg)
 
-            # --- 2. Update RAS Coordinate Display ---
+            # Update RAS Coordinate Display 
             try:
                 main_affine = self.main_window.anatomical_image_affine
                 if main_affine is not None:
@@ -1316,7 +1438,7 @@ class VTKPanel:
                     self.main_window.update_ras_coordinate_display(None)
             except Exception as e:
                 logger.error(f"Error updating RAS coordinate display: {e}")
-                self.main_window.update_ras_coordinate_display(None) # Pass None to signal error/clear
+                self.main_window.update_ras_coordinate_display(None) 
                 
     def set_slices_from_ras(self, ras_coords: np.ndarray) -> None:
         """
@@ -1326,7 +1448,7 @@ class VTKPanel:
         Args:
             ras_coords: A (3,) numpy array of [X, Y, Z] world coordinates.
         """
-        # 1. Check if we have the necessary info
+        # Check if we have the necessary info
         if (self.main_window is None or
             self.main_window.anatomical_image_affine is None or
             not all(self.image_extents.values()) or
@@ -1336,24 +1458,24 @@ class VTKPanel:
             return
 
         try:
-            # 2. Convert RAS world coordinate to (float) voxel coordinate
+            # Convert RAS world coordinate to (float) voxel coordinate
             inv_affine = np.linalg.inv(self.main_window.anatomical_image_affine)
             voxel_pos_float = self._world_to_voxel(ras_coords, inv_affine)
 
-            # 3. Round to nearest integer voxel index
+            # Round to nearest integer voxel index
             new_x = int(round(voxel_pos_float[0]))
             new_y = int(round(voxel_pos_float[1]))
             new_z = int(round(voxel_pos_float[2]))
             
-            # 4. Clamp to valid voxel range
+            # Clamp to valid voxel range
             new_x = max(self.image_extents['x'][0], min(new_x, self.image_extents['x'][1]))
             new_y = max(self.image_extents['y'][0], min(new_y, self.image_extents['y'][1]))
             new_z = max(self.image_extents['z'][0], min(new_z, self.image_extents['z'][1]))
             
-            # 5. Call the master update function
+            # Call the master update function
             self.set_slice_indices(x=new_x, y=new_y, z=new_z)
             
-            # 6. Update the status bar and text input
+            # Update the status bar and text input
             self._update_slow_slice_components()
 
         except Exception as e:
@@ -1365,19 +1487,27 @@ class VTKPanel:
         Picks the 3D coordinate from a 2D view and updates the slice indices.
         """
 
-        # 1. Check if anatomical image is loaded
+        # Check if anatomical image is loaded
         if (self.main_window is None or
             self.main_window.anatomical_image_data is None or
             None in self.current_slice_indices.values()):
             self.is_navigating_2d = False # avoid freeze
             return
 
-        # 2. Get interactor and click position (display coords)
+        # Get interactor and click position (display coords)
         interactor = obj
         if not interactor: return
+        
         display_pos = interactor.GetEventPosition()
+        x, y = display_pos
+        win_size = interactor.GetRenderWindow().GetSize()
+        w, h = win_size
+        
+        # Strictly check bounds (0 <= x < width, 0 <= y < height) to prevent VTK Interactor crash on out-of-bounds pick
+        if x < 0 or x >= w or y < 0 or y >= h:
+            return
 
-        # 3. Pick the 3D world coordinate at that pixel
+        # Pick the 3D world coordinate at that pixel
         picker = vtk.vtkCellPicker()
         picker.SetTolerance(0.005)
         renderer = interactor.GetRenderWindow().GetRenderers().GetFirstRenderer()
@@ -1394,16 +1524,16 @@ class VTKPanel:
         world_pos = picker.GetPickPosition()
 
         try:
-            # 4. Convert this world coordinate back to a (float) voxel coordinate
+            # Convert this world coordinate back to a (float) voxel coordinate
             inv_affine = np.linalg.inv(self.main_window.anatomical_image_affine)
             voxel_pos_float = self._world_to_voxel(world_pos, inv_affine)
 
-            # 5. Round to nearest integer voxel index
+            # Round to nearest integer voxel index
             new_x = int(round(voxel_pos_float[0]))
             new_y = int(round(voxel_pos_float[1]))
             new_z = int(round(voxel_pos_float[2]))
             
-            # --- Clamp to valid voxel range ---
+            # Clamp to valid voxel range 
             new_x = max(self.image_extents['x'][0], min(new_x, self.image_extents['x'][1]))
             new_y = max(self.image_extents['y'][0], min(new_y, self.image_extents['y'][1]))
             new_z = max(self.image_extents['z'][0], min(new_z, self.image_extents['z'][1]))
@@ -1415,7 +1545,7 @@ class VTKPanel:
                 self.is_navigating_2d = False   
                 return
 
-            # 6. Call the master update function
+            # Call the master update function
             if interactor == self.axial_interactor:
                 # Axial view (X-Y plane), so keep current Z
                 current_z = self.current_slice_indices['z']
@@ -1439,7 +1569,7 @@ class VTKPanel:
             self.update_status("Error navigating with click.")
             
 
-    # --- Streamline Actor Management ---
+    # Streamline Actor Management 
     def update_highlight(self) -> None:
         """Updates the actor for highlighted/selected streamlines."""
         if not self.scene: return
@@ -1509,7 +1639,6 @@ class VTKPanel:
         # Update UI action states
         if self.main_window: self.main_window._update_action_states()
 
-    # --- Function signature updated ---
     def _calculate_scalar_colors(self, streamlines_gen: 'generator', scalar_gen: 'generator', vmin: float, vmax: float) -> Optional[Dict[str, Any]]:
         """
         Calculates vertex colors based on a list of scalar arrays per streamline,
@@ -1517,7 +1646,7 @@ class VTKPanel:
         Returns a single concatenated (TotalPoints, 3) numpy array for FURY.
         """
         
-        # --- 1. Create the LUT ---
+        # Create the LUT 
         try:
             lut = vtk.vtkLookupTable()
             table_min = vmin - 0.5 if vmin == vmax else vmin
@@ -1530,7 +1659,7 @@ class VTKPanel:
             logger.error(f"Error creating scalar LUT: {e}. Defaulting to grey.")
             return None # Fallback to grey
         
-        # --- 3. Build the list of color arrays (one per *non-empty* streamline) ---
+        # Build the list of color arrays (one per *non-empty* streamline) 
         default_color_rgb = np.array([128, 128, 128], dtype=np.uint8)
         vertex_colors_list: List[np.ndarray] = [] # List to hold individual np.arrays
         rgb_output: List[float] = [0.0, 0.0, 0.0]
@@ -1561,29 +1690,86 @@ class VTKPanel:
         if not vertex_colors_list: 
             return None 
 
-        # --- 4. Concatenate all color arrays into one big array ---
+        # Concatenate all color arrays into one big array 
         try:
             concatenated_colors = np.concatenate(vertex_colors_list, axis=0)
         except ValueError as ve:
              logger.error(f"Failed to concatenate color arrays: {ve}")
              return None # Fallback to grey
 
-        return {'colors': concatenated_colors, 'opacity': 0.8, 'linewidth': 3}
+        return {'colors': concatenated_colors, 'opacity': 0.8, 'linewidth': 3, 'lut': lut}
+    
+    
+    def _update_scalar_bar(self, lut: vtk.vtkLookupTable, title: str) -> None:
+        """Creates or updates the scalar bar actor with improved UX, title positioning, and precision."""
+        if not self.scene: return
+
+        if self.scalar_bar_actor is None:
+            self.scalar_bar_actor = vtk.vtkScalarBarActor()
+            self.scalar_bar_actor.SetOrientationToVertical()
+            
+            # Size and Positioning
+            self.scalar_bar_actor.SetWidth(0.04) 
+            self.scalar_bar_actor.SetHeight(0.35) 
+            
+            # Position: (X, Y) normalized viewport coordinates
+            self.scalar_bar_actor.GetPositionCoordinate().SetCoordinateSystemToNormalizedViewport()
+            self.scalar_bar_actor.SetPosition(0.94, 0.32)
+            
+            # Typography
+            title_prop = vtk.vtkTextProperty()
+            title_prop.SetColor(0.9, 0.9, 0.9)
+            title_prop.SetFontSize(16)          
+            title_prop.SetFontFamilyToArial()
+            title_prop.ItalicOn()
+            title_prop.ShadowOn()
+            title_prop.SetJustificationToRight()
+            
+            # Label Styling
+            label_prop = vtk.vtkTextProperty()
+            label_prop.SetColor(0.8, 0.8, 0.8)
+            label_prop.SetFontSize(10)
+            label_prop.SetFontFamilyToArial()
+            label_prop.ShadowOff()
+            
+            self.scalar_bar_actor.SetTitleTextProperty(title_prop)
+            self.scalar_bar_actor.SetLabelTextProperty(label_prop)
+            
+            # Formatting
+            self.scalar_bar_actor.SetNumberOfLabels(5)
+            self.scalar_bar_actor.SetLabelFormat("%-.4g") 
+            self.scalar_bar_actor.UnconstrainedFontSizeOn()
+            self.scalar_bar_actor.SetTextPositionToPrecedeScalarBar()
+            self.scene.add(self.scalar_bar_actor)
+
+        # Update Data
+        self.scalar_bar_actor.SetLookupTable(lut)
+        self.scalar_bar_actor.SetTitle(title + "\n") 
+        self.scalar_bar_actor.SetVisibility(1)
+        self.scalar_bar_actor.Modified()
+        
 
     def _get_streamline_actor_params(self) -> Dict[str, Any]:
         """
         Determines parameters for the main streamlines actor using STRIDE.
+        Optimized to avoid double-copying data by using simple lists instead 
+        of rebuilding ArraySequence containers.
         """
-        params: Dict[str, Any] = {'colors': (0.8, 0.8, 0.8), 'opacity': 0.5, 'linewidth': 2}
+        # Get opacity from MainWindow state
+        current_opacity = getattr(self.main_window, 'bundle_opacity', 1.0)
+        
+        # Default parameters
+        params: Dict[str, Any] = {'colors': (0.8, 0.8, 0.8), 'opacity': current_opacity, 'linewidth': 2}
+        
         if not self.main_window or not self.main_window.tractogram_data: 
             return params
 
         tractogram = self.main_window.tractogram_data
         
-        # 1. Get ALL Visible Indices (sorted)
+        # Get ALL Visible Indices
         visible_indices_list = sorted(list(self.main_window.visible_indices))
         
-        # 2. Apply STRIDE (Skip Logic)
+        # Apply STRIDE (Skip Logic)
         stride = self.main_window.render_stride
         subset_indices = visible_indices_list[::stride] # Only pick 1 every N
         
@@ -1591,80 +1777,165 @@ class VTKPanel:
              params['streamlines_list'] = []
              return params
 
-        # 3. Create List of Streamlines
-        # (This is still a list creation, but only for 1% of data if stride=100)
         visible_streamlines_list = [tractogram[i] for i in subset_indices]
 
-        # 4. Coloring Logic
+        # Coloring Logic
         current_mode = self.main_window.current_color_mode
 
         if current_mode == ColorMode.ORIENTATION:
              params['colors'] = colormap.line_colors(visible_streamlines_list)
-             params['opacity'] = 0.8
+             params['opacity'] = current_opacity
         
         elif current_mode == ColorMode.SCALAR:
-            scalar_data = self.main_window.scalar_data_per_point
             active_scalar = self.main_window.active_scalar_name
-            if scalar_data and active_scalar:
-                scalar_seq = scalar_data[active_scalar]
-                # Get scalars for the SUBSET
-                subset_scalars = [scalar_seq[i] for i in subset_indices]
+            scalar_seq = None
+            is_per_streamline = False
+
+            # Try generic dictionary
+            if self.main_window.scalar_data_per_point and active_scalar in self.main_window.scalar_data_per_point:
+                scalar_seq = self.main_window.scalar_data_per_point[active_scalar]
+            
+            # Try TRX 'Data Per Vertex' (dpv)
+            elif hasattr(tractogram, 'data_per_vertex') and active_scalar in tractogram.data_per_vertex:
+                scalar_seq = tractogram.data_per_vertex[active_scalar]
                 
-                vmin = self.main_window.scalar_min_val
-                vmax = self.main_window.scalar_max_val
-                
-                scalar_params = self._calculate_scalar_colors(
-                    iter(visible_streamlines_list), 
-                    iter(subset_scalars), 
-                    vmin, vmax
-                )
-                if scalar_params: params = scalar_params
+            # Try TRX 'Data Per Streamline' (dps)
+            elif hasattr(tractogram, 'data_per_streamline') and active_scalar in tractogram.data_per_streamline:
+                scalar_seq = tractogram.data_per_streamline[active_scalar]
+                is_per_streamline = True
+
+            if scalar_seq is not None:
+                try:
+                    flat_scalars = None
+
+                    if is_per_streamline:
+                        # Extract values for the subset
+                        subset_values = [scalar_seq[i] for i in subset_indices]
+                        
+                        # Calculate lengths manually 
+                        lengths = [len(sl) for sl in visible_streamlines_list]
+                        
+                        # Repeat value N times for each streamline
+                        flat_scalars = np.repeat(subset_values, lengths)
+                    else:
+                        subset_arrays = [scalar_seq[i] for i in subset_indices]
+                        flat_scalars = np.concatenate(subset_arrays)
+
+                    # Vectorized Color Mapping
+                    vmin = self.main_window.scalar_min_val
+                    vmax = self.main_window.scalar_max_val
+
+                    # Create LUT
+                    lut = vtk.vtkLookupTable()
+                    table_min = vmin - 0.5 if vmin == vmax else vmin
+                    table_max = vmax + 0.5 if vmin == vmax else vmax
+                    lut.SetTableRange(table_min, table_max)
+                    lut.SetHueRange(0.667, 0.0) # Blue to Red
+                    lut.Build()
+
+                    # Convert scalars to VTK array (explicit float32)
+                    vtk_scalars = numpy_support.numpy_to_vtk(flat_scalars.astype(np.float32), deep=True, array_type=vtk.VTK_FLOAT)
+                    
+                    # Map Scalars (Returns vtkUnsignedCharArray)
+                    vtk_colors = lut.MapScalars(vtk_scalars, vtk.VTK_COLOR_MODE_DEFAULT, -1)
+                    
+                    # Convert back to Numpy and strip Alpha
+                    colors_flat = numpy_support.vtk_to_numpy(vtk_colors)
+                    colors_rgb = colors_flat[:, :3]
+                    
+                    params['colors'] = colors_rgb
+                    params['lut'] = lut
+                    params['opacity'] = current_opacity
+
+                except Exception as e:
+                    logger.error(f"Error during vectorized scalar calculation: {e}", exc_info=True)
+                    params['colors'] = (0.5, 0.5, 0.5)
 
         params['streamlines_list'] = visible_streamlines_list
         return params
-                     
+    
+
     def update_main_streamlines_actor(self) -> None:
         """
         Recreates the main actor using the skipped/strided dataset.
+        Handles both Line and Tube visualization.
         """
         if not self.scene: return
 
-        # 1. Remove old actor
+        # Remove old actor
         if self.streamlines_actor is not None:
             self.scene.rm(self.streamlines_actor)
             self.streamlines_actor = None
 
         if not self.main_window or not self.main_window.tractogram_data:
+            if self.scalar_bar_actor:
+                self.scalar_bar_actor.SetVisibility(0)
             self.render_window.Render()
             return
 
-        # 2. Get Params (includes subsampled list)
+        # Get Params (includes subsampled list)
         params = self._get_streamline_actor_params()
         sl_list = params.get('streamlines_list', [])
+        
+        current_mode = self.main_window.current_color_mode
+        active_scalar = self.main_window.active_scalar_name
+        
+        if current_mode == ColorMode.SCALAR and 'lut' in params and active_scalar:
+            self._update_scalar_bar(params['lut'], active_scalar)
+        else:
+            if self.scalar_bar_actor:
+                self.scalar_bar_actor.SetVisibility(0)
 
         if not sl_list:
             self.render_window.Render()
             return
             
-        # 3. Create Actor
-        self.streamlines_actor = actor.line(
-            sl_list, 
-            colors=params.get('colors'),
-            opacity=params.get('opacity', 0.5),
-            linewidth=params.get('linewidth', 2),
-            lod=False
-        )
+        # Geometry Logic 
+        use_tubes = getattr(self.main_window, 'render_as_tubes', False)
         
+        # Define visual properties
+        colors = params.get('colors')
+        opacity = params.get('opacity', 0.5)
+        
+        try:
+            if use_tubes:
+                # Tube Rendering
+                tube_radius = 0.15 
+                
+                self.streamlines_actor = actor.streamtube(
+                    sl_list, 
+                    colors=colors,
+                    opacity=opacity,
+                    linewidth=tube_radius, 
+                    lod=False
+                )
+            else:
+                # Line Rendering (Standard)
+                line_width = params.get('linewidth', 2) # Screen pixels
+                
+                self.streamlines_actor = actor.line(
+                    sl_list, 
+                    colors=colors,
+                    opacity=opacity,
+                    linewidth=line_width,
+                    lod=False
+                )
+        except Exception as e:
+            logger.error(f"Error creating streamline actor (Tubes={use_tubes}): {e}")
+            self.update_status(f"Error rendering streamlines: {e}")
+            return
+
         self.scene.add(self.streamlines_actor)
         
-        # 4. Apply visibility toggle
+        # Apply visibility toggle
         if not self.main_window.bundle_is_visible:
             self.streamlines_actor.SetVisibility(0)
             
         self.update_highlight()
         self.render_window.Render()
 
-    # --- Interaction Callbacks ---
+
+    # Interaction Callbacks 
     def _handle_save_shortcut(self) -> None:
         """Handles the Ctrl+S save shortcut logic (saves streamlines)."""
         if not self.main_window: 
@@ -1676,7 +1947,8 @@ class VTKPanel:
         try: self.main_window._trigger_save_streamlines()
         except AttributeError: self.update_status("Error: Save function not found.")
         except Exception as e: self.update_status(f"Error during save: {e}")
-
+        
+        
     def _handle_radius_change(self, increase: bool = True) -> None:
         """Handles increasing or decreasing the selection radius via main window."""
         if not self.main_window: 
@@ -1687,57 +1959,82 @@ class VTKPanel:
         if increase: self.main_window._increase_radius()
         else: self.main_window._decrease_radius()
 
+
     def _find_streamlines_in_radius(self, center_point: np.ndarray, radius: float) -> Set[int]:
         """
-        Selection only searches the rendered (strided) streamlines.
-        This makes selection instant.
+        Uses vectorized bounding box checks (Broad Phase) followed by precise 
+        geometric checks (Narrow Phase) to find streamlines within a sphere.
+        Searches ALL streamlines, not just the rendered subset.
         """
-        if not self.main_window or not self.main_window.tractogram_data: 
+        if (not self.main_window or 
+            not self.main_window.tractogram_data or 
+            self.main_window.streamline_bboxes is None): 
             return set()
             
         tractogram = self.main_window.tractogram_data
+        bboxes = self.main_window.streamline_bboxes
         
-        # 1. Search only the Subset
-        visible_indices = sorted(list(self.main_window.visible_indices))
-        stride = self.main_window.render_stride
-        indices_to_search = visible_indices[::stride]
-        
-        indices_in_radius: Set[int] = set()
-        radius_sq = radius * radius
+        # Vectorized Bounding Box Intersection
         sphere_min = center_point - radius
         sphere_max = center_point + radius
         
-        for idx in indices_to_search:
+        # Vectorized AABB check: 
+        # Streamline is taken if:
+        # (Streamline_Max >= Sphere_Min) AND (Streamline_Min <= Sphere_Max) on ALL axes.
+        # bboxes shape is (N, 2, 3) -> [:, 0, :] is Min, [:, 1, :] is Max
+        
+        overlap_mask = np.all(bboxes[:, 1] >= sphere_min, axis=1) & \
+                       np.all(bboxes[:, 0] <= sphere_max, axis=1)
+        
+        # Get indices of potentially intersecting streamlines
+        candidate_indices = np.where(overlap_mask)[0]
+        
+        # Filter candidates based on current visibility logic (e.g. removed fibers)
+        # Note: We ignore 'stride' here to ensure accuracy (select what is there, not just what is drawn)
+        valid_candidates = [idx for idx in candidate_indices if idx in self.main_window.visible_indices]
+        
+        if not valid_candidates:
+            return set()
+
+        # Precise Geometric Distance Check
+        indices_in_radius: Set[int] = set()
+        radius_sq = radius * radius
+        
+        for idx in valid_candidates:
             try:
                 sl = tractogram[idx]
                 if sl is None or sl.size == 0: continue
-                
-                # BBox Check
-                sl_min = np.min(sl, axis=0)
-                sl_max = np.max(sl, axis=0)
-                if np.any(sl_max < sphere_min) or np.any(sl_min > sphere_max): continue
 
-                # Distance Check
+                # Optimization: Simple Euclidean distance check on vertices
                 diff_sq = np.sum((sl - center_point)**2, axis=1)
                 if np.min(diff_sq) < radius_sq:
                     indices_in_radius.add(idx)
                     continue
                 
-                # Segment Check
-                p1 = sl[:-1]; p2 = sl[1:]
+                # Segment Check (this handles cases where points are far but segment passes through sphere)
+                p1 = sl[:-1]
+                p2 = sl[1:]
                 segment_vec = p2 - p1
                 point_vec = center_point - p1
+                
                 seg_len_sq = np.sum(segment_vec**2, axis=1)
-                seg_len_sq[seg_len_sq == 0] = 1.0
+                seg_len_sq[seg_len_sq == 0] = 1.0 # Avoid division by zero
+                
                 t = np.sum(point_vec * segment_vec, axis=1) / seg_len_sq
                 t = np.clip(t, 0, 1)
-                closest = p1 + segment_vec * t[:, np.newaxis]
-                if np.min(np.sum((closest - center_point)**2, axis=1)) < radius_sq:
+                
+                closest_points = p1 + segment_vec * t[:, np.newaxis]
+                min_dist_sq = np.min(np.sum((closest_points - center_point)**2, axis=1))
+                
+                if min_dist_sq < radius_sq:
                     indices_in_radius.add(idx)
                     
-            except: pass
+            except Exception:
+                pass
             
         return indices_in_radius
+    
+    
     def _toggle_selection(self, indices_to_toggle: Set[int]) -> None:
         """Toggles the selection state for given indices and updates status/highlight."""
         if not self.main_window or not hasattr(self.main_window, 'selected_streamline_indices'): 
@@ -1791,7 +2088,7 @@ class VTKPanel:
         else:
              self._toggle_selection(indices_in_radius)
         
-        # --- Hide selection sphere after selection is applied ---
+        # Hide selection sphere after selection is applied
         self.update_radius_actor(visible=False)
 
     def key_press_callback(self, obj: vtk.vtkObject, event_id: str) -> None:
@@ -1809,7 +2106,7 @@ class VTKPanel:
 
         handler_key = (key, ctrl, shift)
 
-        # --- Handle non-data-dependent keys first ---
+        # Handle non-data-dependent keys first 
         non_data_handlers = {
             ('z', True, False): self.main_window._perform_undo,
             ('y', True, False): self.main_window._perform_redo,
@@ -1821,7 +2118,7 @@ class VTKPanel:
             non_data_handlers[handler_key]()
             return
 
-        # --- Handle Slice Navigation Keys (require anatomical image) ---
+        # Handle Slice Navigation Keys
         anatomical_loaded = self.main_window.anatomical_image_data is not None
         if anatomical_loaded:
             slice_nav_handlers = {
@@ -1838,7 +2135,7 @@ class VTKPanel:
                 self.move_slice(axis, direction)
                 return 
 
-        # --- Handle Streamline-dependent keys ---
+        # Handle Streamline-dependent keys 
         streamline_data_handlers = {
             's': self._handle_streamline_selection,
             'plus': lambda: self._handle_radius_change(increase=True),
@@ -1858,14 +2155,14 @@ class VTKPanel:
         if key in streamline_data_handlers and not ctrl and not shift:
              streamline_data_handlers[key]()
              
-    # --- ROI Layer Actor Management ---
+    # ROI Layer Actor Management 
     def add_roi_layer(self, key: str, data: np.ndarray, affine: np.ndarray) -> None:
         """Creates and adds slicer actors for a new ROI layer (separating 2D/3D actors)."""
         if not self.scene or not self.main_window or self.main_window.anatomical_image_affine is None:
             logger.error("Cannot add ROI layer: Main scene or image not initialized.")
             return
 
-        # 1. Determine value range
+        # Determine value range
         data_min = np.min(data)
         data_max = np.max(data)
         value_range = (data_min, data_max)
@@ -1875,16 +2172,20 @@ class VTKPanel:
         elif data_min == 0 and data_max > 0:
             value_range = (0.1, data_max) 
         
-        slicer_opacity = 0.5 
+        # Get opacity from MainWindow state 
+        slicer_opacity = 0.5  # Default
+        if hasattr(self.main_window, 'roi_opacities') and key in self.main_window.roi_opacities:
+            slicer_opacity = self.main_window.roi_opacities[key]
+
         interpolation_mode = 'nearest'
 
-        # 2. Get current slice indices
+        # Get current slice indices
         c_idx = self.current_slice_indices
         if c_idx['x'] is None:
             self.update_status("Error: Slices not initialized.")
             return
 
-        # 3. Calculate initial ROI slice indices
+        # Calculate initial ROI slice indices
         main_img_affine = self.main_window.anatomical_image_affine
         roi_info = self.main_window.roi_layers.get(key)
         if not roi_info or 'inv_affine' not in roi_info:
@@ -1910,7 +2211,7 @@ class VTKPanel:
                 'interpolation': interpolation_mode
             }
             
-            # --- Create TWO sets of actors ---
+            # Create TWO sets of actors 
             # Set 1: For the main 3D Scene (No artificial flipping)
             ax_3d = actor.slicer(data, **slicer_params)
             cor_3d = actor.slicer(data, **slicer_params)
@@ -1943,16 +2244,16 @@ class VTKPanel:
                 'axial_2d': ax_2d, 'coronal_2d': cor_2d, 'sagittal_2d': sag_2d
             }
             
-            # 6. Add to respective scenes
+            # Add to respective scenes
             self.scene.add(ax_3d); self.scene.add(cor_3d); self.scene.add(sag_3d)
             self.axial_scene.add(ax_2d)
             self.coronal_scene.add(cor_2d)
             self.sagittal_scene.add(sag_2d)
             
-            # --- Apply transformation ONLY to 2D actors ---
+            # Apply transformation ONLY to 2D actors 
             self._apply_display_correction(key)
             
-            # ---Set default color to Dark Grey (0.25, 0.25, 0.25) --
+            # Set default color to Dark Grey (0.25, 0.25, 0.25) 
             self.set_roi_layer_color(key, (1.0, 0.0, 0.0))
             
             self.update_status(f"Added ROI layer: {os.path.basename(key)}")
@@ -2068,7 +2369,6 @@ class VTKPanel:
         if self.main_window.original_trk_path: base_name = os.path.splitext(os.path.basename(self.main_window.original_trk_path))[0]
         elif self.main_window.anatomical_image_path: base_name = os.path.splitext(os.path.basename(self.main_window.anatomical_image_path))[0]
         
-        # Add slice info to filename if slices are visible
         slice_info = ""
         if self.axial_slice_actor and self.axial_slice_actor.GetVisibility() and self.current_slice_indices['z'] is not None:
             slice_info = f"_x{self.current_slice_indices['x']}_y{self.current_slice_indices['y']}_z{self.current_slice_indices['z']}"

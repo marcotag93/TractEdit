@@ -27,6 +27,7 @@ from PyQt6.QtGui import QAction, QKeySequence, QActionGroup, QIcon, QCloseEvent,
 from PyQt6.QtCore import Qt, pyqtSlot
 
 from . import file_io 
+from . import odf_utils 
 from .utils import (
     ColorMode, get_formatted_datetime, get_asset_path, format_tuple,
     MAX_STACK_LEVELS, DEFAULT_SELECTION_RADIUS, MIN_SELECTION_RADIUS,
@@ -38,10 +39,10 @@ from nibabel.orientations import ornt_transform, apply_orientation, io_orientati
 
 logger = logging.getLogger(__name__)
 
-# --- Constant for slider precision ---
+# Constant for slider precision 
 SLIDER_PRECISION = 1000 # Use 1000 steps for the slider
 
-# --- Main GUI class ---
+# Main GUI class
 class MainWindow(QMainWindow):
     """
     Main application window for TractEdit.
@@ -51,8 +52,9 @@ class MainWindow(QMainWindow):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
 
-        # --- Initialize Streamline Data Variables ---
+        # Initialize Streamline Data Variables
         self.tractogram_data: Optional['nib.streamlines.ArraySequence'] = None
+        self.streamline_bboxes: Optional[np.ndarray] = None 
         self.visible_indices: Set[int] = set()
         self.original_trk_header: Optional[Dict[str, Any]] = None # Header dict from loaded file
         self.original_trk_affine: Optional[np.ndarray] = None # Affine matrix (affine_to_rasmm)
@@ -63,8 +65,11 @@ class MainWindow(QMainWindow):
         self.selected_streamline_indices: Set[int] = set() # Indices of selected streamlines
         self.selection_radius_3d: float = DEFAULT_SELECTION_RADIUS # Radius for sphere selection
         self.render_stride: int = 1  # 1 = Show all, 100 = Show 1%
+        self.bundle_opacity: float = 1.0  # Default to 1.0
+        self.image_opacity: float = 1.0
+        self.roi_opacities: Dict[str, float] = {}
 
-        # --- Initialize Anatomical Image Data Variables ---
+        # Initialize Anatomical Image Data Variables
         self.anatomical_image_path: Optional[str] = None
         self.anatomical_image_data: Optional[np.ndarray] = None # Numpy array
         self.anatomical_image_affine: Optional[np.ndarray] = None # 4x4 numpy array
@@ -77,9 +82,10 @@ class MainWindow(QMainWindow):
         self.current_color_mode: ColorMode = ColorMode.DEFAULT
         self.bundle_is_visible: bool = True         
         self.image_is_visible: bool = True       
-        self.roi_visibility: Dict[str, bool] = {}      
+        self.roi_visibility: Dict[str, bool] = {} 
+        self.render_as_tubes: bool = False  # False = Lines, True = Tubes     
 
-        # --- Scalar Range Variables ---
+        # Scalar Range Variables 
         self.scalar_min_val: float = 0.0            # Current min value for the colormap
         self.scalar_max_val: float = 1.0            # Current max value for the colormap
         self.scalar_data_min: float = 0.0           # Actual min value in the loaded data
@@ -90,21 +96,28 @@ class MainWindow(QMainWindow):
         self.scalar_max_spinbox: Optional[QDoubleSpinBox] = None
         self.scalar_min_slider: Optional[QSlider] = None
         self.scalar_max_slider: Optional[QSlider] = None
+        
+        # ODF / Glyphs Data 
+        self.odf_data: Optional[np.ndarray] = None
+        self.odf_affine: Optional[np.ndarray] = None
+        self.odf_sh_order: int = 0
+        self.odf_sphere = None
+        self.odf_basis_matrix = None
+        self.MAX_ODF_STREAMLINES = 26000 # Safety limit for Tunnel View
 
-        # --- Data Panel / Dock Widget --- 
+        # Data Panel / Dock Widget 
         self.data_dock_widget: Optional[QDockWidget] = None
         self.data_tree_widget: Optional[QTreeWidget] = None
         
-        # --- ROI Layer Data Variables ---
+        # ROI Layer Data Variables
         self.roi_layers: Dict[str, Dict[str, Any]] = {} # Key: path, Val: {'data':, 'affine':, 'inv_affine':}
         
-        # --- Status Bar Widgets ---
+        # Status Bar Widgets 
         self.permanent_status_widget: Optional[QWidget] = None
         self.data_info_label: Optional[QLabel] = None
         self.ras_coordinate_label: Optional[QLabel] = None
         
-        # --- ROI Logic State ---
-        # Stores which ROIs are active for which operation
+        # ROI Logic State
         self.roi_states: Dict[str, Dict[str, bool]] = {} 
         self.roi_intersection_cache: Dict[str, Set[int]] = {}
         self.roi_highlight_indices: Set[int] = set()
@@ -116,11 +129,11 @@ class MainWindow(QMainWindow):
         # Set of indices specifically highlighted in RED (ROI Selection)
         self.roi_highlight_indices: Set[int] = set()
 
-        # --- Window Properties ---
+        # Window Properties 
         self.setWindowTitle("TractEdit GUI (PyQt6) - Interactive trk/tck/trx Editor")
         self.setGeometry(100, 100, 1100, 850)
 
-        # --- Setup UI Components ---
+        # Setup UI Components   
         self._create_actions()
         self._create_menus()
         self._create_main_toolbar() 
@@ -129,7 +142,7 @@ class MainWindow(QMainWindow):
         self._setup_status_bar()
         self._setup_central_widget() # This creates the VTKPanel
 
-        # --- Initial Status Update ---
+        # Initial Status Update
         self._update_initial_status()
         self._update_action_states()
         self._update_bundle_info_display()
@@ -137,71 +150,114 @@ class MainWindow(QMainWindow):
     def _create_actions(self) -> None:
         """Creates QAction objects used in menus and potentially toolbars."""
 
-        # --- File Actions ---
+        # File Actions 
         self.load_file_action: QAction = QAction("&Load trk/tck/trx...", self)
         self.load_file_action.setStatusTip("Load a trk, tck or trx streamline file")
         self.load_file_action.triggered.connect(self._trigger_load_streamlines)
 
-        # --- Load Anatomical Image Action ---
+        # Load Anatomical Image Action 
         self.load_bg_image_action: QAction = QAction("Load &Image...", self)
         self.load_bg_image_action.setStatusTip("Load a NIfTI image (.nii, .nii.gz) as background")
         self.load_bg_image_action.triggered.connect(self._trigger_load_anatomical_image)
         self.load_bg_image_action.setEnabled(False) 
+        
+        # ODF Actions
+        self.load_odf_action: QAction = QAction("Load &ODF (SH)...", self)
+        self.load_odf_action.setStatusTip("Load a NIfTI file containing Spherical Harmonics coefficients")
+        self.load_odf_action.triggered.connect(self._trigger_load_odf)
+        self.view_odf_tunnel_action: QAction = QAction("Show ODF &Tunnel", self)
+        self.view_odf_tunnel_action.setStatusTip(f"Show ODF glyphs masked by current bundle (< {self.MAX_ODF_STREAMLINES} fibers)")
+        self.view_odf_tunnel_action.setCheckable(True)
+        self.view_odf_tunnel_action.triggered.connect(self._toggle_odf_tunnel)
+        self.view_odf_tunnel_action.setEnabled(False)
 
+        # Close Bundle Action
         self.close_bundle_action: QAction = QAction("&Close Bundle", self)
         self.close_bundle_action.setStatusTip("Close the current streamline bundle") # Updated tip
         self.close_bundle_action.triggered.connect(self._close_bundle)
         self.close_bundle_action.setEnabled(False)
 
-        # --- Clear Anatomical Image Action ---
+        # Clear Anatomical Image Action
         self.clear_bg_image_action: QAction = QAction("Clear Anatomical Image", self)
         self.clear_bg_image_action.setStatusTip("Remove the background anatomical image")
         self.clear_bg_image_action.triggered.connect(self._trigger_clear_anatomical_image)
         self.clear_bg_image_action.setEnabled(False) # Enabled only when image loaded
         
-        # ... after self.clear_bg_image_action
+        # Load ROI Action 
         self.load_roi_action: QAction = QAction("Load &ROI...", self)
         self.load_roi_action.setStatusTip("Load a NIfTI image (.nii, .nii.gz) as an ROI overlay")
         self.load_roi_action.triggered.connect(self._trigger_load_roi)
         self.load_roi_action.setEnabled(False) # Will be enabled when a main image is loaded
 
+        # Clear All ROIs Action
         self.clear_all_rois_action: QAction = QAction("Clear All ROIs", self)
         self.clear_all_rois_action.setStatusTip("Remove all loaded ROI overlays")
         self.clear_all_rois_action.triggered.connect(self._trigger_clear_all_rois)
         self.clear_all_rois_action.setEnabled(False) # Will be enabled when ROIs are loaded
         
+        # Clear All Data Action
         self.clear_all_data_action: QAction = QAction("Clear &All", self)
         self.clear_all_data_action.setStatusTip("Clear all loaded data (Streamlines, Image, ROIs)")
         self.clear_all_data_action.triggered.connect(self._trigger_clear_all_data)
         self.clear_all_data_action.setEnabled(False)
 
+        # Save Streamlines Action
         self.save_file_action: QAction = QAction("&Save As...", self)
         self.save_file_action.setStatusTip("Save the modified streamlines to a trk, tck or trx file")
         self.save_file_action.triggered.connect(self._trigger_save_streamlines)
         self.save_file_action.setEnabled(False)
 
+        # Screenshot Action
         self.screenshot_action: QAction = QAction("Save &Screenshot", self)
         self.screenshot_action.setStatusTip("Save a screenshot of the current view (bundle and image)")
         self.screenshot_action.setShortcut("Ctrl+P")
         self.screenshot_action.triggered.connect(self._trigger_screenshot)
         self.screenshot_action.setEnabled(False)
         
+        # Calculate Centroid Action
         self.calc_centroid_action: QAction = QAction("Calculate &Centroid", self)
         self.calc_centroid_action.setStatusTip("Calculate and save the centroid (mean) of the current bundle")
         self.calc_centroid_action.triggered.connect(self._trigger_calculate_centroid)
         self.calc_centroid_action.setEnabled(False)
 
+        # Calculate Medoid Action
         self.calc_medoid_action: QAction = QAction("Calculate &Medoid", self)
         self.calc_medoid_action.setStatusTip("Calculate and save the medoid (geometric median) of the current bundle")
         self.calc_medoid_action.triggered.connect(self._trigger_calculate_medoid)
         self.calc_medoid_action.setEnabled(False)
 
+        # Exit Action
         self.exit_action: QAction = QAction("&Exit", self)
         self.exit_action.setStatusTip("Exit the application")
         self.exit_action.setShortcut(QKeySequence("Ctrl+Q"))
         self.exit_action.triggered.connect(self.close)
+        
+        # Save Density Map Action
+        self.save_density_map_action: QAction = QAction("Save &Density Map...", self)
+        self.save_density_map_action.setStatusTip("Generate and save a density map (TDI) of the current visible bundle")
+        self.save_density_map_action.triggered.connect(self._trigger_save_density_map)
+        self.save_density_map_action.setEnabled(False)
+        
+        # Geometry Lines/Tubes
+        self.geometry_action_group: QActionGroup = QActionGroup(self)
+        self.geometry_action_group.setExclusive(True)
 
-        # --- Edit Actions ---
+        self.geo_lines_action: QAction = QAction("Render as &Lines", self)
+        self.geo_lines_action.setStatusTip("Render streamlines as simple lines (Faster)")
+        self.geo_lines_action.setCheckable(True)
+        self.geo_lines_action.setChecked(True)
+        self.geo_lines_action.triggered.connect(lambda: self._set_geometry_mode(as_tubes=False))
+        self.geometry_action_group.addAction(self.geo_lines_action)
+        self.geo_lines_action.setEnabled(False) # Enabled when data loads
+
+        self.geo_tubes_action: QAction = QAction("Render as &Tubes", self)
+        self.geo_tubes_action.setStatusTip("Render streamlines as 3D tubes (Slower, High Quality)")
+        self.geo_tubes_action.setCheckable(True)
+        self.geo_tubes_action.triggered.connect(lambda: self._set_geometry_mode(as_tubes=True))
+        self.geometry_action_group.addAction(self.geo_tubes_action)
+        self.geo_tubes_action.setEnabled(False) # Enabled when data loads
+
+        # Edit Actions 
         self.undo_action: QAction = QAction("&Undo", self)
         self.undo_action.setStatusTip("Undo the last deletion")
         self.undo_action.setShortcut(QKeySequence.StandardKey.Undo) # Ctrl+Z
@@ -214,7 +270,7 @@ class MainWindow(QMainWindow):
         self.redo_action.triggered.connect(self._perform_redo)
         self.redo_action.setEnabled(False)
 
-        # --- View Actions (Coloring) ---
+        # View Actions (Coloring)
         self.coloring_action_group: QActionGroup = QActionGroup(self)
         self.coloring_action_group.setExclusive(True)
 
@@ -241,24 +297,27 @@ class MainWindow(QMainWindow):
         self.coloring_action_group.addAction(self.color_scalar_action)
         self.color_scalar_action.setEnabled(False)
 
-        # --- Command Actions ---
+        # Command Actions
         self.clear_select_action: QAction = QAction("&Clear Selection", self)
         self.clear_select_action.setStatusTip("Clear the current streamline selection (C)")
         self.clear_select_action.setShortcut("C")
         self.clear_select_action.triggered.connect(self._perform_clear_selection)
         self.clear_select_action.setEnabled(False)
 
+        # Delete Selection Action
         self.delete_select_action: QAction = QAction("&Delete Selection", self)
         self.delete_select_action.setStatusTip("Delete the selected streamlines (D)")
         self.delete_select_action.setShortcut("D")
         self.delete_select_action.triggered.connect(self._perform_delete_selection)
         self.delete_select_action.setEnabled(False)
         
+        # Reset Camera Action
         self.reset_camera_action: QAction = QAction("&Reset Camera", self)
         self.reset_camera_action.setStatusTip("Reset the 3D camera view")
         self.reset_camera_action.triggered.connect(self._perform_reset_camera)
         self.reset_camera_action.setEnabled(True)
 
+        # Increase/Decrease Radius Actions
         self.increase_radius_action: QAction = QAction("&Increase Radius", self)
         self.increase_radius_action.setStatusTip(f"Increase the selection sphere radius (+{RADIUS_INCREMENT}mm)")
         self.increase_radius_action.setShortcut("+")
@@ -277,7 +336,7 @@ class MainWindow(QMainWindow):
         self.hide_sphere_action.triggered.connect(self._hide_sphere)
         self.hide_sphere_action.setEnabled(True)
 
-        # --- Help Menu ---
+        # Help Menu
         self.about_action: QAction = QAction("&About TractEdit...", self)
         self.about_action.setStatusTip("Show information about TractEdit")
         self.about_action.triggered.connect(self._show_about_dialog)
@@ -286,39 +345,52 @@ class MainWindow(QMainWindow):
         """Creates the main menu bar and populates it with actions."""
         main_bar: QMenuBar = self.menuBar()
 
-        # --- File Menu --- 
+        # File Menu 
         file_menu = main_bar.addMenu("&File")
         file_menu.addAction(self.load_file_action)      # Load streamlines
         file_menu.addAction(self.load_bg_image_action)  # Load image
-        file_menu.addAction(self.load_roi_action)
+        file_menu.addAction(self.load_roi_action)       # Load ROI
+        file_menu.addAction(self.load_odf_action)       # Load ODF
+        
         file_menu.addSeparator()
         file_menu.addAction(self.calc_centroid_action)
         file_menu.addAction(self.calc_medoid_action)
         file_menu.addSeparator()
-        file_menu.addAction(self.close_bundle_action)   # Close streamlines (also clears image)
+        file_menu.addAction(self.close_bundle_action)   # Close streamlines
         file_menu.addAction(self.clear_bg_image_action) # Clear image 
         file_menu.addAction(self.clear_all_rois_action)
         file_menu.addAction(self.clear_all_data_action) 
         file_menu.addSeparator()
-        file_menu.addAction(self.save_file_action)      # Save streamlines
-        file_menu.addSeparator()
+        file_menu.addAction(self.save_file_action)        # Save streamlines
+        file_menu.addAction(self.save_density_map_action) # Save density map
         file_menu.addAction(self.screenshot_action)
         file_menu.addSeparator()
         file_menu.addAction(self.exit_action)
 
-        # --- Edit Menu ---
+        # Edit Menu
         edit_menu = main_bar.addMenu("&Edit")
         edit_menu.addAction(self.undo_action)
         edit_menu.addAction(self.redo_action)
 
-        # --- View Menu ---
+        # View Menu
         view_menu = main_bar.addMenu("&View")
+        
+        # Color Sub-menu
         color_menu = view_menu.addMenu("Streamline Color")
         color_menu.addAction(self.color_default_action)
         color_menu.addAction(self.color_orientation_action)
         color_menu.addAction(self.color_scalar_action)
+        
+        # Geometry Sub-menu
+        geo_menu = view_menu.addMenu("Streamline &Geometry")
+        geo_menu.addAction(self.geo_lines_action)
+        geo_menu.addAction(self.geo_tubes_action)
 
-        # --- Add Dock Panel Toggle ---
+        # ODF Tunnel View 
+        view_menu.addSeparator()
+        view_menu.addAction(self.view_odf_tunnel_action)
+
+        # Dock Panel Toggle
         if self.data_dock_widget:
             self.toggle_data_panel_action = self.data_dock_widget.toggleViewAction()
             self.toggle_data_panel_action.setText("Data Panel")
@@ -326,7 +398,7 @@ class MainWindow(QMainWindow):
             view_menu.addSeparator()
             view_menu.addAction(self.toggle_data_panel_action)
 
-        # --- Commands Menu ---
+        # Commands Menu
         commands_menu = main_bar.addMenu("&Commands")
         commands_menu.addAction(self.reset_camera_action) 
         commands_menu.addAction(self.screenshot_action)   
@@ -339,20 +411,56 @@ class MainWindow(QMainWindow):
         commands_menu.addSeparator()
         commands_menu.addAction(self.hide_sphere_action)
 
-        # --- Help Menu ---
+        # Help Menu
         help_menu = main_bar.addMenu("&Help")
         help_menu.addAction(self.about_action)
         
-    # --- Main Toolbar for Skip ---
+        # Shortcuts Submenu List 
+        shortcuts_menu = help_menu.addMenu("Keyboard &Shortcuts")
+        
+        # Helper to add static text items
+        def add_shortcut_item(text):
+            act = QAction(text, self)
+            act.setEnabled(False) # Disabled so it acts as a static label
+            shortcuts_menu.addAction(act)
+
+        # Selection Group
+        shortcuts_menu.addSection("Selection Tools")
+        add_shortcut_item("s  :  Select/Deselect at cursor")
+        add_shortcut_item("d  :  Delete selection")
+        add_shortcut_item("c  :  Clear selection")
+        add_shortcut_item("+ / =  :  Increase sphere radius")
+        add_shortcut_item("-  :  Decrease sphereradius")
+
+        # Navigation Group
+        shortcuts_menu.addSection("Slice Navigation")
+        add_shortcut_item("↑ / ↓  :  Axial (Z-axis)")
+        add_shortcut_item("← / →  :  Sagittal (X-axis)")
+        add_shortcut_item("Ctrl + ↑ / ↓  :  Coronal (Y-axis)")
+
+        # General Group
+        shortcuts_menu.addSection("General")
+        add_shortcut_item("Ctrl + S  :  Save As")
+        add_shortcut_item("Ctrl + Z  :  Undo")
+        add_shortcut_item("Ctrl + Y  :  Redo")
+        add_shortcut_item("Ctrl + P  :  Screenshot")
+        add_shortcut_item("Ctrl + Q  :  Quit")
+
+        help_menu.addSeparator()
+        help_menu.addAction(self.about_action)
+        
+        
+    # Main Toolbar for Skip 
     def _create_main_toolbar(self) -> None:
         self.main_toolbar = QToolBar("Main Tools", self)
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self.main_toolbar)
         
-        # --- Skip / Density Control ---
+        # Container for Toolbar Widgets 
         container = QWidget()
         l = QHBoxLayout(container)
         l.setContentsMargins(0, 0, 0, 0)
         
+        # Skip / Density Control
         self.skip_checkbox = QCheckBox()
         self.skip_checkbox.setChecked(False) 
         self.skip_checkbox.toggled.connect(self._on_skip_toggled)
@@ -367,6 +475,27 @@ class MainWindow(QMainWindow):
         self.skip_spinbox.editingFinished.connect(self._on_skip_changed)
         l.addWidget(self.skip_spinbox)
         
+        # Spacer
+        l.addSpacing(20)
+        l.addWidget(QLabel("|"))
+        l.addSpacing(20)
+
+        # Opacity Control
+        self.opacity_label = QLabel("Opacity: ")
+        l.addWidget(self.opacity_label)
+        
+        self.opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.opacity_slider.setRange(0, 100) # 0 to 1.0
+        self.opacity_slider.setValue(100)
+        self.opacity_slider.setFixedWidth(120) # Fixed width for toolbar layout
+        self.opacity_slider.setEnabled(False) # Disabled until selection
+        self.opacity_slider.valueChanged.connect(self._on_opacity_slider_changed)
+        l.addWidget(self.opacity_slider)
+        
+        # Add stretch to push items to the left
+        l.addStretch()
+        
+        # Add container to toolbar
         self.main_toolbar.addWidget(container)
         
     def _on_skip_toggled(self, checked: bool) -> None:
@@ -447,13 +576,13 @@ class MainWindow(QMainWindow):
         if self.vtk_panel:
             self.vtk_panel.update_main_streamlines_actor()
 
-    # --- Scalar Toolbar ---
+    # Scalar Toolbar 
     def _create_scalar_toolbar(self) -> None:
         """Creates the toolbar for scalar range adjustment with sliders."""
         self.scalar_toolbar = QToolBar("Scalar Range", self)
         self.scalar_toolbar.setObjectName("ScalarToolbar") 
 
-        # --- Spinboxes for precise input/display ---
+        # Spinboxes for precise input/display
         self.scalar_min_spinbox = QDoubleSpinBox(self)
         self.scalar_min_spinbox.setDecimals(3)
         self.scalar_min_spinbox.setSingleStep(0.1)
@@ -466,7 +595,7 @@ class MainWindow(QMainWindow):
         self.scalar_max_spinbox.setRange(-1e9, 1e9)
         self.scalar_max_spinbox.setToolTip("Max scalar value")
         
-        # --- Sliders for interactive dragging ---
+        # Sliders for interactive dragging 
         self.scalar_min_slider = QSlider(Qt.Orientation.Horizontal, self)
         self.scalar_min_slider.setRange(0, SLIDER_PRECISION)
         self.scalar_min_slider.setToolTip("Drag to adjust min scalar value")
@@ -476,14 +605,14 @@ class MainWindow(QMainWindow):
         self.scalar_max_slider.setValue(SLIDER_PRECISION)
         self.scalar_max_slider.setToolTip("Drag to adjust max scalar value")
         
-        # --- Reset Button ---
+        # Reset Button 
         self.scalar_reset_button: QAction = QAction("Reset", self)
         self.scalar_reset_button.setStatusTip("Reset scalar range to data min/max")
         
-        # --- Layout ---
+        # Layout 
         toolbar_widget = QWidget(self)
         layout = QHBoxLayout(toolbar_widget)
-        layout.setContentsMargins(5, 0, 5, 0) # Tweak spacing
+        layout.setContentsMargins(5, 0, 5, 0)
         
         layout.addWidget(QLabel(" Min: "))
         layout.addWidget(self.scalar_min_spinbox, 1)
@@ -502,7 +631,7 @@ class MainWindow(QMainWindow):
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self.scalar_toolbar)
         self.scalar_toolbar.setVisible(False) # Hide by default
 
-        # --- Connect Signals ---
+        # Connect Signals 
         # Sliders update spinbox on valueChanged (fast, no VTK)
         self.scalar_min_slider.valueChanged.connect(self._slider_value_changed)
         self.scalar_max_slider.valueChanged.connect(self._slider_value_changed)
@@ -526,60 +655,186 @@ class MainWindow(QMainWindow):
             Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
         )
 
+        # Container Widget
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # Tree Widget
         self.data_tree_widget = QTreeWidget(self)
         self.data_tree_widget.setHeaderLabels(["Loaded Data"])
         self.data_tree_widget.setMinimumWidth(200)
-        
-        # --- Enable Context Menu ---
         self.data_tree_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.data_tree_widget.customContextMenuRequested.connect(self._on_data_panel_context_menu)
-        
-        # --- Connect the itemChanged signal ---
         self.data_tree_widget.itemChanged.connect(self._on_data_panel_item_changed)
+        self.data_tree_widget.itemSelectionChanged.connect(self._on_data_item_selected)        
 
-        self.data_dock_widget.setWidget(self.data_tree_widget)
+        # Highlighting Style Sheet
+        self.data_tree_widget.setStyleSheet("""
+            QTreeWidget {
+                outline: 0; /* Removes the dotted focus line */
+            }
+            QTreeWidget::item {
+                padding: 4px;
+                border-radius: 4px; /* Subtle rounded corners */
+            }
+            
+            /* SELECTION STATES */
+            QTreeWidget::item:selected {
+                background-color: #4a6984; /* Desaturated Steel Blue */
+                color: white;
+                border: none;
+            }
+            QTreeWidget::item:selected:!active {
+                background-color: #5d7e9b; /* Slightly lighter when window loses focus */
+                color: white;
+                border: none;
+            }
+
+            /* HOVER STATES */
+            QTreeWidget::item:hover {
+                /* Ultra-subtle tint. No white/bright flash. */
+                background-color: rgba(0, 0, 0, 0.03); 
+                border: none;
+            }
+            QTreeWidget::item:selected:hover {
+                background-color: #557ba0; /* Slight feedback on the blue selection itself */
+                color: white;
+            }
+        """)
+        
+        layout.addWidget(self.data_tree_widget)        
+        self.data_dock_widget.setWidget(container)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.data_dock_widget)
+        
+    def _on_data_item_selected(self) -> None:
+        """Updates the opacity slider based on the selected item."""
+        items = self.data_tree_widget.selectedItems()
+        if not items:
+            self.opacity_slider.setEnabled(False)
+            return
+            
+        item = items[0]
+        
+        parent = item.parent()
+        if parent and parent.text(0) == "Scalars":
+            scalar_name = item.text(0)
+            
+            if self.tractogram_data and self.scalar_data_per_point and scalar_name in self.scalar_data_per_point:
+                self.active_scalar_name = scalar_name
+                
+                for i in range(parent.childCount()):
+                    child = parent.child(i)
+                    font = child.font(0)
+                    font.setBold(child.text(0) == scalar_name)
+                    child.setFont(0, font)
 
-    # In main_window.py
+                self._update_scalar_data_range()
+                self.scalar_range_initialized = True
+                
+                if self.current_color_mode != ColorMode.SCALAR:
+                    self.color_scalar_action.setChecked(True)
+                    self._set_color_mode(ColorMode.SCALAR)
+                else:
+                    if self.vtk_panel:
+                        self.vtk_panel.update_main_streamlines_actor()
+            
+            self.opacity_slider.setEnabled(False)
+            return
+        
+        item_data = item.data(0, Qt.ItemDataRole.UserRole)
+        
+        if not item_data or not isinstance(item_data, dict):
+            self.opacity_slider.setEnabled(False)
+            return
+            
+        itype = item_data.get('type')
+        val = 1.0
+        
+        self.opacity_slider.blockSignals(True) # Prevent feedback
+        
+        if itype == 'bundle':
+            val = self.bundle_opacity
+            self.opacity_slider.setEnabled(True)
+        elif itype == 'image':
+            val = self.image_opacity
+            self.opacity_slider.setEnabled(True)
+        elif itype == 'roi':
+            path = item_data.get('path')
+            val = self.roi_opacities.get(path, 0.5)
+            self.opacity_slider.setEnabled(True)
+        else:
+            self.opacity_slider.setEnabled(False)
+            
+        self.opacity_slider.setValue(int(val * 100))
+        self.opacity_slider.blockSignals(False)
+        
+    def _on_opacity_slider_changed(self, value: int) -> None:
+        """Updates the opacity of the selected item."""
+        float_val = value / 100.0
+        
+        items = self.data_tree_widget.selectedItems()
+        if not items: return
+        item = items[0]
+        item_data = item.data(0, Qt.ItemDataRole.UserRole)
+        if not item_data: return
+        
+        itype = item_data.get('type')
+        
+        if itype == 'bundle':
+            self.bundle_opacity = float_val
+            if self.vtk_panel:
+                self.vtk_panel.set_streamlines_opacity(float_val)
+                
+        elif itype == 'image':
+            self.image_opacity = float_val
+            if self.vtk_panel:
+                self.vtk_panel.set_anatomical_opacity(float_val)
+                
+        elif itype == 'roi':
+            path = item_data.get('path')
+            if path:
+                self.roi_opacities[path] = float_val
+                if self.vtk_panel:
+                    self.vtk_panel.set_roi_opacity(path, float_val)
 
     def _setup_status_bar(self) -> None:
         """
         Creates and configures the status bar with permanent widgets for
         bundle/image info and interactive RAS coordinate display.
         """
-        # --- Create Container Widget ---
+        # Create Container Widget 
         self.permanent_status_widget = QWidget(self)
         layout = QHBoxLayout(self.permanent_status_widget)
-        layout.setContentsMargins(0, 0, 5, 0) # Add some right margin
+        layout.setContentsMargins(0, 0, 5, 0) 
         layout.setSpacing(10)
 
-        # --- 1. Data Info Label (Existing) ---
+        # Data Info Label
         self.data_info_label = QLabel(" No data loaded ")
         self.data_info_label.setStyleSheet("border: 1px solid grey; padding: 2px;")
         layout.addWidget(self.data_info_label, 1) # Give it stretch factor 1
 
-        # --- 2. RAS Coordinate Display ---
+        # RAS Coordinate Display 
         self.ras_label = QLabel("RAS: ", self)
         self.ras_label.setToolTip(
             "Current RAS coordinates. Enter values (e.g., '10.5, -5, 20') and press Enter."
         )
         layout.addWidget(self.ras_label, 0)
         
-        # --- QLineEdit no longer has "RAS:" prefix ---
         self.ras_coordinate_input = QLineEdit("--, --, --", self) 
         self.ras_coordinate_input.setToolTip(
             "Current RAS coordinates. Enter values (e.g., '10.5, -5, 20') and press Enter."
         ) 
-        self.ras_coordinate_input.setMinimumWidth(150) # Can be a bit smaller now
+        self.ras_coordinate_input.setMinimumWidth(150) 
         self.ras_coordinate_input.setMaximumWidth(180)
         self.ras_coordinate_input.setStyleSheet("border: 1px solid grey; padding: 2px;")
         layout.addWidget(self.ras_coordinate_input, 0) 
         
-        # --- Add Container to Status Bar ---
+        # Add Container to Status Bar 
         self.status_bar: QStatusBar = self.statusBar()
         self.status_bar.addPermanentWidget(self.permanent_status_widget)
 
-        # --- Connect Signal for Manual Entry ---
+        # Connect Signal for Manual Entry 
         self.ras_coordinate_input.returnPressed.connect(self._on_ras_coordinate_entered)
 
     def _setup_central_widget(self) -> None:
@@ -596,6 +851,7 @@ class MainWindow(QMainWindow):
     def _update_action_states(self) -> None:
             """Enables/disables actions based on current application state."""
             has_streamlines = self.tractogram_data is not None
+            has_odf = self.odf_data is not None
             has_selection = bool(self.selected_streamline_indices)
             has_scalars = bool(self.scalar_data_per_point)
             has_image = self.anatomical_image_data is not None
@@ -603,6 +859,7 @@ class MainWindow(QMainWindow):
 
             # File Menu
             self.load_bg_image_action.setEnabled(has_streamlines)
+            self.view_odf_tunnel_action.setEnabled(has_odf and has_streamlines)
             self.load_roi_action.setEnabled(has_image)
             self.close_bundle_action.setEnabled(has_streamlines)
             self.clear_bg_image_action.setEnabled(has_image)
@@ -611,6 +868,7 @@ class MainWindow(QMainWindow):
             self.calc_centroid_action.setEnabled(has_streamlines)
             self.calc_medoid_action.setEnabled(has_streamlines)
             self.save_file_action.setEnabled(has_streamlines)
+            self.save_density_map_action.setEnabled(has_streamlines)
             self.screenshot_action.setEnabled(has_any_data)
 
             # Edit Menu
@@ -628,6 +886,10 @@ class MainWindow(QMainWindow):
             self.increase_radius_action.setEnabled(has_streamlines)
             self.decrease_radius_action.setEnabled(has_streamlines)
             
+            # Geometry Menu
+            self.geo_lines_action.setEnabled(has_streamlines)
+            self.geo_tubes_action.setEnabled(has_streamlines)
+            
     def _trigger_calculate_centroid(self) -> None:
         """Wrapper to calculate and save centroid."""
         file_io.calculate_and_save_statistic(self, 'centroid')
@@ -635,7 +897,169 @@ class MainWindow(QMainWindow):
     def _trigger_calculate_medoid(self) -> None:
         """Wrapper to calculate and save medoid."""
         file_io.calculate_and_save_statistic(self, 'medoid')
+        
+    def _set_geometry_mode(self, as_tubes: bool) -> None:
+        """Switches between Line and Tube rendering."""
+        if self.render_as_tubes == as_tubes:
+            return
+            
+        self.render_as_tubes = as_tubes
+        
+        if self.vtk_panel:
+            self.vtk_panel.update_status(f"Rendering geometry set to: {'Tubes' if as_tubes else 'Lines'}")
+            self.vtk_panel.update_main_streamlines_actor()
+            
+    def _trigger_load_odf(self) -> None:
+        """Loads a NIfTI file as ODF coefficients."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Load ODF (SH Coefficients)", "", "NIfTI Files (*.nii *.nii.gz)"
+        )
+        if not file_path:
+            return
 
+        try:
+            self.vtk_panel.update_status("Loading ODF data...")
+            QApplication.processEvents()
+            
+            img = nib.load(file_path)
+            data = img.get_fdata()
+            affine = img.affine
+            
+            # Validate Shape
+            if data.ndim != 4:
+                QMessageBox.warning(self, "ODF Error", "File must be a 4D volume (SH coefficients).")
+                return
+                
+            n_coeffs = data.shape[-1]
+            try:
+                sh_order = odf_utils.calculate_sh_order(n_coeffs)
+            except ValueError as e:
+                QMessageBox.warning(self, "ODF Error", str(e))
+                return
+                
+            self.odf_data = data
+            self.odf_affine = affine
+            self.odf_sh_order = sh_order
+            
+            # Pre-compute Sphere and Basis (Tournier07)
+            self.odf_sphere = odf_utils.generate_symmetric_sphere(radius=1.0, subdivisions=3)
+            self.vtk_panel.update_status("Computing SH Basis...")
+            QApplication.processEvents()
+            
+            self.odf_basis_matrix = odf_utils.compute_sh_basis(
+                self.odf_sphere.vertices, sh_order, basis_type='tournier07'
+            )
+            
+            self.vtk_panel.update_status(f"ODF Loaded (Order {sh_order}). Ready for Tunnel View.")
+            self._update_action_states()
+            
+        except Exception as e:
+            logger.error(f"Error loading ODF: {e}", exc_info=True)
+            QMessageBox.critical(self, "Load Error", f"Could not load ODF file:\n{e}")
+            
+            
+    def _toggle_odf_tunnel(self, checked: bool) -> None:
+        """Computes the mask and updates the VTK actor with progress indication."""
+        if not checked:
+            if self.vtk_panel:
+                self.vtk_panel.remove_odf_actor()
+            return
+
+        if self.odf_data is None or self.tractogram_data is None:
+            return
+
+        # Apply Stride (Skip) to match visual representation 
+        sorted_indices = sorted(list(self.visible_indices))
+        
+        # Apply the current render stride
+        stride = self.render_stride
+        strided_indices = sorted_indices[::stride]
+        
+        # Retrieve only the subset of streamlines
+        current_streamlines = [self.tractogram_data[i] for i in strided_indices]
+        
+        # Check Limit against the STRIDED count
+        if len(current_streamlines) > self.MAX_ODF_STREAMLINES:
+            QMessageBox.warning(self, "Performance Warning", 
+                                f"Too many streamlines selected ({len(current_streamlines)}).\n"
+                                f"Limit is {self.MAX_ODF_STREAMLINES}. \n\n"
+                                f"Tip: Increase the 'Skip %' or use ROIs to reduce the count.")
+            self.view_odf_tunnel_action.setChecked(False)
+            return
+
+        self.vtk_panel.update_status("Computing Tunnel View...")
+        
+        # Initialize Progress Bar (4 steps total)
+        # 1. Mask Creation, 2. Mask Application, 3. SH Projection, 4. Rendering
+        TOTAL_STEPS = 4
+        self.vtk_panel.update_progress_bar(0, TOTAL_STEPS, visible=True)
+        QApplication.processEvents()
+
+        try:
+            # Create Mask (Heavy operation)
+            mask = odf_utils.create_tunnel_mask(
+                current_streamlines, 
+                self.odf_affine, 
+                self.odf_data.shape, 
+                dilation_iter=1
+            )
+            
+            # Update Progress -> 25%
+            self.vtk_panel.update_progress_bar(1, TOTAL_STEPS, visible=True)
+            QApplication.processEvents()
+            
+            # Apply Mask to ODF Data
+            masked_coeffs = self.odf_data * mask[..., np.newaxis]
+            
+            # Update Progress -> 50%
+            self.vtk_panel.update_progress_bar(2, TOTAL_STEPS, visible=True)
+            QApplication.processEvents()
+            
+            # Project to Amplitudes (SF)
+            amplitudes_shape = self.odf_data.shape[:3] + (self.odf_sphere.vertices.shape[0],)
+            odf_amplitudes = np.zeros(amplitudes_shape, dtype=np.float32)
+            
+            # Flatten mask to find indices
+            mask_indices = np.where(mask)
+            
+            extent = None
+            
+            if len(mask_indices[0]) > 0:
+                valid_coeffs = masked_coeffs[mask_indices]
+                valid_amps = np.dot(valid_coeffs, self.odf_basis_matrix.T)
+                odf_amplitudes[mask_indices] = valid_amps
+                
+                # Determine min/max for x, y, z to constrain the actor
+                min_x, max_x = np.min(mask_indices[0]), np.max(mask_indices[0])
+                min_y, max_y = np.min(mask_indices[1]), np.max(mask_indices[1])
+                min_z, max_z = np.min(mask_indices[2]), np.max(mask_indices[2])
+                
+                extent = (min_x, max_x, min_y, max_y, min_z, max_z)
+            
+            # Update Progress -> 75%
+            self.vtk_panel.update_progress_bar(3, TOTAL_STEPS, visible=True)
+            QApplication.processEvents()
+
+            # Update VTK with Extent
+            self.vtk_panel.update_odf_actor(
+                odf_amplitudes, 
+                self.odf_sphere, 
+                self.odf_affine,
+                extent=extent 
+            )
+            
+            # Update Progress -> 100% and Hide
+            self.vtk_panel.update_progress_bar(TOTAL_STEPS, TOTAL_STEPS, visible=True)
+            QApplication.processEvents()
+            
+        except Exception as e:
+            logger.error(f"Error computing Tunnel View: {e}", exc_info=True)
+            self.vtk_panel.update_status("Error generating Tunnel View.")
+            self.view_odf_tunnel_action.setChecked(False)
+        finally:
+            self.vtk_panel.update_progress_bar(0, 0, visible=False)
+            
+            
     def _update_bundle_info_display(self) -> None:
         """Updates the data information QLabel in the status bar for both streamlines and image."""
         if not self.data_info_label: # Check if label exists
@@ -691,6 +1115,7 @@ class MainWindow(QMainWindow):
         self.data_info_label.setText(final_text)
         self._update_data_panel_display()
 
+
     def _update_data_panel_display(self) -> None:
         """
         Updates the QTreeWidget in the data panel dock.
@@ -700,7 +1125,7 @@ class MainWindow(QMainWindow):
 
         self.data_tree_widget.clear()
         
-        # --- 1. Streamlines ---
+        # Streamlines
         if self.tractogram_data is not None:
             bundle_name = (os.path.basename(self.original_trk_path) 
                            if self.original_trk_path else "Loaded Bundle")
@@ -735,7 +1160,7 @@ class MainWindow(QMainWindow):
             item = QTreeWidgetItem(self.data_tree_widget, ["No streamlines loaded"])
             item.setDisabled(True)
 
-        # --- 2. Anatomical Image ---
+        # Anatomical Image 
         if self.anatomical_image_data is not None:
             image_name = (os.path.basename(self.anatomical_image_path) 
                           if self.anatomical_image_path else "Loaded Image")
@@ -751,7 +1176,7 @@ class MainWindow(QMainWindow):
             item = QTreeWidgetItem(self.data_tree_widget, ["No anatomical image"])
             item.setDisabled(True)
             
-        # --- 3. ROI Layers ---
+        # ROI Layers 
         if self.roi_layers:
             roi_root_item = QTreeWidgetItem(self.data_tree_widget, ["ROI Layers"])
             roi_root_item.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon))
@@ -780,7 +1205,7 @@ class MainWindow(QMainWindow):
 
         self.data_tree_widget.resizeColumnToContents(0)
 
-    # --- Undo/Redo Core Logic ---             
+    # Undo/Redo Core Logic           
     def _perform_undo(self) -> None:
         if not self.undo_stack: return
         restored = self.undo_stack.pop()
@@ -797,7 +1222,7 @@ class MainWindow(QMainWindow):
         self._apply_logic_filters() # Re-apply filters 
         self._update_action_states()
 
-    # --- Command Actions Logic ---
+    # Command Actions Logic
     def _perform_clear_selection(self) -> None:
         """Clears the current streamline selection."""
         if self.vtk_panel: self.vtk_panel.update_radius_actor(visible=False)
@@ -819,20 +1244,20 @@ class MainWindow(QMainWindow):
         if not self.vtk_panel or not self.vtk_panel.scene:
             return
 
-        # 1. Standard view reset
+        # Standard view reset
         self.vtk_panel.scene.reset_camera()
         
-        # 2. Get the camera and current parameters calculated by reset_camera()
+        # Get the camera and current parameters calculated by reset_camera()
         cam = self.vtk_panel.scene.GetActiveCamera()
         fp = cam.GetFocalPoint()
         dist = cam.GetDistance()
         
-        # 3. Re-orient to Front Coronal (Anterior View)
+        # Re-orient to Front Coronal (Anterior View)
         cam.SetPosition(fp[0], fp[1] + dist, fp[2])
         cam.SetFocalPoint(fp[0], fp[1], fp[2])
         cam.SetViewUp(0, 0, 1) # Up is Superior (+Z)
         
-        # 4. Finalize update
+        # Finalize update
         self.vtk_panel.scene.reset_clipping_range()
         if self.vtk_panel.render_window:
             self.vtk_panel.render_window.Render()
@@ -854,10 +1279,10 @@ class MainWindow(QMainWindow):
         self._apply_logic_filters() # Re-apply filters on new manual state
         self._update_action_states()
         
-        # --- fHide selection sphere after deletion ---
+        # Hide selection sphere after deletion 
         if self.vtk_panel:
             self.vtk_panel.update_radius_actor(visible=False)
-
+            
     def _increase_radius(self) -> None:
         """Increases the selection radius."""
         if not self.tractogram_data: 
@@ -881,13 +1306,15 @@ class MainWindow(QMainWindow):
                 center = self.vtk_panel.radius_actor.GetCenter()
                 self.vtk_panel.update_radius_actor(center_point=center, radius=self.selection_radius_3d, visible=True)
 
+
     def _hide_sphere(self) -> None:
         """Hides the selection sphere."""
         if self.vtk_panel:
             self.vtk_panel.update_radius_actor(visible=False)
             self.vtk_panel.update_status("Selection sphere hidden.")
 
-    # --- View Action Logic ---
+
+    # View Action Logic 
     @pyqtSlot(object)
     def _set_color_mode(self, mode: ColorMode) -> None:
         """Sets the streamline coloring mode and triggers VTK update."""
@@ -897,7 +1324,7 @@ class MainWindow(QMainWindow):
              self.color_default_action.setChecked(True)
              return
 
-        # --- Handle scalar toolbar visibility ---
+        # Handle scalar toolbar visibility 
         if self.current_color_mode != mode:
             if mode == ColorMode.SCALAR:
                 if not self.active_scalar_name:
@@ -929,7 +1356,7 @@ class MainWindow(QMainWindow):
              self.scalar_toolbar.setVisible(is_scalar)
 
 
-    # --- GUI Action Methods ---
+    # GUI Action Methods 
     def _close_bundle(self) -> None:
         """
         Closes the current streamline bundle.
@@ -947,6 +1374,7 @@ class MainWindow(QMainWindow):
             self.vtk_panel.update_radius_actor(visible=False)
             self.selected_streamline_indices = set()
             self.vtk_panel.update_highlight()
+            self.vtk_panel.remove_odf_actor()
 
             # Clear anatomical slices if present
             if self.anatomical_image_data is not None:
@@ -957,6 +1385,7 @@ class MainWindow(QMainWindow):
 
         # Reset streamline data state
         self.tractogram_data = None
+        self.streamline_bboxes = None
         self.visible_indices = set()
         self.original_trk_header = None
         self.original_trk_affine = None
@@ -964,6 +1393,13 @@ class MainWindow(QMainWindow):
         self.original_file_extension = None
         self.scalar_data_per_point = None
         self.active_scalar_name = None
+        self.odf_data = None
+        self.odf_affine = None
+        self.odf_sh_order = 0
+        self.view_odf_tunnel_action.blockSignals(True) # Prevent triggering logic
+        self.view_odf_tunnel_action.setChecked(False)
+        self.view_odf_tunnel_action.setEnabled(False)
+        self.view_odf_tunnel_action.blockSignals(False)
         self.undo_stack = []
         self.redo_stack = []
         self.current_color_mode = ColorMode.ORIENTATION
@@ -977,12 +1413,16 @@ class MainWindow(QMainWindow):
             self.vtk_panel.update_status("Bundle closed (Image also cleared).") # Keep status clear
             if self.vtk_panel.render_window and self.vtk_panel.render_window.GetInteractor().GetInitialized():
                 self.vtk_panel.render_window.Render()
+                
+        # Reset Geometry to Lines default
+        self.render_as_tubes = False
+        self.geo_lines_action.setChecked(True)
 
         # Update UI
         self._update_bundle_info_display()
         self._update_action_states()
 
-    # --- Action Trigger Wrappers ---
+    # Action Trigger Wrappers 
     def _trigger_load_streamlines(self) -> None:
         """Wrapper to call the streamline load function from file_io."""
         self.scalar_range_initialized = False
@@ -998,15 +1438,158 @@ class MainWindow(QMainWindow):
             self.roi_intersection_cache = {}
             self.roi_highlight_indices = set()
         
-        # --- Update scalar range if scalar mode is already active
+        # Update scalar range if scalar mode is already active
         if self.current_color_mode == ColorMode.SCALAR and self.active_scalar_name:
              self._update_scalar_data_range()
              self.scalar_range_initialized = True
              if self.scalar_toolbar: self.scalar_toolbar.setVisible(True)
 
+
     def _trigger_save_streamlines(self) -> None:
         """Wrapper to call the streamline save function from file_io."""
         file_io.save_streamlines_file(self)
+        
+        
+    def _trigger_save_density_map(self) -> None:
+        """
+        Calculates and saves a Track Density Imaging (TDI) map of the currently 
+        visible streamlines. Uses the anatomical image grid if available for 
+        maximum accuracy/alignment, otherwise derives a grid from the tractogram.
+        """
+        if not self.tractogram_data:
+            return
+
+        # Determine Target Grid (Reference) 
+        affine = None
+        shape = None
+        
+        # Priority A: Loaded Anatomical Image (Best for alignment)
+        if self.anatomical_image_data is not None:
+            affine = self.anatomical_image_affine
+            shape = self.anatomical_image_data.shape[:3]
+            
+        # Priority B: Original Header Info (if compatible/available)
+        elif self.original_trk_header:
+            try:
+                # Check for standard TRK header fields
+                if 'dimensions' in self.original_trk_header and 'voxel_to_rasmm' in self.original_trk_header:
+                    shape = tuple(int(d) for d in self.original_trk_header['dimensions'][:3])
+                    affine = self.original_trk_header['voxel_to_rasmm']
+            except Exception:
+                pass
+        
+        # Priority C: Compute Bounding Box (Fallback)
+        # If no reference is found, we create a 1mm isotropic grid around the bundle
+        if affine is None or shape is None:
+            self.vtk_panel.update_status("Calculating density grid from bounds...")
+            QApplication.processEvents()
+            
+            visible_streamlines = [self.tractogram_data[i] for i in self.visible_indices 
+                                  if self.tractogram_data[i] is not None]
+            
+            if not visible_streamlines:
+                QMessageBox.warning(self, "Error", "No visible streamlines to map.")
+                return
+
+            try:
+                # Concatenate to find global bounds
+                all_points = np.concatenate(visible_streamlines, axis=0)
+                min_coord = np.min(all_points, axis=0)
+                max_coord = np.max(all_points, axis=0)
+                
+                # Use 1mm isotropic resolution
+                voxel_size = np.array([1.0, 1.0, 1.0])
+                
+                # Add padding (5mm)
+                padding = 5.0 
+                min_coord -= padding
+                max_coord += padding
+                
+                # Calculate shape
+                dims = np.ceil((max_coord - min_coord) / voxel_size).astype(int)
+                shape = tuple(dims)
+                
+                # Construct Affine (Translation + Scale)
+                # Maps Voxel(0,0,0) -> World(min_coord)
+                affine = np.eye(4)
+                affine[:3, :3] = np.diag(voxel_size)
+                affine[:3, 3] = min_coord
+                
+            except Exception as e:
+                logger.error(f"Error computing bounds: {e}")
+                self.vtk_panel.update_status("Error computing density bounds.")
+                return
+
+        default_filename = "density_map.nii.gz"
+        if self.original_trk_path:
+            base_name = os.path.splitext(os.path.basename(self.original_trk_path))[0]
+            default_filename = f"{base_name}_density_map.nii.gz"
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Density Map", default_filename, "NIfTI Files (*.nii.gz *.nii)"
+        )
+        if not file_path:
+            return
+
+        self.vtk_panel.update_status("Computing density map...")
+        self.vtk_panel.update_progress_bar(0, 0, visible=True) 
+        QApplication.processEvents()
+
+        try:
+            # Compute Density 
+            # Retrieve only visible streamlines
+            visible_streamlines = [self.tractogram_data[i] for i in self.visible_indices 
+                                  if self.tractogram_data[i] is not None and len(self.tractogram_data[i]) > 0]
+            
+            if not visible_streamlines:
+                raise ValueError("No valid streamlines found in current view.")
+
+            # Flatten to a single array of points (N, 3)
+            points = np.concatenate(visible_streamlines, axis=0)
+            
+            # Transform World (RASmm) -> Voxel Coordinates
+            inv_affine = np.linalg.inv(affine)
+            vox_coords = nib.affines.apply_affine(inv_affine, points)
+            
+            # Round to nearest integer voxel index
+            vox_indices = np.rint(vox_coords).astype(int)
+            
+            # Filter points outside the defined grid dimensions
+            valid_mask = (
+                (vox_indices[:, 0] >= 0) & (vox_indices[:, 0] < shape[0]) &
+                (vox_indices[:, 1] >= 0) & (vox_indices[:, 1] < shape[1]) &
+                (vox_indices[:, 2] >= 0) & (vox_indices[:, 2] < shape[2])
+            )
+            valid_voxels = vox_indices[valid_mask]
+            
+            # Binning (Histogram)
+            density_data = np.zeros(shape, dtype=np.int32)
+            
+            # Fast unbuffered summation at coordinates
+            np.add.at(density_data, (valid_voxels[:, 0], valid_voxels[:, 1], valid_voxels[:, 2]), 1)
+            
+            # Save to Disk 
+            nifti_img = nib.Nifti1Image(density_data.astype(np.float32), affine)
+            
+            # Copy header info if possible (e.g. from anatomy) to preserve orientations
+            if self.anatomical_image_path and self.anatomical_image_data is not None:
+                 try:
+                     ref_img = nib.load(self.anatomical_image_path)
+                     nifti_img.header.set_zooms(ref_img.header.get_zooms()[:3])
+                     nifti_img.header.set_xyzt_units(*ref_img.header.get_xyzt_units())
+                 except: pass
+
+            nib.save(nifti_img, file_path)
+            
+            self.vtk_panel.update_status(f"Saved density map: {os.path.basename(file_path)}")
+
+        except Exception as e:
+            logger.error(f"Error saving density map: {e}", exc_info=True)
+            QMessageBox.critical(self, "Error", f"Could not save density map:\n{e}")
+            self.vtk_panel.update_status("Error saving density map.")
+        finally:
+             self.vtk_panel.update_progress_bar(0, 0, visible=False)
+
 
     def _trigger_screenshot(self) -> None:
         """Wrapper to call the screenshot function in vtk_panel."""
@@ -1023,7 +1606,8 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.warning(self, "Screenshot Error", "VTK panel not initialized.")
 
-    # --- Background Image Methods ---
+
+    # Background Image Methods 
     def _trigger_load_anatomical_image(self) -> None:
         """Triggers loading of an anatomical image."""
         if self.anatomical_image_data is not None:
@@ -1059,7 +1643,8 @@ class MainWindow(QMainWindow):
             self._update_bundle_info_display()
             self._update_action_states()
             
-    # --- ROI Image Methods ---
+            
+    # ROI Image Methods 
     def _trigger_load_roi(self) -> None:
         """
         Triggers loading of ROI image layer(s),
@@ -1086,6 +1671,9 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "ROI Already Loaded", 
                                     f"The ROI from '{os.path.basename(roi_path)}' is already loaded.")
                 continue
+            
+            self.roi_visibility[roi_path] = True
+            self.roi_opacities[roi_path] = 0.5 # Default ROI opacity
                 
             if self.vtk_panel:
                 self.vtk_panel.update_status(f"Processing {os.path.basename(roi_path)}...")
@@ -1098,7 +1686,7 @@ class MainWindow(QMainWindow):
                 # Load the ROI image object again to perform reorientation operations
                 roi_img = nib.load(roi_path)
                 
-                # --- Ensure proper coordinate system alignment ---
+                # Ensure proper coordinate system alignment 
                 current_ornt = nib.io_orientation(roi_img.affine)
                 target_ornt = nib.io_orientation(anatomical_img.affine)
                 
@@ -1159,21 +1747,22 @@ class MainWindow(QMainWindow):
         if self.vtk_panel:
             self.vtk_panel.update_status("ROI loading complete.")
 
+
     def _trigger_clear_all_rois(self, notify: bool = True) -> None:
         """Clears all loaded ROI image layers and resets logic filters."""
         if not self.roi_layers:
             return
 
-        # 1. Clear Data Containers
+        # Clear Data Containers
         self.roi_layers.clear()
         self.roi_visibility.clear()
 
-        # 2. Clear Logic States and Caches
+        # Clear Logic States and Caches
         self.roi_states.clear()
         self.roi_intersection_cache.clear()
         self.roi_highlight_indices.clear()
 
-        # 3. Re-calculate Visuals
+        # Re-calculate Visuals
         self._update_roi_visual_selection() 
         self._apply_logic_filters()
 
@@ -1185,6 +1774,7 @@ class MainWindow(QMainWindow):
         self._update_bundle_info_display()
         self._update_action_states()
         
+        
     def _trigger_clear_all_data(self) -> None:
         """Clears all loaded data (streamlines, anatomical image, ROIs) without confirmation."""
         has_data = (self.tractogram_data is not None or 
@@ -1194,15 +1784,15 @@ class MainWindow(QMainWindow):
         if not has_data:
             return
 
-        # 1. Clear ROIs first
+        # Clear ROIs first
         if self.roi_layers:
             self._trigger_clear_all_rois(notify=False)
         
-        # 2. Clear Streamlines 
+        # Clear Streamlines 
         if self.tractogram_data is not None:
             self._close_bundle() 
         
-        # 3. Clear Image (if not already cleared by _close_bundle or if no bundle was loaded)
+        # Clear Image (if not already cleared by _close_bundle or if no bundle was loaded)
         if self.anatomical_image_data is not None:
             self._trigger_clear_anatomical_image()
         
@@ -1250,7 +1840,8 @@ class MainWindow(QMainWindow):
             if self.data_tree_widget:
                 self.data_tree_widget.blockSignals(False)
                 
-    # --- Data Panel Context Menu Logic ---
+                
+    # Data Panel Context Menu Logic 
     def _on_data_panel_context_menu(self, position) -> None:
         """
         Grouped Logic Modes with Radio Buttons.
@@ -1271,11 +1862,11 @@ class MainWindow(QMainWindow):
             
             menu = QMenu()
             
-            # --- Logic Mode Group (Mutually Exclusive) ---
+            # Logic Mode Group (Mutually Exclusive) 
             logic_group = QActionGroup(self)
             logic_group.setExclusive(True)
             
-            # 1. Visual Only (None)
+            # Visual Only (None)
             act_none = QAction("Visual Only", self)
             act_none.setCheckable(True)
             is_none = not (current_state['select'] or current_state['include'] or current_state['exclude'])
@@ -1284,7 +1875,7 @@ class MainWindow(QMainWindow):
             logic_group.addAction(act_none)
             menu.addAction(act_none)
             
-            # 2. Select
+            # Select
             act_select = QAction("Select (Highlight)", self)
             act_select.setCheckable(True)
             act_select.setChecked(current_state['select'])
@@ -1292,7 +1883,7 @@ class MainWindow(QMainWindow):
             logic_group.addAction(act_select)
             menu.addAction(act_select)
 
-            # 3. Include
+            # Include
             act_include = QAction("Include (AND)", self)
             act_include.setCheckable(True)
             act_include.setChecked(current_state['include'])
@@ -1300,7 +1891,7 @@ class MainWindow(QMainWindow):
             logic_group.addAction(act_include)
             menu.addAction(act_include)
             
-            # 4. Exclude
+            # Exclude
             act_exclude = QAction("Exclude (NOT)", self)
             act_exclude.setCheckable(True)
             act_exclude.setChecked(current_state['exclude'])
@@ -1309,8 +1900,8 @@ class MainWindow(QMainWindow):
             menu.addAction(act_exclude)
 
             menu.addSeparator()
-            
-            # --- Standard Actions ---
+    
+            # Standard Actions 
             change_color_action = QAction("Change Color...", self)
             change_color_action.triggered.connect(lambda: self._change_roi_color_action(roi_path))
             menu.addAction(change_color_action)
@@ -1321,6 +1912,7 @@ class MainWindow(QMainWindow):
             
             menu.exec(self.data_tree_widget.mapToGlobal(position))
             
+            
     def _set_roi_logic_mode(self, roi_path: str, mode: str) -> None:
         """
         Sets the logic mode for an ROI, ensuring mutual exclusivity.
@@ -1329,11 +1921,11 @@ class MainWindow(QMainWindow):
         if roi_path not in self.roi_states:
             return
 
-        # 1. Reset all flags
+        # Reset all flags
         for f in ['select', 'include', 'exclude']:
             self.roi_states[roi_path][f] = False
 
-        # 2. Set new flag (unless mode is 'none')
+        # Set new flag (unless mode is 'none')
         if mode != 'none':
             self.roi_states[roi_path][mode] = True
             
@@ -1343,11 +1935,11 @@ class MainWindow(QMainWindow):
                 if not success:
                     self.roi_states[roi_path][mode] = False # Revert on failure
 
-        # 3. Refresh Visuals
+        # Refresh Visuals
         self._update_roi_visual_selection()  # Updates Red Highlight
         self._apply_logic_filters()          # Updates Streamline Visibility
         
-        # 4. Refresh Panel Text (to show [TAG])
+        # Refresh Panel Text (to show [TAG])
         self._update_data_panel_display()
         
     def _toggle_image_visibility(self, visible: bool) -> None:
@@ -1359,10 +1951,24 @@ class MainWindow(QMainWindow):
         if self.vtk_panel:
             self.vtk_panel.set_anatomical_slice_visibility(visible)
             self.vtk_panel.update_status(f"Image visibility set to {visible}")
-            
-    def _compute_roi_intersection(self, roi_path: str) -> bool:
-        if not self.tractogram_data or roi_path not in self.roi_layers: return False
         
+        
+    def _compute_roi_intersection(self, roi_path: str) -> bool:
+        """
+        Computes intersections using a Broad Phase (Bounding Box) filter 
+        followed by a Narrow Phase (Voxel Grid) check.
+        """
+        if not self.tractogram_data or roi_path not in self.roi_layers: 
+            return False
+        
+        # Ensure we have bounding boxes (calculated on load usually)
+        if self.streamline_bboxes is None:
+            # Fallback calculation if missing
+            self.streamline_bboxes = np.array([
+                [np.min(sl, axis=0), np.max(sl, axis=0)] 
+                for sl in self.tractogram_data
+            ])
+
         total_fibers = len(self.tractogram_data)
         self.vtk_panel.update_status(f"Computing intersection: {os.path.basename(roi_path)}...")
         self.vtk_panel.update_progress_bar(0, total_fibers, visible=True)
@@ -1370,38 +1976,84 @@ class MainWindow(QMainWindow):
                 
         try:
             roi_data = self.roi_layers[roi_path]['data']
+            roi_affine = self.roi_layers[roi_path]['affine']
             inv_affine = self.roi_layers[roi_path]['inv_affine']
-            intersecting = set()
             dims = roi_data.shape
             
-            # Check basic bounds first or stride points
-            for idx, sl in enumerate(self.tractogram_data):
-                
-                # --- Update Progress ---
-                if idx % 2000 == 0: # Check every 2000 fibers
-                    self.vtk_panel.update_progress_bar(idx, total_fibers, visible=True)
+            # BROAD PHASE: Bounding Box Filter 
+            # Find the bounding box of the ROI mask in Voxel Space
+            roi_indices = np.argwhere(roi_data > 0)
+            
+            if roi_indices.size == 0:
+                self.roi_intersection_cache[roi_path] = set()
+                self.vtk_panel.update_status(f"ROI is empty. Found 0.")
+                return True
+
+            v_min = np.min(roi_indices, axis=0)
+            v_max = np.max(roi_indices, axis=0) + 1 # +1 for exclusive max
+
+            # Create the 8 corners of the ROI BBox in Voxel Space
+            corners_vox = np.array([
+                [v_min[0], v_min[1], v_min[2]],
+                [v_min[0], v_min[1], v_max[2]],
+                [v_min[0], v_max[1], v_min[2]],
+                [v_min[0], v_max[1], v_max[2]],
+                [v_max[0], v_min[1], v_min[2]],
+                [v_max[0], v_min[1], v_max[2]],
+                [v_max[0], v_max[1], v_min[2]],
+                [v_max[0], v_max[1], v_max[2]],
+            ])
+
+            # Transform ROI Voxel Corners -> World Space to get World AABB
+            corners_world = nib.affines.apply_affine(roi_affine, corners_vox)
+            roi_world_min = np.min(corners_world, axis=0)
+            roi_world_max = np.max(corners_world, axis=0)
+
+            
+            # Add small padding/tolerance to ROI bounds (e.g. 1 voxel size approx) to be safe
+            tolerance = 2.0 
+            roi_world_min -= tolerance
+            roi_world_max += tolerance
+
+            overlap_mask = np.all(self.streamline_bboxes[:, 1] >= roi_world_min, axis=1) & \
+                           np.all(self.streamline_bboxes[:, 0] <= roi_world_max, axis=1)
+            
+            candidate_indices = np.where(overlap_mask)[0]
+            
+            # Voxel Grid Check 
+            intersecting = set()
+            
+            # Optimization: Pre-fetch affine components for faster dot product inside loop
+            T = inv_affine[:3, 3]
+            R = inv_affine[:3, :3]
+
+            # Only loop through candidates (usually < 5% of total fibers)
+            for i, idx in enumerate(candidate_indices):
+                # Update UI less frequently
+                if i % 500 == 0:
+                    self.vtk_panel.update_progress_bar(i, len(candidate_indices), visible=True)
                     QApplication.processEvents()
 
-                if sl is None or len(sl) == 0: continue
-                # Map to voxel space
-                vox = nib.affines.apply_affine(inv_affine, sl)
-                ivox = np.rint(vox).astype(int)
+                sl = self.tractogram_data[idx]
                 
-                # Check bounds
-                in_bounds = (
-                    (ivox[:,0] >= 0) & (ivox[:,0] < dims[0]) &
-                    (ivox[:,1] >= 0) & (ivox[:,1] < dims[1]) &
-                    (ivox[:,2] >= 0) & (ivox[:,2] < dims[2])
+                # Fast manual apply_affine: vox = sl @ R.T + T
+                vox_float = np.dot(sl, R.T) + T
+                ivox = np.rint(vox_float).astype(int)
+                
+                # Bounds check (Vectorized for the whole streamline)
+                valid_mask = (
+                    (ivox[:, 0] >= 0) & (ivox[:, 0] < dims[0]) &
+                    (ivox[:, 1] >= 0) & (ivox[:, 1] < dims[1]) &
+                    (ivox[:, 2] >= 0) & (ivox[:, 2] < dims[2])
                 )
-                valid_vox = ivox[in_bounds]
-                if len(valid_vox) > 0:
-                    # Check mask value (assuming > 0 is ROI)
-                    vals = roi_data[valid_vox[:,0], valid_vox[:,1], valid_vox[:,2]]
-                    if np.any(vals > 0):
+                
+                if np.any(valid_mask):
+                    valid_points = ivox[valid_mask]
+                    if np.any(roi_data[valid_points[:, 0], valid_points[:, 1], valid_points[:, 2]] > 0):
                         intersecting.add(idx)
-            
+
             self.roi_intersection_cache[roi_path] = intersecting
-            self.vtk_panel.update_status(f"Intersection done. Found {len(intersecting)}.")
+            self.vtk_panel.update_status(f"Intersection done. Found {len(intersecting)} (Candidates: {len(candidate_indices)}).")
             return True
 
         except Exception as e:
@@ -1412,6 +2064,7 @@ class MainWindow(QMainWindow):
         finally:
             self.vtk_panel.update_progress_bar(0, 0, visible=False)
         
+        
     def _update_roi_visual_selection(self) -> None:
         active_selects = [p for p, s in self.roi_states.items() if s['select']]
         combined = set()
@@ -1421,6 +2074,7 @@ class MainWindow(QMainWindow):
         if self.vtk_panel:
             self.vtk_panel.update_roi_highlight_actor()
             
+            
     def _apply_logic_filters(self) -> None:
         if not hasattr(self, 'manual_visible_indices'):
             self.manual_visible_indices = set(range(len(self.tractogram_data))) if self.tractogram_data else set()
@@ -1428,7 +2082,7 @@ class MainWindow(QMainWindow):
         # Start with manual state
         final_indices = self.manual_visible_indices.copy()
         
-        # 1. Apply Includes (Union of all active includes)
+        # Apply Includes
         active_includes = [p for p, s in self.roi_states.items() if s['include']]
         if active_includes:
             union_includes = set()
@@ -1437,7 +2091,7 @@ class MainWindow(QMainWindow):
             # Strict AND: Streamline must be in Manual AND (Include_A OR Include_B)
             final_indices.intersection_update(union_includes)
             
-        # 2. Apply Excludes
+        # Apply Excludes
         active_excludes = [p for p, s in self.roi_states.items() if s['exclude']]
         for p in active_excludes:
             excl = self.roi_intersection_cache.get(p, set())
@@ -1447,6 +2101,7 @@ class MainWindow(QMainWindow):
         if self.vtk_panel:
             self.vtk_panel.update_main_streamlines_actor()
         self._update_bundle_info_display()
+
 
     def _change_roi_color_action(self, path: str) -> None:
         """Opens a color picker and updates the ROI layer color."""
@@ -1460,35 +2115,34 @@ class MainWindow(QMainWindow):
                 self.vtk_panel.set_roi_layer_color(path, rgb_normalized)
                 self.vtk_panel.update_status(f"Updated color for {os.path.basename(path)}")
 
+
     def _remove_roi_layer_action(self, path: str) -> None:
         """Removes a specific ROI layer."""
         if path in self.roi_layers:
-            # 1. Remove from data structures
             del self.roi_layers[path]
             if path in self.roi_visibility:
                 del self.roi_visibility[path]
             
-            # --- Remove from Logic State and Cache ---
+            # Remove from Logic State and Cache 
             if path in self.roi_states:
                 del self.roi_states[path]
             
             if path in self.roi_intersection_cache:
                 del self.roi_intersection_cache[path]
 
-            # --- Re-calculate Logic and Visuals ---
-            # This ensures that Excluded/Included streamlines return to normal
-            # and Selected (Highlighted) streamlines are un-highlighted.
+            # Re-calculate Logic and Visuals 
             self._update_roi_visual_selection() 
             self._apply_logic_filters()
             
-            # 2. Update VTK Panel
+            # Update VTK Panel
             if self.vtk_panel:
                 self.vtk_panel.remove_roi_layer(path)
                 self.vtk_panel.update_status(f"Removed ROI: {os.path.basename(path)}")
             
-            # 3. Refresh UI
+            # Refresh UI
             self._update_bundle_info_display()
             self._update_action_states()
+
 
     def _toggle_bundle_visibility(self, visible: bool) -> None:
         """Toggles the visibility of the streamline bundle actors."""
@@ -1517,6 +2171,7 @@ class MainWindow(QMainWindow):
         
         self.vtk_panel.update_status(f"Bundle visibility set to {visible}")
 
+
     def _toggle_roi_visibility(self, path: str, visible: bool) -> None:
         """Toggles the visibility of a specific ROI layer."""
         if self.roi_visibility.get(path, True) == visible:
@@ -1529,6 +2184,7 @@ class MainWindow(QMainWindow):
             self.vtk_panel.update_status(
                 f"ROI '{os.path.basename(path)}' visibility set to {visible}"
             )
+
 
     def _trigger_clear_anatomical_image(self) -> None:
         """Clears the currently loaded anatomical image."""
@@ -1544,7 +2200,7 @@ class MainWindow(QMainWindow):
         self.anatomical_image_data = None
         self.anatomical_image_affine = None
 
-        # --- Clear RAS coordinate display ---
+        # Clear RAS coordinate display 
         if self.ras_coordinate_label: 
             self.ras_coordinate_label.setText(" RAS: --, --, -- ") 
 
@@ -1560,7 +2216,8 @@ class MainWindow(QMainWindow):
         self._update_bundle_info_display()
         self._update_action_states()
 
-    # --- Helper functions for float <-> int mapping ---
+
+    # Helper functions for float <-> int mapping 
     def _float_to_int_slider(self, float_val: float) -> int:
         """Maps a float value from the data range to the slider's integer range."""
         data_min = self.scalar_data_min
@@ -1575,6 +2232,7 @@ class MainWindow(QMainWindow):
         percent = (float_val - data_min) / (data_max - data_min)
         return int(round(percent * SLIDER_PRECISION))
         
+        
     def _int_slider_to_float(self, slider_val: int) -> float:
         """Maps an integer slider value back to the float data range."""
         data_min = self.scalar_data_min
@@ -1585,6 +2243,7 @@ class MainWindow(QMainWindow):
             
         percent = float(slider_val) / SLIDER_PRECISION
         return data_min + percent * (data_max - data_min)
+
 
     def _update_scalar_data_range(self) -> None:
         """Calculates the min/max range from the active scalar data."""
@@ -1629,6 +2288,7 @@ class MainWindow(QMainWindow):
             self.scalar_max_val = 1.0
             self._update_scalar_range_widgets()
 
+
     def _update_scalar_range_widgets(self) -> None:
         """Updates the spinbox and slider widgets with current range and values."""
         if not self.scalar_min_spinbox or not self.scalar_max_spinbox:
@@ -1657,6 +2317,7 @@ class MainWindow(QMainWindow):
         self.scalar_max_spinbox.blockSignals(False)
         self.scalar_min_slider.blockSignals(False)
         self.scalar_max_slider.blockSignals(False)
+
 
     def _slider_value_changed(self, slider_val: int) -> None:
         """
@@ -1687,6 +2348,7 @@ class MainWindow(QMainWindow):
                 self.scalar_min_slider.setValue(slider_val)
                 self.scalar_min_slider.blockSignals(False)
 
+
     def _spinbox_value_changed(self) -> None:
         """
         Slot for when spinbox editing is finished.
@@ -1714,12 +2376,13 @@ class MainWindow(QMainWindow):
         self._update_scalar_range_widgets()
         self._trigger_vtk_update() # Manually trigger the changed signal to force a redraw
         
+        
     def _trigger_vtk_update(self) -> None:
         """
         Validates range and triggers the (slow) VTK actor update.
         Called on slider release or spinbox edit finished.
         """
-        # --- Validation ---
+        # Validation 
         min_val = self.scalar_min_val
         max_val = self.scalar_max_val
         
@@ -1730,12 +2393,13 @@ class MainWindow(QMainWindow):
         # Update widgets one last time to be sure they are synced
         self._update_scalar_range_widgets()
         
-        # --- Trigger Update ---
+        # Trigger Update
         if self.vtk_panel and self.current_color_mode == ColorMode.SCALAR:
             self.vtk_panel.update_main_streamlines_actor()
             self.vtk_panel.update_status(f"Scalar range set to: [{min_val:.3f}, {max_val:.3f}]")
             
-    # --- Slot for VTK Panel ---
+            
+    # Slot for VTK Panel
     def update_ras_coordinate_display(self, ras_coords: Optional[np.ndarray]) -> None:
         """
         Updates the RAS coordinate QLineEdit from the VTK panel.
@@ -1754,11 +2418,12 @@ class MainWindow(QMainWindow):
             coord_str = f"{display_x:.2f}, {ras_coords[1]:.2f}, {ras_coords[2]:.2f}"
             self.ras_coordinate_input.setText(coord_str)
         else:
-            # --- Update placeholder text ---
+            # Update placeholder text 
             self.ras_coordinate_input.setText("--, --, --")
 
         # Unblock signals
         self.ras_coordinate_input.blockSignals(False)
+
 
     @pyqtSlot()
     def _on_ras_coordinate_entered(self) -> None:
@@ -1777,7 +2442,7 @@ class MainWindow(QMainWindow):
 
         text_value = self.ras_coordinate_input.text()
 
-        # 1. Parse the text
+        # Parse the text
         try:
             # Split by comma or space
             parts = text_value.replace(",", " ").split()
@@ -1788,13 +2453,13 @@ class MainWindow(QMainWindow):
             ras_y = float(parts[1])
             ras_z = float(parts[2])
 
-            # --- Negate the X-coordinate ---
+            # Negate the X-coordinate 
             # Convert from user's neurological input (+X=Right)
             # to the application's internal radiological convention (-X=Right)
             internal_ras_x = -ras_x_input
             ras_coords = np.array([internal_ras_x, ras_y, ras_z])
 
-            # 2. Send to VTKPanel
+            # Send to VTKPanel
             self.vtk_panel.set_slices_from_ras(ras_coords)
 
         except (ValueError, TypeError) as e:
@@ -1810,7 +2475,8 @@ class MainWindow(QMainWindow):
             
             self.update_ras_coordinate_display(current_ras) # Revert to last known good value
     
-    # --- Window Close Event ---
+    
+    # Window Close Event 
     def closeEvent(self, event: QCloseEvent) -> None:
         """Handles the main window close event, prompting if data is loaded."""
         data_loaded = bool(self.tractogram_data or self.anatomical_image_data)
@@ -1828,6 +2494,7 @@ class MainWindow(QMainWindow):
         else:
             self._cleanup_vtk()
             event.accept()
+
 
     def _cleanup_vtk(self) -> None:
         """Safely cleans up VTK resources."""
@@ -1852,19 +2519,19 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     logger.error(f"Error finalizing VTK render window: {e}")
 
-    # --- Help-About dialog ---
+
+    # Help-About dialog 
     def _show_about_dialog(self) -> None:
         """Displays the About tractedit information box with the application logo."""
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle("About tractedit")
         
-        # --- Load and Set Logo ---
+        # Load and Set Logo 
         try:
             logo_path = get_asset_path("logo.png")
             pixmap = QPixmap(logo_path)
             
             if not pixmap.isNull():
-                # Scale the logo to a reasonable size (e.g., 100x100)
                 scaled_pixmap = pixmap.scaled(
                     150, 150, 
                     Qt.AspectRatioMode.KeepAspectRatio, 
@@ -1874,7 +2541,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.warning(f"Could not load logo for About dialog: {e}")
 
-        about_text = """<b>TractEdit version 2.1.0</b><br><br>
+        about_text = """<b>TractEdit version 2.1.5</b><br><br>
         Author: Marco Tagliaferri, PhD Candidate in Neuroscience<br>
         Center for Mind/Brain Sciences (CIMeC)
         University of Trento, Italy

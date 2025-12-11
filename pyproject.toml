@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tractedit"
-version = "2.1.0" 
+version = "2.1.5" 
 authors = [
     { name = "Marco Tagliaferri", email = "marco.tagliaferri@unitn.it" },
     { name = "Marco Tagliaferri", email = "marco.tagliaferri93@gmail.com" },
@@ -36,6 +36,8 @@ dependencies = [
     "numpy==1.26.4",
     "pytz==2024.1",
     "trx-python==0.3",
+    "numba>=0.57.0",
+    "scipy",
 ]
 
 # Command-line script 'tractedit'
