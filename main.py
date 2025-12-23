@@ -6,6 +6,11 @@ Tractedit GUI - Main Application Runner
 
 import os
 import sys
+if sys.platform == "darwin":  # macOS
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 import logging
 import importlib.resources
 import ctypes
