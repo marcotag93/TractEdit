@@ -37,6 +37,7 @@ dependencies = [
     "pytz==2024.1",
     "trx-python==0.3",
     "numba>=0.58",
+    "scipy>=1.10.0",
 ]
 
 # Command-line script 'tractedit'
