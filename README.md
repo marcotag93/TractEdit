@@ -63,13 +63,13 @@ Load & save streamlines in `.trk`, `.tck`, `.trx`, `.vtk`, `.vtp` formats with w
 
 ### ✏️ ROI & Editing Tools
 - **Drawing:** Pencil, Eraser, Sphere, Rectangle modes
-- **Selection:** Sphere-based with adjustable radius
+- **Selection:** Sphere-based streamlines selection and deletion with adjustable radius
 - **Filtering:** Include/Exclude logic for ROIs
 - Undo/Redo support for all operations
 
 ### 🧠 Advanced Analysis
 - FreeSurfer parcellation support with connectivity matrices
-- ODF visualization (spherical harmonics)
+- ODF 3D visualization (spherical harmonics)
 - Track Density Imaging (TDI)
 - Centroid & Medoid calculation
 
@@ -246,7 +246,7 @@ Use **pre-built executable** Tractedit.exe (no Python setup required).
 
 ### Step 1: Load Your Data
 ```
-File → Open          → Load .trk, .tck, .trx, .vtk, or .vtp
+File → Load          → Load .trk, .tck, .trx, .vtk, or .vtp
 File → Load Image    → Add anatomical image (NIfTI)
 ```
 
