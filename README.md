@@ -78,14 +78,14 @@ Load & save streamlines in `.trk`, `.tck`, `.trx`, `.vtk`, `.vtp` formats with w
 
 #### Visualization
 - **Multi-View Orthogonal Visualization:** Integrated 3D viewer and three linked 2D orthogonal slice views (Axial, Coronal, Sagittal)
-- **Anatomical Image:** Load NIfTI images (`.nii`, `.nii.gz`) as backgrounds for anatomical context and interactive slice navigation
+- **Anatomical Image:** Load NIfTI images (`.nii`, `.nii.gz`) for anatomical context and interactive slice navigation
 - **3D Visualization** with [VTK](https://vtk.org/) and [FURY](https://fury.gl/)
   - Default orientation (RGB), or scalar-based coloring with dynamic colormap range adjustment, or greyscale
   - **Render as Lines or Tubes:** Toggle between fast line rendering and high-quality 3D tube rendering via **View → Streamline Geometry**
   - Interactive RAS coordinate bar for precise navigation
 
 #### ROI Support
-- **Multi-Layer Anatomical ROI Support:** Load multiple NIfTI images (`.nii`, `.nii.gz`) as background Region of Interest (ROI) layers
+- **Multi-Layer Anatomical ROI Support:** Load multiple NIfTI images (`.nii`, `.nii.gz`) as Region of Interest (ROI) layers
   - Independent visibility toggles and color settings
   - **Logical Filtering:** Right-click ROIs to set them as exclusion or inclusion ROIs for streamlines
 
@@ -243,7 +243,7 @@ Use **pre-built executable** Tractedit.exe (no Python setup required).
 ### Step 1: Load Your Data
 ```
 File → Open          → Load .trk, .tck, .trx, .vtk, or .vtp
-File → Load Image    → Add anatomical background (NIfTI)
+File → Load Image    → Add anatomical image (NIfTI)
 ```
 
 ### Step 2: Navigate
