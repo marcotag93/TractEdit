@@ -7,7 +7,11 @@ A Python-based graphical interface for interactively **viewing**, **selecting**,
 
 
 
-https://github.com/user-attachments/assets/845e0c0e-8bf4-430b-b660-01adeba8a4b9
+
+
+https://github.com/user-attachments/assets/2101fb2e-1e3b-487b-a77b-fd7ba45b5d65
+
+
 
 
 
