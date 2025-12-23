@@ -1,85 +1,147 @@
-# TractEdit
+<p align="center">
+  <img src="tractedit_pkg/assets/logo.png" alt="TractEdit Logo" width="150"/>
+</p>
 
-A Python-based graphical interface for interactively **viewing**, **selecting**, and **editing** tractography bundles in `.trk`, `.tck`, `.trx`, `.vtk` and `.vtp` formats.
+<h1 align="center">🧠 TractEdit</h1>
+
+<p align="center">
+  <b>A Python-based Open-Source Interactive Tool for Virtual Dissection and Manual Refinement of Diffusion MRI Tractography</b>
+</p>
+
+<p align="center">
+  <code>.trk</code> • <code>.tck</code> • <code>.trx</code> • <code>.vtk</code> • <code>.vtp</code>
+</p>
+
+<p align="center">
+  <a href="https://github.com/marcotag93/TractEdit/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"/></a>
+  <img src="https://img.shields.io/badge/python-3.8--3.11-green.svg" alt="Python"/>
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey" alt="Platform"/>
+</p>
 
 
+https://github.com/user-attachments/assets/845e0c0e-8bf4-430b-b660-01adeba8a4b9
 
 
-
-
-
-
-https://github.com/user-attachments/assets/2101fb2e-1e3b-487b-a77b-fd7ba45b5d65
-
-
-
-
-
-
----
-
-## Author
-
-**Marco Tagliaferri**, PhD Candidate in Neuroscience  
-Center for Mind/Brain Sciences (CIMeC), University of Trento Italy 
-
-📧 marco.tagliaferri@unitn.it / marco.tagliaferri93@gmail.com
 
 ---
 
-## Key Features
+## 👤 Author
 
+**Marco Tagliaferri** — *PhD Candidate in Neuroscience*  
+🏛️ [Center for Mind/Brain Sciences (CIMeC)](https://www.cimec.unitn.it/), University of Trento, Italy
+
+[![Email](https://img.shields.io/badge/Email-marco.tagliaferri%40unitn.it-D14836?style=flat&logo=gmail&logoColor=white)](mailto:marco.tagliaferri@unitn.it)
+[![Email](https://img.shields.io/badge/Email-marco.tagliaferri93%40gmail.com-D14836?style=flat&logo=gmail&logoColor=white)](mailto:marco.tagliaferri93@gmail.com)
+[![GitHub](https://img.shields.io/badge/GitHub-marcotag93-181717?style=flat&logo=github)](https://github.com/marcotag93)
+
+---
+
+## 📋 Table of Contents
+
+- [Key Features](#key-features)
+- [Getting Started](#getting-started-manual-install)
+- [Keyboard Shortcuts](#keyboard-shortcuts)
+- [Sample Workflow](#sample-workflow)
+- [Author](#-author)
+- [License](#license)
+
+
+## ✨ Key Features
+
+### 📂 File I/O
+Load & save streamlines in `.trk`, `.tck`, `.trx`, `.vtk`, `.vtp` formats with whole-brain support (>2M streamlines)
+
+### 🖥️ Visualization
+- Multi-view: 3D + Axial, Coronal, Sagittal slices
+- Anatomical overlay with NIfTI support
+- RGB, scalar, or greyscale coloring
+- Line or tube rendering
+
+### ✏️ ROI & Editing Tools
+- **Drawing:** Pencil, Eraser, Sphere, Rectangle modes
+- **Selection:** Sphere-based with adjustable radius
+- **Filtering:** Include/Exclude logic for ROIs
+- Undo/Redo support for all operations
+
+### 🧠 Advanced Analysis
+- FreeSurfer parcellation support with connectivity matrices
+- ODF visualization (spherical harmonics)
+- Track Density Imaging (TDI)
+- Centroid & Medoid calculation
+
+<details>
+<summary><b>📋 Full Feature List</b></summary>
+
+#### File Support
 - **Load & Save** streamline bundles (`.trk`, `.tck`, `.trx`, `.vtk`, `.vtp`)
-- **Whole-Brain Tractogram Support:** Optimized rendering for large datasets (tested with >2 million streamlines) using stride-based visualization and toggleable "skip".
-- **Multi-View Orthogonal Visualization:** Integrated 3D viewer and three linked 2D orthogonal slice views (Axial, Coronal, Sagittal).
-- **Anatomical Image:** Load NIfTI images (`.nii`, `.nii.gz`) as backgrounds for anatomical context and **interactive slice navigation**.
-- **Multi-Layer Anatomical ROI Support:** - Load multiple NIfTI images (`.nii`, `.nii.gz`) as background Region of Interest (ROI) layers.
-    - Independent visibility toggles and color settings.
-    - **Logical Filtering:** Right-click ROIs to set them as exclusion or inclusion ROIs for streamlines.
-- **Interactive ROI Drawing Tools:**
-    - **Pencil Mode (1):** Freehand drawing directly on 2D slice views to create custom ROIs.
-    - **Eraser Mode (2):** Erase portions of ROIs with freehand strokes.
-    - **Sphere Mode (3):** Draw spherical ROIs on slices.
-    - **Rectangle Mode (4):** Draw rectangular/cuboid ROIs on slices.
-    - **Move ROIs:** Hold Ctrl and drag to reposition sphere or rectangle ROIs with real-time preview. Hold Ctrl + scroll to resize.
-    - **Undo/Redo Support:** Full undo/redo for all ROI drawing operations (Ctrl+Z / Ctrl+Y) if mode enabled, otherwise for streamline deletion.
-- **3D Visualization** with [VTK](https://vtk.org/) and [FURY](https://fury.gl/)
-    - Default orientation (RGB), or scalar-based coloring with dynamic colormap range adjustment, or greyscale.
-    - **Render as Lines or Tubes:** Toggle between fast line rendering and high-quality 3D tube rendering via **View → Streamline Geometry**.
-    - Interactive RAS coordinate bar for precise navigation.
-- **Interactive Editing Tools:**
-    - Sphere-based streamline selection (with adjustable radius)
-    - Streamline deletion and undo/redo support.
-    - Screenshot export
-- **FreeSurfer Parcellation Support:**
-    - Load FreeSurfer parcellation/segmentation files (`aparc+aseg`, `aparc.a2009s+aseg`, etc.)
-    - **3D Parcellation Overlay:** Visualize connected parcellation regions in 3D with hemisphere-organized tree view
-    - **Region Logic Filters:** Set parcellation regions as Include/Exclude filters for streamlines
-    - **Compute Connectivity Matrix:** Generate structural connectivity matrices from streamlines and parcellation
-- **ODF Visualization:**
-    - Load Spherical Harmonics (SH) coefficient NIfTI files
-    - **ODF Tunnel View:** Visualize ODFs masked by the current bundle's spatial extent
-- **Track Density Imaging (TDI):** Save density maps of visible streamlines as NIfTI files.
-- **Export Options:**
-    - **HTML Export (Experimental):** Export interactive 3D visualization as self-contained HTML file
-    - Screenshot export in multiple formats
-- **Bundle Analytics:**
-    - Calculate **Centroid** and **Medoid** (both Numba optimized) of the edited bundle.
-- **Streamline Info Display:**
-    - File name, streamline count, voxel size, bounding box, etc.
-    - Vertical data panel with hover details 
-- **Keyboard Shortcuts** for fast interaction (see full list below)
-- **Fast Startup:** Splash screen implementation for immediate feedback and optimized library loading.
-- **Modular Architecture:** Refactored codebase with dedicated manager classes for improved maintainability.
-- **Performance Optimizations:** Numba JIT compilation for geometric computations, Numpy vectorizations, debounced UI updates, pre-computed bounding boxes for fast selection.
+- **Whole-Brain Tractogram Support:** Optimized rendering for large datasets (tested with >2 million streamlines) using stride-based visualization and toggleable "skip"
 
-> ⚠️ **Note:** While TractEdit supports **whole-brain tractograms**, rendering density may be automatically reduced (skipped) for extremely large files to maintain interactivity. You can adjust this manually in the toolbar.
->
-> **Selection Strategy:**
-> * **Sphere Selection:** Recommended for refining specific **bundles** or small bundle complexes. Note that this method is **ineffective** on whole-brain datasets if streamlines are being "skipped" (hidden) for performance, as the sphere can only interact with visible fibers.
-> * **ROI Filtering:** Recommended for **whole-brain tractograms**. Loading NIfTI images as logic filters (Include/Exclude) works on the entire dataset regardless of visual density.
-> * **ROI Drawing:** Use the built-in drawing tools (Pencil, Sphere, Rectangle) to create custom ROIs directly on anatomical slices for flexible, targeted filtering.
-> * **Parcellation Filtering:** Load a FreeSurfer parcellation and set regions as Include/Exclude for anatomically-guided filtering.
+#### Visualization
+- **Multi-View Orthogonal Visualization:** Integrated 3D viewer and three linked 2D orthogonal slice views (Axial, Coronal, Sagittal)
+- **Anatomical Image:** Load NIfTI images (`.nii`, `.nii.gz`) as backgrounds for anatomical context and interactive slice navigation
+- **3D Visualization** with [VTK](https://vtk.org/) and [FURY](https://fury.gl/)
+  - Default orientation (RGB), or scalar-based coloring with dynamic colormap range adjustment, or greyscale
+  - **Render as Lines or Tubes:** Toggle between fast line rendering and high-quality 3D tube rendering via **View → Streamline Geometry**
+  - Interactive RAS coordinate bar for precise navigation
+
+#### ROI Support
+- **Multi-Layer Anatomical ROI Support:** Load multiple NIfTI images (`.nii`, `.nii.gz`) as background Region of Interest (ROI) layers
+  - Independent visibility toggles and color settings
+  - **Logical Filtering:** Right-click ROIs to set them as exclusion or inclusion ROIs for streamlines
+
+#### Interactive ROI Drawing Tools
+- **Pencil Mode (1):** Freehand drawing directly on 2D slice views to create custom ROIs
+- **Eraser Mode (2):** Erase portions of ROIs with freehand strokes
+- **Sphere Mode (3):** Draw spherical ROIs on slices
+- **Rectangle Mode (4):** Draw rectangular/cuboid ROIs on slices
+- **Move ROIs:** Hold Ctrl and drag to reposition sphere or rectangle ROIs with real-time preview. Hold Ctrl + scroll to resize
+- **Undo/Redo Support:** Full undo/redo for all ROI drawing operations (Ctrl+Z / Ctrl+Y) if mode enabled, otherwise for streamline deletion
+
+#### Interactive Editing Tools
+- Sphere-based streamline selection (with adjustable radius)
+- Streamline deletion and undo/redo support
+- Screenshot export
+
+#### FreeSurfer Parcellation Support
+- Load FreeSurfer parcellation/segmentation files (`aparc+aseg`, `aparc.a2009s+aseg`, etc.)
+- **3D Parcellation Overlay:** Visualize connected parcellation regions in 3D with hemisphere-organized tree view
+- **Region Logic Filters:** Set parcellation regions as Include/Exclude filters for streamlines
+- **Compute Connectivity Matrix:** Generate structural connectivity matrices from streamlines and parcellation
+
+#### ODF Visualization
+- Load Spherical Harmonics (SH) coefficient NIfTI files
+- **ODF Tunnel View:** Visualize ODFs masked by the current bundle's spatial extent
+
+#### Export Options
+- **Track Density Imaging (TDI):** Save density maps of visible streamlines as NIfTI files
+- **HTML Export (Experimental):** Export interactive 3D visualization as self-contained HTML file
+- Screenshot export in multiple formats
+
+#### Bundle Analytics
+- Calculate **Centroid** and **Medoid** (both Numba optimized) of the edited bundle
+
+#### UI & Performance
+- **Streamline Info Display:** File name, streamline count, voxel size, bounding box, etc. with vertical data panel and hover details
+- **Keyboard Shortcuts** for fast interaction (see full list below)
+- **Fast Startup:** Splash screen implementation for immediate feedback and optimized library loading
+- **Modular Architecture:** Refactored codebase with dedicated manager classes for improved maintainability
+- **Performance Optimizations:** Numba JIT compilation for geometric computations, Numpy vectorizations, debounced UI updates, pre-computed bounding boxes for fast selection
+
+#### 💡 Tips for Large Datasets
+
+> [!NOTE]
+> While TractEdit supports **whole-brain tractograms**, rendering density may be automatically reduced for extremely large files to maintain interactivity. You can adjust this manually in the toolbar.
+
+**Selection Strategy:**
+| Method | Best For |
+|--------|----------|
+| **Sphere Selection** | Refining specific bundles or small bundle complexes |
+| **ROI Filtering** | Whole-brain tractograms (works on entire dataset) |
+| **ROI Drawing** | Custom regions on anatomical slices |
+| **Parcellation Filtering** | Anatomically-guided filtering with FreeSurfer |
+
+</details>
+
 ---
 
 ## Getting Started (Manual Install)
@@ -178,47 +240,76 @@ Use **pre-built executable** Tractedit.exe (no Python setup required).
 
 ## Sample Workflow
 
-1. Open a `.trk`, `.tck`, `.trx`, `.vtk` or `.vtp` file via **File → Open**
-2. Load an anatomical image via **File → Load Image** to enable 2D slice views.
-3. Use the mouse click-drag in the 2D slice views or the arrow keys (see shortcuts above) to navigate the anatomical slices.
+### Step 1: Load Your Data
+```
+File → Open          → Load .trk, .tck, .trx, .vtk, or .vtp
+File → Load Image    → Add anatomical background (NIfTI)
+```
 
-Choose one or more of the following approaches:
+### Step 2: Navigate
+- **2D Slices:** Click-drag or use arrow keys
+- **3D View:** Rotate, zoom, pan with mouse
 
-**Option A - Manual Selection (Main Feature):**
-- Click on the 3D view and press `S` to select streamlines under the cursor
-- Use `+` / `-` to adjust the selection sphere radius
-- Press `D` to delete selected streamlines, or `C` to clear selection
-- Use `Ctrl+Z` to undo deletions, `Ctrl+Y` to redo
+### Step 3: Edit (Choose Your Approach)
 
-**Option B - Load ROIs:**
-- Load anatomical ROIs via **File → Load ROI**
-- Right-click ROI layers in the data panel to set them as **Include** or **Exclude** regions
-- Streamlines are automatically filtered based on ROI logic
+<table>
+<tr>
+<td width="25%" align="center">
 
-**Option C - Draw ROIs:**
-- Use the drawing toolbar to create custom ROIs directly on slices:
-  - Press **1** for Pencil mode to freehand draw
-  - Press **3** for Sphere mode, click to place and drag to resize
-  - Press **4** for Rectangle mode for rectangular regions
-  - Hold **Ctrl** and drag to move placed sphere/rectangle ROIs
-  - Use **2** for Eraser mode to remove parts of ROIs
-- Right-click drawn ROIs in the data panel to set them as Include/Exclude filters
+**🎯 Manual Selection**
 
-**Option D - Parcellation-Based Filtering:**
-- Load a FreeSurfer parcellation via **File → Load Parcellation**
-- Enable the 3D overlay via **View → Show Parcellation Overlay**
-- Expand the parcellation in the data panel to see connected regions by hemisphere
-- Right-click regions to set them as **Include** or **Exclude** filters
-- Compute a connectivity matrix via **File → Compute Connectivity Matrix**
+Press `S` to select  
+`+`/`-` adjust radius  
+`D` to delete  
 
-4. If needed, change streamline color in **View → Streamline Color**. If using Color by Scalar, use the Scalar Range toolbar at the top of the window to adjust the min/max range of the colormap.
-5. Save the centroid and/or the medoid of your edited bundle with **File → Calculate Centroid** and **File → Calculate Medoid**
-6. Save a Track Density Image with **File → Save Density Map**
-7. Export an interactive HTML visualization with **File → Export to HTML** (Experimental)
-8. Save your edited bundle with **File → Save As** choosing one of the available formats (`.trk`, `.tck`, `.trx`, `.vtk`, `.vtp`)
+</td>
+<td width="25%" align="center">
+
+**📂 Load ROIs**
+
+File → Load ROI  
+Right-click for  
+Include/Exclude  
+
+</td>
+<td width="25%" align="center">
+
+**✏️ Draw ROIs**
+
+`1` Pencil · `2` Eraser  
+`3` Sphere · `4` Rectangle  
+Ctrl+drag to move  
+
+</td>
+<td width="25%" align="center">
+
+**🧠 Parcellation**
+
+File → Load Parcellation  
+Right-click regions  
+Connectivity matrix  
+
+</td>
+</tr>
+</table>
+
+### Step 4: Finalize & Export
+
+| Action | Menu |
+|--------|------|
+| Change colors | View → Streamline Color |
+| Calculate centroid/medoid | File → Calculate Centroid/Medoid |
+| Save density map | File → Save Density Map |
+| Export HTML | File → Export to HTML |
+| Save bundle | File → Save As |
+
+> [!TIP]
+> Use `Ctrl+Z` / `Ctrl+Y` for undo/redo at any time!
 
 ---
 
 ## License
+
+[![MIT License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file for details.
