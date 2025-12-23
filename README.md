@@ -168,6 +168,7 @@ The project dependencies (including PyQt6, VTK, and Nibabel) are defined in pypr
 - [Numba](https://numba.pydata.org/)
 - pytz
 - [trx-python](https://pypi.org/project/trx-python/)
+- Scipy
   
 Recommend a virtual environment:
 ```bash
