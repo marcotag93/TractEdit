@@ -1,27 +1,44 @@
-__pycache__
+# Python bytecode
+__pycache__/
 *.py[cod]
 *$py.class
-.cache
+
+# Virtual environments
 .env
-.venv
+.venv/
 env/
 venv/
+
+# Build/Distribution
+dist/
+build/
+*.egg-info/
+*.egg
+
+# IDE/Editor
 .vscode/
-*~
 .project
 .pydevproject
 .settings/
+*~
+
+# macOS
 .DS_Store
 .AppleDouble
 .LSOverride
+
+# Windows
 Thumbs.db
 ehthumbs.db
 Desktop.ini
-.ipynb_checkpoints
-*.locals
+
+# Jupyter/IPython
+.ipynb_checkpoints/
+
+# Testing
+.pytest_cache/
+
+# Cache/Logs
+.cache/
 *.log
-.DS_store
-dist
-venv
-*.pyc
-build
+*.locals
