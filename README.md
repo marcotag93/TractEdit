@@ -283,9 +283,9 @@ File → Load Image    → Add anatomical image (NIfTI)
 
 **🎯 Manual Selection**
 
-Press `S` to select  
-`+`/`-` adjust radius  
-`D` to delete  
+`+`/`-` adjust radius <br>
+Press `S` to select <br>
+`D` to delete
 
 </td>
 <td width="25%" align="center">
@@ -303,7 +303,8 @@ Include/Exclude
 
 `1` Pencil · `2` Eraser  
 `3` Sphere · `4` Rectangle  
-Ctrl+drag to move  
+Ctrl+drag to move 
+Include/Exclude 
 
 </td>
 <td width="25%" align="center">
@@ -312,7 +313,7 @@ Ctrl+drag to move
 
 File → Load Parcellation  
 Right-click regions  
-Connectivity matrix  
+Include/Exclude  
 
 </td>
 </tr>
