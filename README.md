@@ -38,6 +38,24 @@ https://github.com/user-attachments/assets/f97633bb-2f16-493c-8487-64055d8f164d
 [![Email](https://img.shields.io/badge/Email-marco.tagliaferri93%40gmail.com-D14836?style=flat&logo=gmail&logoColor=white)](mailto:marco.tagliaferri93@gmail.com)
 [![GitHub](https://img.shields.io/badge/GitHub-marcotag93-181717?style=flat&logo=github)](https://github.com/marcotag93)
 
+If you use TractEdit in your research, please cite:
+
+> Tagliaferri, M. (2024). TractEdit: An Open-Source Interactive Tool for Virtual Dissection and Manual Refinement of Diffusion MRI Tractography. GitHub. https://github.com/marcotag93/TractEdit
+
+**BibTeX:**
+
+```bibtex
+@software{tagliaferri2024tractedit,
+  author = {Tagliaferri, Marco},
+  title = {TractEdit: An Open-Source Interactive Tool for Virtual Dissection and Manual Refinement of Diffusion MRI Tractography},
+  year = {2024},
+  publisher = {GitHub},
+  url = {https://github.com/marcotag93/TractEdit}
+}
+```
+
+*📌 A dedicated manuscript is currently in preparation. This section will be updated with the publication reference once available.*
+
 ---
 
 ## 📋 Table of Contents
@@ -133,8 +151,7 @@ Load & save streamlines in `.trk`, `.tck`, `.trx`, `.vtk`, `.vtp` formats with w
 
 #### 💡 Tips for Large Datasets
 
-> [!NOTE]
-> While TractEdit supports **whole-brain tractograms**, rendering density may be automatically reduced for extremely large files to maintain interactivity. You can adjust this manually in the toolbar.
+*📌 While TractEdit supports **whole-brain tractograms**, rendering density may be automatically reduced for extremely large files to maintain interactivity. You can adjust this manually in the toolbar.*
 
 **Selection Strategy:**
 | Method | Best For |
@@ -311,8 +328,7 @@ Connectivity matrix
 | Export HTML | File → Export to HTML |
 | Save bundle | File → Save As |
 
-> [!TIP]
-> Use `Ctrl+Z` / `Ctrl+Y` for undo/redo at any time!
+*💡 Tip: Use `Ctrl+Z` / `Ctrl+Y` for undo/redo at any time!*
 
 ---
 
