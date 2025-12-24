@@ -40,15 +40,15 @@ https://github.com/user-attachments/assets/f97633bb-2f16-493c-8487-64055d8f164d
 
 If you use TractEdit in your research, please cite:
 
-> Tagliaferri, M. (2024). TractEdit: An Open-Source Interactive Tool for Virtual Dissection and Manual Refinement of Diffusion MRI Tractography. GitHub. https://github.com/marcotag93/TractEdit
+> Tagliaferri, M. (2025). TractEdit: An Open-Source Interactive Tool for Virtual Dissection and Manual Refinement of Diffusion MRI Tractography. GitHub. https://github.com/marcotag93/TractEdit
 
 **BibTeX:**
 
 ```bibtex
-@software{tagliaferri2024tractedit,
+@software{tagliaferri2025tractedit,
   author = {Tagliaferri, Marco},
   title = {TractEdit: An Open-Source Interactive Tool for Virtual Dissection and Manual Refinement of Diffusion MRI Tractography},
-  year = {2024},
+  year = {2025},
   publisher = {GitHub},
   url = {https://github.com/marcotag93/TractEdit}
 }
