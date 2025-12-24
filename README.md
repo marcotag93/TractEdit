@@ -210,8 +210,11 @@ Explore `sample_data/` to test TractEdit with example streamline files, anatomic
 
 ---
 
-### For Windows
-Use **pre-built executable** Tractedit.exe (no Python setup required).
+### Pre-built Executables
+No Python setup is required for these versions. Download the latest release for your operating system:
+
+* **Windows:** Use the `.exe` file.
+* **macOS (Apple Silicon):** Use the  `.dmg` file.
 
 ---
 
