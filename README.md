@@ -229,7 +229,7 @@ tractedit --version
 tractedit --help
 ```
 
-> On certain Linux systems (e.g., Ubuntu on Wayland), you may encounter Qt platform errors. If so, try the xcb workaround below. Please note that this mode is known to cause rendering artifacts in the 2D panels.
+> On certain Linux systems (e.g., Ubuntu on Wayland), you may encounter Qt platform errors. If so, try the xcb workaround below.
 ```bash
 QT_QPA_PLATFORM=xcb tractedit
 ```
