@@ -71,7 +71,7 @@ If you use TractEdit in your research, please cite:
 ## ✨ Key Features
 
 ### 📂 File I/O
-Load & save streamlines in `.trk`, `.tck`, `.trx`, `.vtk`, `.vtp` formats with whole-brain support (>2M streamlines)
+Load & save streamlines in `.trk`, `.tck`, `.trx`, `.vtk`, `.vtp` formats with whole-brain support (>5M streamlines)
 
 ### 🖥️ Visualization
 - Multi-view: 3D + Axial, Coronal, Sagittal slices
