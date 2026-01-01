@@ -1,0 +1,27 @@
+# Auto detect text files and normalize to LF on commit
+* text=auto eol=lf
+
+# Windows-specific files should use CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary files (don't modify)
+*.png binary
+*.jpg binary
+*.ico binary
+*.gif binary
+*.dmg binary
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
+
+# Explicitly set LF for Unix scripts and configs
+*.sh text eol=lf
+*.desktop text eol=lf
+*.xml text eol=lf
+*.spec text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+Makefile text eol=lf

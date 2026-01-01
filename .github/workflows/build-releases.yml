@@ -1,0 +1,407 @@
+name: Build Releases
+
+on:
+  push:
+    tags:
+      - 'v*'  # Trigger on version tags like v1.0.0
+  workflow_dispatch:  # Allow manual trigger
+    inputs:
+      build_macos:
+        description: 'Build macOS DMG'
+        type: boolean
+        default: true
+      build_appimage:
+        description: 'Build Linux AppImage'
+        type: boolean
+        default: true
+      build_deb:
+        description: 'Build Linux DEB'
+        type: boolean
+        default: true
+      build_windows:
+        description: 'Build Windows EXE'
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: dmg
+            name: macOS DMG
+            artifact_name: TractEdit-macOS-arm64
+          - os: ubuntu-22.04
+            target: appimage
+            name: Linux AppImage
+            artifact_name: TractEdit-Linux-AppImage
+          - os: ubuntu-22.04
+            target: deb
+            name: Linux DEB
+            artifact_name: TractEdit-Linux-DEB
+          - os: windows-latest
+            target: exe
+            name: Windows EXE
+            artifact_name: TractEdit-Windows-x64
+
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    
+    # Skip builds based on input selection (manual trigger only)
+    # When triggered by tag, all inputs default to true
+    if: >
+      (github.event_name == 'push') ||
+      (matrix.target == 'dmg' && github.event.inputs.build_macos == 'true') ||
+      (matrix.target == 'appimage' && github.event.inputs.build_appimage == 'true') ||
+      (matrix.target == 'deb' && github.event.inputs.build_deb == 'true') ||
+      (matrix.target == 'exe' && github.event.inputs.build_windows == 'true')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Get version from pyproject.toml (Unix)
+        if: runner.os != 'Windows'
+        id: version-unix
+        run: |
+          VERSION=$(grep -m1 'version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Get version from pyproject.toml (Windows)
+        if: runner.os == 'Windows'
+        id: version-windows
+        shell: pwsh
+        run: |
+          $content = Get-Content pyproject.toml
+          $version = ($content | Select-String -Pattern 'version = "([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          echo "VERSION=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Set version output
+        id: version
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            echo "VERSION=${{ steps.version-windows.outputs.VERSION }}" >> $GITHUB_OUTPUT
+          else
+            echo "VERSION=${{ steps.version-unix.outputs.VERSION }}" >> $GITHUB_OUTPUT
+          fi
+
+      # ========== Linux-specific setup ==========
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgl1-mesa-dev \
+            libxcb-xinerama0 \
+            libxcb-cursor0 \
+            libxkbcommon-x11-0 \
+            libegl1 \
+            fuse \
+            imagemagick
+
+      # ========== Common Python setup ==========
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install .
+
+      # ========== Build with PyInstaller ==========
+      - name: Build with PyInstaller (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          pyinstaller .github/scripts/linux/tractedit.spec --noconfirm
+
+      - name: Build with PyInstaller (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          pyinstaller .github/scripts/macos/tractedit.spec --noconfirm
+
+      - name: Build with PyInstaller (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          pyinstaller .github/scripts/windows/tractedit.spec --noconfirm
+
+      # ========== macOS DMG ==========
+      - name: Create DMG
+        if: matrix.target == 'dmg'
+        run: |
+          brew install create-dmg
+          
+          create-dmg \
+            --volname "TractEdit" \
+            --window-size 600 400 \
+            --icon-size 100 \
+            --text-size 14 \
+            --icon "TractEdit.app" 150 190 \
+            --app-drop-link 450 190 \
+            "TractEdit-${{ steps.version.outputs.VERSION }}-macos-arm64.dmg" \
+            "dist/TractEdit.app"
+
+      # ========== Linux AppImage ==========
+      - name: Download appimagetool
+        if: matrix.target == 'appimage'
+        run: |
+          wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool-x86_64.AppImage
+          sudo mv appimagetool-x86_64.AppImage /usr/local/bin/appimagetool
+
+      - name: Build AppImage
+        if: matrix.target == 'appimage'
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          APPDIR="build/TractEdit.AppDir"
+          
+          # Create AppDir structure
+          rm -rf "$APPDIR"
+          mkdir -p "$APPDIR/usr/bin"
+          mkdir -p "$APPDIR/usr/share/applications"
+          mkdir -p "$APPDIR/usr/share/icons/hicolor/256x256/apps"
+          mkdir -p "$APPDIR/usr/share/icons/hicolor/128x128/apps"
+          mkdir -p "$APPDIR/usr/share/icons/hicolor/64x64/apps"
+          mkdir -p "$APPDIR/usr/share/icons/hicolor/48x48/apps"
+          mkdir -p "$APPDIR/usr/share/metainfo"
+          
+          # Copy PyInstaller output
+          cp -r "dist/tractedit/"* "$APPDIR/usr/bin/"
+          
+          # Copy desktop file and appdata
+          cp ".github/scripts/linux/tractedit.desktop" "$APPDIR/usr/share/applications/"
+          cp ".github/scripts/linux/tractedit.desktop" "$APPDIR/"
+          cp ".github/scripts/linux/io.github.tractedit.appdata.xml" "$APPDIR/usr/share/metainfo/"
+          
+          # Copy and resize icons
+          cp "tractedit_pkg/assets/tractedit.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/tractedit.png"
+          convert "tractedit_pkg/assets/tractedit.png" -resize 128x128 "$APPDIR/usr/share/icons/hicolor/128x128/apps/tractedit.png"
+          convert "tractedit_pkg/assets/tractedit.png" -resize 64x64 "$APPDIR/usr/share/icons/hicolor/64x64/apps/tractedit.png"
+          convert "tractedit_pkg/assets/tractedit.png" -resize 48x48 "$APPDIR/usr/share/icons/hicolor/48x48/apps/tractedit.png"
+          
+          # Icon in AppDir root
+          cp "tractedit_pkg/assets/tractedit.png" "$APPDIR/tractedit.png"
+          ln -sf tractedit.png "$APPDIR/.DirIcon"
+          
+          # Create AppRun script
+          cat > "$APPDIR/AppRun" << 'APPRUN_EOF'
+          #!/bin/bash
+          SELF=$(readlink -f "$0")
+          HERE=${SELF%/*}
+          export PATH="${HERE}/usr/bin:${PATH}"
+          export LD_LIBRARY_PATH="${HERE}/usr/bin:${LD_LIBRARY_PATH}"
+          export GIO_LAUNCHED_DESKTOP_FILE="${HERE}/tractedit.desktop"
+          export GIO_LAUNCHED_DESKTOP_FILE_PID=$$
+          export XDG_DATA_DIRS="${HERE}/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+          export RESOURCE_NAME=tractedit
+          
+          is_ubuntu_wayland() {
+              if [ -f /etc/os-release ]; then
+                  . /etc/os-release
+                  if [[ "$ID" == "ubuntu" ]] || [[ "$ID_LIKE" == *"ubuntu"* ]]; then
+                      if [ -n "$WAYLAND_DISPLAY" ] || [ "$XDG_SESSION_TYPE" = "wayland" ]; then
+                          return 0
+                      fi
+                  fi
+              fi
+              return 1
+          }
+          
+          if is_ubuntu_wayland; then
+              export QT_QPA_PLATFORM=xcb
+              exec "${HERE}/usr/bin/tractedit" "$@"
+          fi
+          
+          "${HERE}/usr/bin/tractedit" "$@" 2>/dev/null
+          EXIT_CODE=$?
+          
+          if [ $EXIT_CODE -ne 0 ]; then
+              if [ -n "$WAYLAND_DISPLAY" ] || [ "$XDG_SESSION_TYPE" = "wayland" ]; then
+                  echo "Note: Falling back to XCB platform for Wayland compatibility..."
+                  export QT_QPA_PLATFORM=xcb
+                  exec "${HERE}/usr/bin/tractedit" "$@"
+              else
+                  exit $EXIT_CODE
+              fi
+          fi
+          APPRUN_EOF
+          chmod +x "$APPDIR/AppRun"
+          
+          # Build AppImage
+          cd build
+          ARCH=x86_64 appimagetool "TractEdit.AppDir" "../dist/TractEdit-$VERSION-x86_64.AppImage"
+
+      # ========== Linux DEB ==========
+      - name: Build DEB package
+        if: matrix.target == 'deb'
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          PACKAGE_NAME="TractEdit"
+          DEB_DIR="build/${PACKAGE_NAME}_${VERSION}_amd64"
+          
+          # Create Debian package structure
+          rm -rf "$DEB_DIR"
+          mkdir -p "$DEB_DIR/DEBIAN"
+          mkdir -p "$DEB_DIR/usr/bin"
+          mkdir -p "$DEB_DIR/opt/tractedit"
+          mkdir -p "$DEB_DIR/usr/share/applications"
+          mkdir -p "$DEB_DIR/usr/share/icons/hicolor/256x256/apps"
+          mkdir -p "$DEB_DIR/usr/share/icons/hicolor/128x128/apps"
+          mkdir -p "$DEB_DIR/usr/share/icons/hicolor/64x64/apps"
+          mkdir -p "$DEB_DIR/usr/share/icons/hicolor/48x48/apps"
+          
+          # Copy application files to /opt
+          cp -r "dist/tractedit/"* "$DEB_DIR/opt/tractedit/"
+          
+          # Create launcher script in /usr/bin
+          cat > "$DEB_DIR/usr/bin/tractedit" << 'LAUNCHER_EOF'
+          #!/bin/bash
+          
+          is_ubuntu_wayland() {
+              if [ -f /etc/os-release ]; then
+                  . /etc/os-release
+                  if [[ "$ID" == "ubuntu" ]] || [[ "$ID_LIKE" == *"ubuntu"* ]]; then
+                      if [ -n "$WAYLAND_DISPLAY" ] || [ "$XDG_SESSION_TYPE" = "wayland" ]; then
+                          return 0
+                      fi
+                  fi
+              fi
+              return 1
+          }
+          
+          if is_ubuntu_wayland; then
+              export QT_QPA_PLATFORM=xcb
+              exec /opt/tractedit/tractedit "$@"
+          fi
+          
+          /opt/tractedit/tractedit "$@" 2>/dev/null
+          EXIT_CODE=$?
+          
+          if [ $EXIT_CODE -ne 0 ]; then
+              if [ -n "$WAYLAND_DISPLAY" ] || [ "$XDG_SESSION_TYPE" = "wayland" ]; then
+                  export QT_QPA_PLATFORM=xcb
+                  exec /opt/tractedit/tractedit "$@"
+              else
+                  exit $EXIT_CODE
+              fi
+          fi
+          LAUNCHER_EOF
+          chmod +x "$DEB_DIR/usr/bin/tractedit"
+          
+          # Copy desktop file
+          cp ".github/scripts/linux/tractedit.desktop" "$DEB_DIR/usr/share/applications/"
+          
+          # Copy and resize icons
+          cp "tractedit_pkg/assets/tractedit.png" "$DEB_DIR/usr/share/icons/hicolor/256x256/apps/"
+          convert "tractedit_pkg/assets/tractedit.png" -resize 128x128 "$DEB_DIR/usr/share/icons/hicolor/128x128/apps/tractedit.png"
+          convert "tractedit_pkg/assets/tractedit.png" -resize 64x64 "$DEB_DIR/usr/share/icons/hicolor/64x64/apps/tractedit.png"
+          convert "tractedit_pkg/assets/tractedit.png" -resize 48x48 "$DEB_DIR/usr/share/icons/hicolor/48x48/apps/tractedit.png"
+          
+          # Create DEBIAN control file
+          cat > "$DEB_DIR/DEBIAN/control" << CONTROL_EOF
+          Package: tractedit
+          Version: $VERSION
+          Section: science
+          Priority: optional
+          Architecture: amd64
+          Maintainer: Marco Tagliaferri <marco.tagliaferri@unitn.it>
+          Description: Interactive tractography bundle editor
+           TractEdit is a Python-based graphical interface for interactively
+           viewing, selecting, and editing tractography bundles in .trk, .tck
+           and .trx formats.
+          Homepage: https://github.com/marcotag93/TractEdit
+          CONTROL_EOF
+          
+          # Create postinst script
+          cat > "$DEB_DIR/DEBIAN/postinst" << 'POSTINST_EOF'
+          #!/bin/bash
+          if [ -x /usr/bin/update-icon-caches ]; then
+              /usr/bin/update-icon-caches /usr/share/icons/hicolor || true
+          fi
+          if [ -x /usr/bin/update-desktop-database ]; then
+              /usr/bin/update-desktop-database /usr/share/applications || true
+          fi
+          POSTINST_EOF
+          chmod +x "$DEB_DIR/DEBIAN/postinst"
+          
+          # Build .deb package
+          cd build
+          dpkg-deb --build --root-owner-group "${PACKAGE_NAME}_${VERSION}_amd64"
+          mv "${PACKAGE_NAME}_${VERSION}_amd64.deb" "../dist/"
+
+      # ========== Upload artifacts ==========
+      - name: Upload DMG artifact
+        if: matrix.target == 'dmg'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: TractEdit-*.dmg
+          retention-days: 30
+
+      - name: Upload AppImage artifact
+        if: matrix.target == 'appimage'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/TractEdit-*.AppImage
+          retention-days: 30
+
+      - name: Upload DEB artifact
+        if: matrix.target == 'deb'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/TractEdit_*.deb
+          retention-days: 30
+
+      - name: Upload Windows artifact
+        if: matrix.target == 'exe'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/TractEdit/
+          retention-days: 30
+
+      # ========== Upload to Release ==========
+      - name: Upload DMG to Release
+        if: startsWith(github.ref, 'refs/tags/') && matrix.target == 'dmg'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: TractEdit-*.dmg
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload AppImage to Release
+        if: startsWith(github.ref, 'refs/tags/') && matrix.target == 'appimage'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/TractEdit-*.AppImage
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload DEB to Release
+        if: startsWith(github.ref, 'refs/tags/') && matrix.target == 'deb'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/TractEdit_*.deb
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Windows ZIP
+        if: matrix.target == 'exe'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\TractEdit -DestinationPath "TractEdit-${{ steps.version.outputs.VERSION }}-windows-x64.zip"
+
+      - name: Upload Windows ZIP to Release
+        if: startsWith(github.ref, 'refs/tags/') && matrix.target == 'exe'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: TractEdit-*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

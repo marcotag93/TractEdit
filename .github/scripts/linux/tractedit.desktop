@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=TractEdit
+Comment=Interactive tractography bundle editor
+Exec=tractedit %f
+Icon=tractedit
+Terminal=false
+Type=Application
+Categories=Science;Education;Graphics;
+MimeType=application/x-trk;application/x-tck;application/x-trx;
+StartupWMClass=tractedit
