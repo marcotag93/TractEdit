@@ -7,11 +7,20 @@ Provides navigation, drawing, and zoom functionality for the axial,
 coronal, and sagittal slice views.
 """
 
+# ============================================================================
+# Imports
+# ============================================================================
+
 from typing import TYPE_CHECKING
 import vtk
 
 if TYPE_CHECKING:
     from .vtk_panel import VTKPanel
+
+
+# ============================================================================
+# Custom Interactor Style Class
+# ============================================================================
 
 
 class CustomInteractorStyle2D(vtk.vtkInteractorStyleImage):
@@ -118,6 +127,8 @@ class CustomInteractorStyle2D(vtk.vtkInteractorStyleImage):
                 self._adjust_preview_radius(0.5, view_type)
             else:
                 super().OnMouseWheelForward()
+                # Update scale bar after zoom
+                self._update_scale_bar_for_interactor(interactor)
         else:
             super().OnMouseWheelForward()
 
@@ -138,8 +149,24 @@ class CustomInteractorStyle2D(vtk.vtkInteractorStyleImage):
                 self._adjust_preview_radius(-0.5, view_type)
             else:
                 super().OnMouseWheelBackward()
+                # Update scale bar after zoom
+                self._update_scale_bar_for_interactor(interactor)
         else:
             super().OnMouseWheelBackward()
+
+    def _update_scale_bar_for_interactor(self, interactor) -> None:
+        """Update scale bar for the view associated with this interactor."""
+        if not self.vtk_panel:
+            return
+        if not self.vtk_panel.scale_bar_manager.is_initialized():
+            return
+
+        if interactor == self.vtk_panel.axial_interactor:
+            self.vtk_panel.scale_bar_manager.update_view("axial")
+        elif interactor == self.vtk_panel.coronal_interactor:
+            self.vtk_panel.scale_bar_manager.update_view("coronal")
+        elif interactor == self.vtk_panel.sagittal_interactor:
+            self.vtk_panel.scale_bar_manager.update_view("sagittal")
 
     def _adjust_preview_radius(self, delta: float, view_type: str) -> None:
         """
@@ -172,7 +199,7 @@ class CustomInteractorStyle2D(vtk.vtkInteractorStyleImage):
         center_3d = roi_params["center"].copy()
         stored_view_type = roi_params.get("view_type", "axial")
 
-        # Un-flip X for display
+        # Undo radiological X-flip for 2D preview display (stored center is in 3D world coords)
         center_display = center_3d.copy()
         if stored_view_type in ["axial", "coronal"]:
             center_display[0] = -center_display[0]

@@ -10,6 +10,10 @@ Handles ROI-related operations including:
 - ROI actions (rename, color change, save, remove)
 """
 
+# ============================================================================
+# Imports
+# ============================================================================
+
 from __future__ import annotations
 
 import logging
@@ -33,7 +37,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@njit(nogil=True)
+# ============================================================================
+# Numba Optimized Functions
+# ============================================================================
+
+
+@njit(nogil=True, cache=True)
 def _check_streamline_roi_intersection(
     streamline: np.ndarray,
     R: np.ndarray,
@@ -95,6 +104,11 @@ def _check_streamline_roi_intersection(
                 return True
 
     return False
+
+
+# ============================================================================
+# ROI Manager Class
+# ============================================================================
 
 
 class ROIManager:
@@ -324,41 +338,55 @@ class ROIManager:
                 set(range(len(mw.tractogram_data))) if mw.tractogram_data else set()
             )
 
-        # Start with manual state
-        final_indices = mw.manual_visible_indices.copy()
-
-        # ========== ROI FILTERS ==========
-        # Apply ROI Includes
+        # Collect active filters first to avoid unnecessary work
         active_includes = [p for p, s in mw.roi_states.items() if s["include"]]
-        for p in active_includes:
-            roi_indices = mw.roi_intersection_cache.get(p, set())
-            final_indices.intersection_update(roi_indices)
-
-        # Apply ROI Excludes
         active_excludes = [p for p, s in mw.roi_states.items() if s["exclude"]]
-        for p in active_excludes:
-            excl = mw.roi_intersection_cache.get(p, set())
-            final_indices.difference_update(excl)
 
-        # ========== PARCELLATION REGION FILTERS ==========
+        # Collect parcellation filters
         parc_states = getattr(mw, "parcellation_region_states", {})
         parc_cache = getattr(mw, "parcellation_region_intersection_cache", {})
-
-        # Apply Parcellation Region Includes (cumulative - must pass through ALL)
         parc_includes = [l for l, s in parc_states.items() if s.get("include")]
-        for label in parc_includes:
-            region_indices = parc_cache.get(label, set())
-            final_indices.intersection_update(region_indices)
-
-        # Apply Parcellation Region Excludes
         parc_excludes = [l for l, s in parc_states.items() if s.get("exclude")]
-        for label in parc_excludes:
-            excl = parc_cache.get(label, set())
-            final_indices.difference_update(excl)
+
+        # OPTIMIZATION: Only copy if we have filters to apply
+        has_filters = (
+            active_includes or active_excludes or parc_includes or parc_excludes
+        )
+
+        if has_filters:
+            # Copy only when modification is needed
+            final_indices = mw.manual_visible_indices.copy()
+
+            # Apply ROI Includes
+            for p in active_includes:
+                roi_indices = mw.roi_intersection_cache.get(p, set())
+                final_indices.intersection_update(roi_indices)
+
+            # Apply ROI Excludes
+            for p in active_excludes:
+                excl = mw.roi_intersection_cache.get(p, set())
+                final_indices.difference_update(excl)
+
+            # Apply Parcellation Region Includes
+            for label in parc_includes:
+                region_indices = parc_cache.get(label, set())
+                final_indices.intersection_update(region_indices)
+
+            # Apply Parcellation Region Excludes
+            for label in parc_excludes:
+                excl = parc_cache.get(label, set())
+                final_indices.difference_update(excl)
+        else:
+            # No filters active, use manual state directly (no copy needed)
+            final_indices = mw.manual_visible_indices
 
         mw.visible_indices = final_indices
 
-        # Handle empty result - show warning but allow recovery ##TODO - think this might go, it's not necessary anymore
+        # Invalidate visible array cache since visibility changed
+        if mw.vtk_panel and hasattr(mw.vtk_panel, "selection_manager"):
+            mw.vtk_panel.selection_manager.invalidate_visible_cache()
+
+        # Handle empty result - show warning but allow recovery
         if not final_indices and mw.tractogram_data:
             logger.warning(
                 "All streamlines filtered out. Remove filters to restore visibility."
@@ -513,6 +541,14 @@ class ROIManager:
         if path not in mw.roi_layers:
             return
 
+        # Check if this ROI had an active filter before removal
+        had_active_filter = False
+        if path in mw.roi_states:
+            state = mw.roi_states[path]
+            had_active_filter = state.get("include", False) or state.get(
+                "exclude", False
+            )
+
         # Remove from VTK
         if mw.vtk_panel:
             mw.vtk_panel.remove_roi_layer(path)
@@ -532,8 +568,50 @@ class ROIManager:
         if path in mw.roi_intersection_cache:
             del mw.roi_intersection_cache[path]
 
+        # Check if we need to reset drawing modes
+        was_current_drawing_roi = mw.current_drawing_roi == path
+
         if mw.current_drawing_roi == path:
             mw.current_drawing_roi = None
+
+        # Reset all drawing modes if:
+        # 1. No ROIs left, OR
+        # 2. The current drawing ROI was removed and any drawing mode is active
+        # This fixes the crosshair navigation bug on Windows
+        should_reset_drawing = False
+        if not mw.roi_layers:
+            should_reset_drawing = True
+        elif was_current_drawing_roi:
+            # Check if any drawing mode is active
+            is_any_mode_active = (
+                getattr(mw, "is_drawing_mode", False)
+                or getattr(mw, "is_eraser_mode", False)
+                or getattr(mw, "is_sphere_mode", False)
+                or getattr(mw, "is_rectangle_mode", False)
+            )
+            if is_any_mode_active:
+                should_reset_drawing = True
+
+        if should_reset_drawing and hasattr(mw, "drawing_modes_manager"):
+            mw.drawing_modes_manager.reset_all_drawing_modes()
+
+        # Auto-enable skip toggle if ROI had active filter and skip is currently off
+        # This restores rendering performance after filter removal
+        if had_active_filter:
+            # Check if no other active filters remain
+            remaining_includes = [
+                p for p, s in mw.roi_states.items() if s.get("include")
+            ]
+            remaining_excludes = [
+                p for p, s in mw.roi_states.items() if s.get("exclude")
+            ]
+
+            if not remaining_includes and not remaining_excludes:
+                # No more ROI filters - check skip state
+                if hasattr(mw, "skip_checkbox") and not mw.skip_checkbox.isChecked():
+                    # Re-enable skip with auto-calculated level
+                    if hasattr(mw, "_auto_calculate_skip_level"):
+                        mw._auto_calculate_skip_level()
 
         # Refresh
         self.apply_logic_filters()

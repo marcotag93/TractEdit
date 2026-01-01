@@ -7,8 +7,17 @@ Provides helper functions for converting between voxel indices and
 world (RASmm) coordinates using affine transformation matrices.
 """
 
+# ============================================================================
+# Imports
+# ============================================================================
+
 from typing import List, Optional
 import numpy as np
+
+
+# ============================================================================
+# Coordinate Transformation Functions
+# ============================================================================
 
 
 def voxel_to_world(vox_coord: List[float], affine: np.ndarray) -> np.ndarray:

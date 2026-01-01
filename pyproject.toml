@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tractedit"
-version = "3.0.1"
+version = "3.2.0"
 authors = [
     { name = "Marco Tagliaferri", email = "marco.tagliaferri@unitn.it" },
     { name = "Marco Tagliaferri", email = "marco.tagliaferri93@gmail.com" },
@@ -12,12 +12,9 @@ authors = [
 description = "A Python-based graphical interface for interactively viewing, selecting, and editing tractography bundles in .trk, .tck and .trx formats."
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.8, <3.12"
+requires-python = ">=3.11,<3.12"
 classifiers = [
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
@@ -27,17 +24,32 @@ classifiers = [
     "Environment :: X11 Applications :: Qt",
 ]
 
-# Dependencies
+# Runtime dependencies - minimum tested versions (PEP 440 compliant)
+# Officially supports Python 3.11 only
 dependencies = [
-    "PyQt6==6.7.0",
-    "vtk==9.2.6",
-    "fury==0.12.0",
-    "nibabel==5.2.1",
-    "numpy==1.26.4",
-    "pytz==2024.1",
-    "trx-python==0.3",
-    "numba>=0.58",
+    "PyQt6>=6.7.0",
+    "vtk>=9.2.6",
+    "fury>=0.12.0",
+    "nibabel>=5.0.0",
+    "numpy>=1.24.0",
+    "numba>=0.58.0",
     "scipy>=1.10.0",
+    "pytz>=2024.1",
+    "trx-python>=0.3",
+]
+
+# Optional dependency groups
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "pytest-xvfb>=3.0",
+    "tox>=4.0",
+]
+dev = [
+    "tractedit[test]",
+    "black>=23.0",
+    "flake8>=6.0",
 ]
 
 # Command-line script 'tractedit'

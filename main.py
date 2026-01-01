@@ -4,8 +4,13 @@
 Tractedit GUI - Main Application Runner
 """
 
+# ============================================================================
+# Imports
+# ============================================================================
+
 import os
 import sys
+
 if sys.platform == "darwin":  # macOS
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -27,6 +32,11 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Splash Screen
+# ============================================================================
 
 
 class LoadingSplash(QSplashScreen):
@@ -83,6 +93,11 @@ class LoadingSplash(QSplashScreen):
         painter.setPen(self.text_color)
         painter.setFont(QFont("Arial", 10, QFont.Weight.Bold))
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, self.message)
+
+
+# ============================================================================
+# Headless Operations
+# ============================================================================
 
 
 def _run_headless_conversion(input_path: str, output_path: str) -> None:
@@ -142,6 +157,11 @@ def _run_headless_conversion(input_path: str, output_path: str) -> None:
         import nibabel as nib
         from nibabel.streamlines import Field
         import trx.trx_file_memmap as tbx
+
+        # Suppress verbose INFO logs from trx library
+        root_logger = logging.getLogger()
+        original_level = root_logger.level
+        root_logger.setLevel(logging.WARNING)
 
         # Load input file
         streamlines = None
@@ -229,28 +249,36 @@ def _run_headless_conversion(input_path: str, output_path: str) -> None:
             nib.streamlines.save(tck_file, output_path)
 
         elif output_ext == ".trx":
-            # Use trx-python to save
-            from nibabel.streamlines import ArraySequence
-
-            sft_streamlines = ArraySequence(streamlines)
-
+            # TRX requires a reference NIfTI image that defines the space
             # Get reference dimensions
             if header and "dimensions" in header:
-                dimensions = np.array(header["dimensions"])
+                dimensions = tuple(np.array(header["dimensions"]).astype(int))
             else:
                 all_pts = np.concatenate(streamlines)
-                dimensions = np.ceil(np.max(all_pts, axis=0) + 1).astype(int)
+                dimensions = tuple(np.ceil(np.max(all_pts, axis=0) + 1).astype(int))
 
             voxel_sizes = np.abs(np.diag(affine)[:3])
             if np.all(voxel_sizes == 0):
                 voxel_sizes = np.array([1.0, 1.0, 1.0])
 
-            trx_header = {
-                "DIMENSIONS": dimensions,
-                "VOXEL_TO_RASMM": affine,
-                "VOXEL_SIZES": voxel_sizes,
-            }
-            tbx.save(sft_streamlines, output_path, header=trx_header)
+            # Create a dummy NIfTI reference image
+            nifti_header = nib.Nifti1Header()
+            nifti_header.set_data_shape(dimensions)
+            nifti_header.set_zooms(voxel_sizes)
+            nifti_header.set_qform(affine)
+            nifti_header.set_sform(affine)
+
+            dummy_data = np.empty(dimensions, dtype=np.int8)
+            reference_img = nib.Nifti1Image(dummy_data, affine, header=nifti_header)
+
+            # Create tractogram and TRX object
+            tractogram = nib.streamlines.Tractogram(
+                streamlines=streamlines, affine_to_rasmm=np.eye(4)
+            )
+            trx_obj = tbx.TrxFile.from_lazy_tractogram(tractogram, reference_img)
+
+            # Save TRX file (no header argument)
+            tbx.save(trx_obj, output_path)
 
         elif output_ext in (".vtk", ".vtp"):
             import vtk
@@ -283,10 +311,18 @@ def _run_headless_conversion(input_path: str, output_path: str) -> None:
             writer.SetInputData(polydata)
             writer.Write()
 
+        # Restore original logging level
+        root_logger.setLevel(original_level)
+
         print(f"Successfully saved: {output_path}")
         logger.info(f"Conversion complete: {output_path}")
 
     except Exception as e:
+        # Restore logging level on error
+        try:
+            root_logger.setLevel(original_level)
+        except NameError:
+            pass
         logger.error(f"Conversion failed: {e}", exc_info=True)
         print(f"Error: Conversion failed: {e}", file=sys.stderr)
         sys.exit(1)
@@ -484,6 +520,11 @@ def _run_headless_density_map(
         sys.exit(1)
 
 
+# ============================================================================
+# Main Entry Point
+# ============================================================================
+
+
 def main() -> None:
     """
     Main function to start the tractedit application.
@@ -544,7 +585,7 @@ def main() -> None:
         _run_headless_density_map(args.bundle, args.density_map, args.anat)
         sys.exit(0)
 
-    # Windows App ID
+    # Windows: Set app ID for taskbar grouping
     myappid = "tractedit.app.gui"
     if sys.platform == "win32":
         try:
@@ -552,17 +593,25 @@ def main() -> None:
         except Exception as e:
             logger.warning(f"Warning: Could not set AppUserModelID: {e}")
 
-    # Start Application (Instant)
+    # Linux: Set argv[0] for X11 WM_CLASS matching
+    if sys.platform.startswith("linux"):
+        if sys.argv:
+            sys.argv[0] = "tractedit"
+
     app: QApplication = QApplication(sys.argv)
 
-    # Start SplashScreen (Before importing heavy libraries)
+    # Linux: Set app identifiers for taskbar icon matching
+    if sys.platform.startswith("linux"):
+        app.setDesktopFileName("tractedit")
+        app.setApplicationName("tractedit")
+        app.setApplicationDisplayName("TractEdit")
+
+    # Splash screen and app icon
     splash = None
     try:
-        # Load larger logo for splash if available, or standard logo
         logo_ref = importlib.resources.files("tractedit_pkg.assets").joinpath(
             "logo.png"
         )
-
         with importlib.resources.as_file(logo_ref) as logo_path:
             if logo_path.is_file():
                 pixmap = QPixmap(str(logo_path))
@@ -572,13 +621,27 @@ def main() -> None:
                     Qt.AspectRatioMode.KeepAspectRatio,
                     Qt.TransformationMode.SmoothTransformation,
                 )
-
                 splash = LoadingSplash(pixmap)
                 splash.show()
 
-                # Set App Icon
-                app_icon = QIcon(str(logo_path))
+        # Load app icon for window/taskbar
+        icon_ref = importlib.resources.files("tractedit_pkg.assets").joinpath(
+            "tractedit.png"
+        )
+        with importlib.resources.as_file(icon_ref) as icon_path:
+            if icon_path.is_file():
+                app_icon = QIcon()
+                icon_pixmap = QPixmap(str(icon_path))
+                for size in [16, 24, 32, 48, 64, 128, 256]:
+                    scaled = icon_pixmap.scaled(
+                        size,
+                        size,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                    app_icon.addPixmap(scaled)
                 app.setWindowIcon(app_icon)
+                logger.info(f"Loaded app icon from: {icon_path}")
 
     except Exception as e:
         logger.warning(f"Could not load splash screen assets: {e}")
@@ -608,6 +671,46 @@ def main() -> None:
         logger.error(f"Error importing necessary modules: {e}")
         sys.exit(1)
 
+    # Pre-compile Numba functions (while splash is visible)
+    if splash:
+        splash.set_progress(50, "Optimizing performance...")
+
+    try:
+        from tractedit_pkg.file_io import warmup_numba_functions
+
+        warmup_numba_functions()
+    except Exception as e:
+        logger.warning(f"Numba warmup failed (non-critical): {e}")
+
+    # Pre-import heavy libraries to speed up first bundle load
+    if splash:
+        splash.set_progress(60, "Pre-loading streamline libraries...")
+
+    try:
+        import nibabel.streamlines
+        import nibabel.streamlines.array_sequence
+        import nibabel.streamlines.tractogram
+        import nibabel.streamlines.trk
+        import nibabel.streamlines.tck
+        import trx.trx_file_memmap
+
+        logger.debug("Streamline libraries pre-loaded")
+    except Exception as e:
+        logger.warning(f"Library pre-load failed (non-critical): {e}")
+
+    # Warmup selection numba functions (sphere/box selection)
+    if splash:
+        splash.set_progress(65, "Optimizing selection tools...")
+
+    try:
+        from tractedit_pkg.visualization.selection import (
+            warmup_selection_numba_functions,
+        )
+
+        warmup_selection_numba_functions()
+    except Exception as e:
+        logger.warning(f"Selection warmup failed (non-critical): {e}")
+
     # Main Window
     if splash:
         splash.set_progress(70, "Building User Interface...")
@@ -617,8 +720,19 @@ def main() -> None:
     if splash:
         splash.set_progress(90, "Starting...")
 
-    # Launch
+    # Launch - cross-platform window maximization
+    screen = app.primaryScreen()
+    if screen:
+        available_geometry = screen.availableGeometry()
+        main_window.setGeometry(available_geometry)
+
     main_window.show()
+
+    # Delay maximize to ensure window manager has fully initialized the window
+    def ensure_maximized():
+        main_window.showMaximized()
+
+    QTimer.singleShot(50, ensure_maximized)
 
     if splash:
         splash.finish(main_window)

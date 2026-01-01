@@ -1,5 +1,14 @@
 # tractedit_pkg/odf_utils.py
 
+"""
+ODF (Orientation Distribution Function) utilities for spherical harmonics
+visualization and streamline-based mask generation.
+"""
+
+# ============================================================================
+# Imports
+# ============================================================================
+
 import numpy as np
 import math
 import vtk
@@ -8,11 +17,18 @@ from scipy.special import sph_harm
 from scipy.ndimage import binary_dilation
 import nibabel as nib
 
+
+# ============================================================================
+# Sphere Geometry
+# ============================================================================
+
+
 class SimpleSphere:
     """A minimal sphere class compatible with FURY actors."""
     def __init__(self, vertices, faces):
         self.vertices = vertices
         self.faces = faces
+
 
 def generate_symmetric_sphere(radius=1.0, subdivisions=3):
     """
@@ -44,6 +60,12 @@ def generate_symmetric_sphere(radius=1.0, subdivisions=3):
     
     return SimpleSphere(vertices, faces)
 
+
+# ============================================================================
+# Spherical Harmonics
+# ============================================================================
+
+
 def compute_sh_basis(vertices, sh_order, basis_type='tournier07'):
     """
     Computes the Spherical Harmonic basis matrix B.
@@ -57,7 +79,7 @@ def compute_sh_basis(vertices, sh_order, basis_type='tournier07'):
     B = np.zeros((len(vertices), n_coeffs))
     
     idx = 0
-    for l in range(0, sh_order + 1, 2): # Even orders only
+    for l in range(0, sh_order + 1, 2):  # Even orders only
         for m in range(-l, l + 1):
             Y_lm = sph_harm(m, l, azimuth, polar)
             
@@ -73,12 +95,19 @@ def compute_sh_basis(vertices, sh_order, basis_type='tournier07'):
             idx += 1
     return B
 
+
 def calculate_sh_order(n_coeffs):
     """Calculates SH order from number of coefficients."""
     l_max = (math.sqrt(8 * n_coeffs + 1) - 3) / 2
     if not l_max.is_integer():
         raise ValueError(f"Invalid coefficient count ({n_coeffs}).")
     return int(l_max)
+
+
+# ============================================================================
+# Streamline Mask Generation
+# ============================================================================
+
 
 def create_tunnel_mask(streamlines, affine, volume_shape, dilation_iter=1):
     """

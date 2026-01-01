@@ -14,7 +14,7 @@
 
 <p align="center">
   <a href="https://github.com/marcotag93/TractEdit/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"/></a>
-  <img src="https://img.shields.io/badge/python-3.8--3.11-green.svg" alt="Python"/>
+  <img src="https://img.shields.io/badge/python-3.11-green.svg" alt="Python"/>
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey" alt="Platform"/>
 </p>
 
@@ -96,7 +96,7 @@ Load & save streamlines in `.trk`, `.tck`, `.trx`, `.vtk`, `.vtp` formats with w
 
 #### File Support
 - **Load & Save** streamline bundles (`.trk`, `.tck`, `.trx`, `.vtk`, `.vtp`)
-- **Whole-Brain Tractogram Support:** Optimized rendering for large datasets (tested with >2 million streamlines) using stride-based visualization and toggleable "skip"
+- **Whole-Brain Tractogram Support:** Optimized rendering for large datasets (tested with >5 million streamlines) using stride-based visualization and toggleable "skip"
 
 #### Visualization
 - **Multi-View Orthogonal Visualization:** Integrated 3D viewer and three linked 2D orthogonal slice views (Axial, Coronal, Sagittal)
@@ -143,11 +143,15 @@ Load & save streamlines in `.trk`, `.tck`, `.trx`, `.vtk`, `.vtp` formats with w
 - Calculate **Centroid** and **Medoid** (both Numba optimized) of the edited bundle
 
 #### UI & Performance
+- **Theme Support:** Light, Dark, and System theme modes with full UI styling
 - **Streamline Info Display:** File name, streamline count, voxel size, bounding box, etc. with vertical data panel and hover details
 - **Keyboard Shortcuts** for fast interaction (see full list below)
 - **Fast Startup:** Splash screen implementation for immediate feedback and optimized library loading
-- **Modular Architecture:** Refactored codebase with dedicated manager classes for improved maintainability
-- **Performance Optimizations:** Numba JIT compilation for geometric computations, Numpy vectorizations, debounced UI updates, pre-computed bounding boxes for fast selection
+- **Background Loading:** Non-blocking threaded loading for large streamline bundles and anatomical images
+- **Memory-Mapped Images:** Efficient on-demand slice extraction for large anatomical images without loading full volume into RAM
+- **Modular Architecture:** Refactored codebase with dedicated manager classes (ThemeManager, StateManager, SelectionManager, etc.) for improved maintainability
+- **Performance Optimizations:** Numba JIT compilation with parallel batch processing for geometric computations, Numpy vectorizations, debounced UI updates, pre-computed bounding boxes for fast selection
+- **Reliability:** Comprehensive automated test suite (88 tests) ensuring stability of core features
 
 #### 💡 Tips for Large Datasets
 
@@ -176,7 +180,7 @@ cd TractEdit
 ### 2. Install Dependencies
 The project dependencies (including PyQt6, VTK, and Nibabel) are defined in pyproject.toml
 
-- Python 3.8–3.11 (tested)
+- **Python 3.11** (required)
 - [PyQt6](https://pypi.org/project/PyQt6/)
 - [VTK](https://vtk.org/)
 - [FURY](https://fury.gl/)
@@ -186,6 +190,8 @@ The project dependencies (including PyQt6, VTK, and Nibabel) are defined in pypr
 - pytz
 - [trx-python](https://pypi.org/project/trx-python/)
 - Scipy
+
+> **Note:** Python 3.11 is the only officially supported version. Other Python versions may experience compatibility issues with dependency combinations.
   
 Recommend a virtual environment:
 ```bash
@@ -206,11 +212,17 @@ tractedit
 # Load files directly
 tractedit bundle.trk --anat T1w.nii.gz
 
+# Load multiple ROI files at startup
+tractedit bundle.trk --anat T1w.nii.gz --load-roi roi1.nii.gz --load-roi roi2.nii.gz
+
 # Load file creating a spherical ROI at RAS coordinates
 tractedit bundle.trk --anat T1w.nii.gz --roi 10,20,30 --radius 5
 
 # Headless format conversion (no GUI)
 tractedit input.trk --convert-to output.trx
+
+# Headless density map export (TDI)
+tractedit input.trk --density-map output.nii.gz --anat T1w.nii.gz
 
 # Display version and help
 tractedit --version
@@ -231,7 +243,9 @@ Explore `sample_data/` to test TractEdit with example streamline files, anatomic
 No Python setup is required for these versions. Download the latest release for your operating system:
 
 * **Windows:** Use the `.exe` file.
-* **macOS (Apple Silicon):** Use the  `.dmg` file.
+* **macOS (Apple Silicon):** Use the `.dmg` file.
+* **Linux (AppImage):** Use `TractEdit-3.2.0-x86_64.AppImage` — portable, runs on most Linux distributions without installation. Simply make it executable (`chmod +x`) and run.
+* **Linux (Debian/Ubuntu):** Use `TractEdit_3.2.0_amd64.deb` — native package for Debian-based distributions. Install with `sudo dpkg -i TractEdit_3.2.0_amd64.deb`.
 
 ---
 

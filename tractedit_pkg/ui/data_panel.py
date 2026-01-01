@@ -7,6 +7,10 @@ Handles the dockable data panel displaying loaded data items
 (bundles, images, ROIs, scalars) and their interaction handlers.
 """
 
+# ============================================================================
+# Imports
+# ============================================================================
+
 from __future__ import annotations
 
 import logging
@@ -29,6 +33,11 @@ if TYPE_CHECKING:
     from ..main_window import MainWindow
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Data Panel Manager Class
+# ============================================================================
 
 
 class DataPanelManager:
@@ -281,6 +290,10 @@ class DataPanelManager:
                 if label is not None:
                     mw._toggle_parcellation_region(label, is_checked)
 
+            elif item_type == "odf_tunnel":
+                # Toggle ODF tunnel visibility without recomputing
+                mw._toggle_odf_tunnel_visibility(is_checked)
+
         except Exception as e:
             logger.error(f"Error handling item visibility change: {e}", exc_info=True)
         finally:
@@ -386,6 +399,53 @@ class DataPanelManager:
                 lambda: mw._remove_roi_layer_action(roi_path)
             )
             menu.addAction(remove_action)
+
+            menu.exec(mw.data_tree_widget.mapToGlobal(position))
+
+        # Context menu for ODF Tunnel View
+        elif (
+            item_data
+            and isinstance(item_data, dict)
+            and item_data.get("type") == "odf_tunnel"
+        ):
+            menu = QMenu(mw)
+
+            # Remove Tunnel View action
+            remove_tunnel_action = QAction("Remove Tunnel View", mw)
+            remove_tunnel_action.setStatusTip("Remove the ODF tunnel visualization")
+            remove_tunnel_action.triggered.connect(self._remove_odf_tunnel_view)
+            menu.addAction(remove_tunnel_action)
+
+            menu.exec(mw.data_tree_widget.mapToGlobal(position))
+
+        # Context menu for ODF Data (the parent file item)
+        elif (
+            item_data
+            and isinstance(item_data, dict)
+            and item_data.get("type") == "odf_data"
+        ):
+            menu = QMenu(mw)
+
+            # Show ODF Tunnel action (same as View menu)
+            show_tunnel_action = QAction("Show ODF Tunnel", mw)
+            show_tunnel_action.setStatusTip(
+                f"Show ODF glyphs masked by current bundle (< {mw.MAX_ODF_STREAMLINES} fibers)"
+            )
+            show_tunnel_action.setCheckable(True)
+            show_tunnel_action.setChecked(mw.view_odf_tunnel_action.isChecked())
+            show_tunnel_action.setEnabled(mw.view_odf_tunnel_action.isEnabled())
+            show_tunnel_action.triggered.connect(
+                lambda checked: mw.view_odf_tunnel_action.trigger()
+            )
+            menu.addAction(show_tunnel_action)
+
+            menu.addSeparator()
+
+            # Remove ODF Data action
+            remove_odf_action = QAction("Remove ODF Data", mw)
+            remove_odf_action.setStatusTip("Remove ODF data and tunnel visualization")
+            remove_odf_action.triggered.connect(mw._remove_odf_data)
+            menu.addAction(remove_odf_action)
 
             menu.exec(mw.data_tree_widget.mapToGlobal(position))
 
@@ -684,6 +744,37 @@ class DataPanelManager:
             mw.data_tree_widget.blockSignals(False)
 
         mw.vtk_panel.update_status("All region filters cleared")
+
+    def _remove_odf_tunnel_view(self) -> None:
+        """
+        Removes only the ODF tunnel visualization, keeping the ODF data loaded.
+
+        This allows users to remove the tunnel view without losing the ODF data,
+        enabling them to re-enable the tunnel view later from the View menu.
+        """
+        mw = self.mw
+
+        try:
+            # Remove the ODF actor from the scene
+            if mw.vtk_panel:
+                mw.vtk_panel.remove_odf_actor()
+
+            # Reset visibility state
+            mw.odf_tunnel_is_visible = False
+
+            # Sync the menu action state
+            mw.view_odf_tunnel_action.blockSignals(True)
+            mw.view_odf_tunnel_action.setChecked(False)
+            mw.view_odf_tunnel_action.blockSignals(False)
+
+            # Update the data panel
+            mw._update_data_panel_display()
+
+            if mw.vtk_panel:
+                mw.vtk_panel.update_status("ODF Tunnel View removed")
+
+        except Exception as e:
+            logger.error(f"Error removing ODF tunnel view: {e}", exc_info=True)
 
     def update_data_panel_display(self) -> None:
         """

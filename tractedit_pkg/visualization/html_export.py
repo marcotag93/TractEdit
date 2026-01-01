@@ -12,6 +12,10 @@ to a self-contained interactive HTML file using three.js for WebGL rendering.
 Data is subsampled to keep file sizes reasonable for web viewing.
 """
 
+# ============================================================================
+# Imports
+# ============================================================================
+
 import os
 import io
 import json
@@ -26,6 +30,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+# ============================================================================
+# Default Options
+# ============================================================================
+
 # Default export options
 DEFAULT_OPTIONS = {
     "max_streamlines": 1000,  # Maximum streamlines to export
@@ -34,6 +43,11 @@ DEFAULT_OPTIONS = {
     "include_slices": True,  # Include 2D slice images
     "include_rois": True,  # Include ROI visualizations
 }
+
+
+# ============================================================================
+# Export Functions
+# ============================================================================
 
 
 def export_to_html(

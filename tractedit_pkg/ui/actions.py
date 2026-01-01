@@ -6,6 +6,10 @@ Actions manager for TractEdit UI.
 Handles creation of QAction objects, menus, and action state management.
 """
 
+# ============================================================================
+# Imports
+# ============================================================================
+
 from __future__ import annotations
 
 import logging
@@ -20,6 +24,11 @@ if TYPE_CHECKING:
     from ..main_window import MainWindow
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Actions Manager Class
+# ============================================================================
 
 
 class ActionsManager:
@@ -359,6 +368,29 @@ class ActionsManager:
         mw.hide_sphere_action.triggered.connect(mw._hide_sphere)
         mw.hide_sphere_action.setEnabled(True)
 
+        # Settings Menu - Theme Actions
+        mw.theme_light_action = QAction("&Light", mw)
+        mw.theme_light_action.setStatusTip("Use light theme")
+        mw.theme_light_action.setCheckable(True)
+        mw.theme_light_action.triggered.connect(mw._set_theme_light)
+
+        mw.theme_dark_action = QAction("&Dark", mw)
+        mw.theme_dark_action.setStatusTip("Use dark theme")
+        mw.theme_dark_action.setCheckable(True)
+        mw.theme_dark_action.triggered.connect(mw._set_theme_dark)
+
+        mw.theme_system_action = QAction("&System", mw)
+        mw.theme_system_action.setStatusTip("Follow system theme")
+        mw.theme_system_action.setCheckable(True)
+        mw.theme_system_action.triggered.connect(mw._set_theme_system)
+
+        # Create action group for mutual exclusivity
+        mw.theme_action_group = QActionGroup(mw)
+        mw.theme_action_group.addAction(mw.theme_light_action)
+        mw.theme_action_group.addAction(mw.theme_dark_action)
+        mw.theme_action_group.addAction(mw.theme_system_action)
+        mw.theme_action_group.setExclusive(True)
+
         # Help Menu
         mw.about_action = QAction("&About TractEdit...", mw)
         mw.about_action.setStatusTip("Show information about TractEdit")
@@ -440,6 +472,30 @@ class ActionsManager:
         commands_menu.addAction(mw.decrease_radius_action)
         commands_menu.addSeparator()
         commands_menu.addAction(mw.hide_sphere_action)
+
+        # Settings Menu
+        settings_menu = main_bar.addMenu("&Settings")
+
+        # Theme Sub-menu
+        theme_menu = settings_menu.addMenu("&Theme")
+        theme_menu.addAction(mw.theme_light_action)
+        theme_menu.addAction(mw.theme_dark_action)
+        theme_menu.addAction(mw.theme_system_action)
+
+        # Set initial checked state based on current theme
+        if hasattr(mw, "theme_manager"):
+            from .theme_manager import ThemeMode
+
+            current_mode = mw.theme_manager.current_mode
+            if current_mode == ThemeMode.LIGHT:
+                mw.theme_light_action.setChecked(True)
+            elif current_mode == ThemeMode.DARK:
+                mw.theme_dark_action.setChecked(True)
+            else:
+                mw.theme_system_action.setChecked(True)
+        else:
+            # Default to system if theme manager not yet initialized
+            mw.theme_system_action.setChecked(True)
 
         # Help Menu
         help_menu = main_bar.addMenu("&Help")

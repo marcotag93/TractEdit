@@ -10,6 +10,10 @@ Handles application state operations including:
 - Color mode management
 """
 
+# ============================================================================
+# Imports
+# ============================================================================
+
 from __future__ import annotations
 
 import logging
@@ -33,6 +37,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# ============================================================================
+# Action Type
+# ============================================================================
+
+
 class ActionType(Enum):
     """
     Enum defining the types of undoable actions.
@@ -43,6 +52,11 @@ class ActionType(Enum):
 
     STREAMLINE_DELETION = auto()
     ROI_MODIFICATION = auto()
+
+
+# ============================================================================
+# State Manager Class
+# ============================================================================
 
 
 class StateManager:

@@ -8,6 +8,10 @@ and interactions. Uses helper modules for interactor styles, actor creation,
 scene management, and coordinate transformations.
 """
 
+# ============================================================================
+# Imports
+# ============================================================================
+
 import os
 import numpy as np
 import vtk
@@ -32,16 +36,20 @@ from typing import Optional, List, Dict, Any, Tuple, Set
 import nibabel as nib
 from functools import partial
 from vtk.util import numpy_support
-
-# Import from local visualization modules
 from .interactor import CustomInteractorStyle2D
 from .scene_manager import SceneManager
 from .drawing import DrawingManager
 from .selection import SelectionManager
 from .streamlines import StreamlinesManager
+from .scale_bar import ScaleBarManager
 from . import coordinates
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# VTK Panel Class
+# ============================================================================
 
 
 class VTKPanel:
@@ -143,7 +151,7 @@ class VTKPanel:
 
         # Reduce anti-aliasing for better performance (4 samples vs default 8)
         # Trade-off: Slightly jagged edges, but smoother interaction
-        ##TODO - add option menu to allow user to disable it
+        ##TODO - add option menu in Settings to allow user to disable it or change it
         self.render_window.SetMultiSamples(4)
 
         self.interactor: vtk.vtkRenderWindowInteractor = (
@@ -158,7 +166,18 @@ class VTKPanel:
         self.axial_render_window: vtk.vtkRenderWindow = (
             self.axial_vtk_widget.GetRenderWindow()
         )
+        self.axial_render_window.SetNumberOfLayers(2)  # Enable multiple layers
         self.axial_render_window.AddRenderer(self.axial_scene)
+        self.axial_scene.SetLayer(0)  # Base layer for slice
+
+        # Create overlay renderer for axial scale bar (renders on top)
+        self.axial_overlay_renderer = vtk.vtkRenderer()
+        self.axial_overlay_renderer.SetLayer(1)  # Overlay layer
+        self.axial_overlay_renderer.InteractiveOff()
+        self.axial_overlay_renderer.PreserveColorBufferOn()
+        self.axial_overlay_renderer.SetActiveCamera(self.axial_scene.GetActiveCamera())
+        self.axial_render_window.AddRenderer(self.axial_overlay_renderer)
+
         self.axial_interactor: vtk.vtkRenderWindowInteractor = (
             self.axial_render_window.GetInteractor()
         )
@@ -171,7 +190,20 @@ class VTKPanel:
         self.coronal_render_window: vtk.vtkRenderWindow = (
             self.coronal_vtk_widget.GetRenderWindow()
         )
+        self.coronal_render_window.SetNumberOfLayers(2)  # Enable multiple layers
         self.coronal_render_window.AddRenderer(self.coronal_scene)
+        self.coronal_scene.SetLayer(0)  # Base layer for slice
+
+        # Create overlay renderer for coronal scale bar (renders on top)
+        self.coronal_overlay_renderer = vtk.vtkRenderer()
+        self.coronal_overlay_renderer.SetLayer(1)  # Overlay layer
+        self.coronal_overlay_renderer.InteractiveOff()
+        self.coronal_overlay_renderer.PreserveColorBufferOn()
+        self.coronal_overlay_renderer.SetActiveCamera(
+            self.coronal_scene.GetActiveCamera()
+        )
+        self.coronal_render_window.AddRenderer(self.coronal_overlay_renderer)
+
         self.coronal_interactor: vtk.vtkRenderWindowInteractor = (
             self.coronal_render_window.GetInteractor()
         )
@@ -188,11 +220,14 @@ class VTKPanel:
         self.sagittal_render_window.AddRenderer(self.sagittal_scene)
         self.sagittal_scene.SetLayer(0)  # Base layer for slice
 
-        # Create overlay renderer for sagittal crosshair (renders on top)
+        # Create overlay renderer for sagittal crosshair and scale bar (renders on top)
         self.sagittal_overlay_renderer = vtk.vtkRenderer()
         self.sagittal_overlay_renderer.SetLayer(1)  # Overlay layer
         self.sagittal_overlay_renderer.InteractiveOff()  # Don't intercept mouse events
         self.sagittal_overlay_renderer.PreserveColorBufferOn()  # Keep background from layer 0
+        self.sagittal_overlay_renderer.SetActiveCamera(
+            self.sagittal_scene.GetActiveCamera()
+        )
         self.sagittal_render_window.AddRenderer(self.sagittal_overlay_renderer)
 
         self.sagittal_interactor: vtk.vtkRenderWindowInteractor = (
@@ -274,6 +309,9 @@ class VTKPanel:
         # --- Streamlines Manager (handles streamline visualization) ---
         self.streamlines_manager: StreamlinesManager = StreamlinesManager(self)
 
+        # --- Scale Bar Manager (handles 2D view scale bars) ---
+        self.scale_bar_manager: ScaleBarManager = ScaleBarManager()
+
         # --- Fast Render Mode State ---
         # Reduces rendering quality during mouse interactions for smoother UX
         # VTK DesiredUpdateRate: HIGHER = faster rendering (lower quality)
@@ -311,6 +349,13 @@ class VTKPanel:
         }
         self.image_shape_vox: Optional[Tuple[int, ...]] = None
         self.image_extents: Dict[str, Optional[Tuple[int, int]]] = {
+            "x": None,
+            "y": None,
+            "z": None,
+        }
+        # Full-resolution shape from mmap image (used for 2D slice navigation)
+        self.mmap_image_shape: Optional[Tuple[int, int, int]] = None
+        self.mmap_image_extents: Dict[str, Optional[Tuple[int, int]]] = {
             "x": None,
             "y": None,
             "z": None,
@@ -459,7 +504,7 @@ class VTKPanel:
                 prop.SetInterpolationToFlat()
 
         ## TODO - this might not work well on some configurations (integrated GPUs), or cause visual artifacts.
-        # will be moved to an option menu, allowing user to disable it if needed ##
+        # will be moved to Settings, allowing user to disable it if needed ##
         # Disable antialiasing
         if self.render_window:
             self.render_window.SetMultiSamples(0)
@@ -693,7 +738,6 @@ class VTKPanel:
         old_actors = self.roi_slice_actors.get(key)
 
         # Add new actors (render=False to avoid intermediate frame)
-        # This overwrites self.roi_slice_actors[key] with new actors
         self.add_roi_layer(key, data, affine, render=False)
 
         # Remove old actors
@@ -989,6 +1033,22 @@ class VTKPanel:
         self.image_extents["y"] = (0, shape[1] - 1)
         self.image_extents["z"] = (0, shape[2] - 1)
 
+        # Store full-resolution shape from mmap image if available
+        mmap_img = getattr(self.main_window, 'anatomical_mmap_image', None)
+        if mmap_img is not None:
+            mmap_shape = mmap_img.shape
+            self.mmap_image_shape = mmap_shape
+            self.mmap_image_extents["x"] = (0, mmap_shape[0] - 1)
+            self.mmap_image_extents["y"] = (0, mmap_shape[1] - 1)
+            self.mmap_image_extents["z"] = (0, mmap_shape[2] - 1)
+            logger.info(
+                f"Mmap image available: full-res shape {mmap_shape}, "
+                f"display shape {shape}"
+            )
+        else:
+            self.mmap_image_shape = None
+            self.mmap_image_extents = {"x": None, "y": None, "z": None}
+
         # Initialize or keep current slice indices
         if (
             self.current_slice_indices["x"] is None
@@ -1066,7 +1126,7 @@ class VTKPanel:
             )
             if self.axial_scene:
                 self.axial_scene.add(self.axial_slice_actor_2d)
-                # Apply display correction to match proper orientation
+                # X-flip: Convert FURY's neurological output to radiological display convention
                 self.axial_slice_actor_2d.SetScale(-1, 1, 1)
 
             # Coronal Slice (Y plane)
@@ -1095,7 +1155,7 @@ class VTKPanel:
             )
             if self.coronal_scene:
                 self.coronal_scene.add(self.coronal_slice_actor_2d)
-                # Apply display correction to match proper orientation
+                # X-flip: Convert FURY's neurological output to radiological display convention
                 self.coronal_slice_actor_2d.SetScale(-1, 1, 1)
 
             # Sagittal Slice (X plane)
@@ -1140,6 +1200,20 @@ class VTKPanel:
             self.clear_anatomical_slices()
 
         self._setup_ortho_cameras()
+
+        # Initialize scale bars for 2D views
+        try:
+            self.scale_bar_manager.initialize(
+                axial_renderer=self.axial_overlay_renderer,
+                coronal_renderer=self.coronal_overlay_renderer,
+                sagittal_renderer=self.sagittal_overlay_renderer,
+                axial_camera=self.axial_scene.GetActiveCamera(),
+                coronal_camera=self.coronal_scene.GetActiveCamera(),
+                sagittal_camera=self.sagittal_scene.GetActiveCamera(),
+            )
+            self.scale_bar_manager.update_all()
+        except Exception as e:
+            logger.warning(f"Failed to initialize scale bars: {e}")
 
         # Final render
         self._render_all()
@@ -1197,10 +1271,15 @@ class VTKPanel:
         self.coronal_slice_actor_2d = None
         self.sagittal_slice_actor_2d = None
 
+        # Clear scale bars
+        self.scale_bar_manager.clear()
+
         if reset_state:
             self.current_slice_indices = {"x": None, "y": None, "z": None}
             self.image_shape_vox = None
             self.image_extents = {"x": None, "y": None, "z": None}
+            self.mmap_image_shape = None
+            self.mmap_image_extents = {"x": None, "y": None, "z": None}
 
         if scene_changed:
             self._render_all()
@@ -1574,7 +1653,7 @@ class VTKPanel:
             or self.main_window.anatomical_image_affine is None
             or not all(self.image_extents.values())
             or self.image_extents["x"] is None
-        ):  # Check one specifically
+        ): 
 
             self.update_status(
                 "Error: Cannot set slices from RAS, no anatomical image loaded."
@@ -1814,6 +1893,12 @@ class VTKPanel:
 
         handler_key = (key, ctrl, shift)
 
+        # Block VTK's default number key behaviors (e.g., '3' toggles stereo mode)
+        vtk_blocked_keys = {"1", "2", "3", "4"}
+        if key in vtk_blocked_keys and not ctrl and not shift:
+            interactor.SetKeyCode(chr(0))  # Neutralize the key to prevent VTK handling
+            return
+
         # Handle non-data-dependent keys first
         non_data_handlers = {
             ("z", True, False): self.main_window._perform_undo,
@@ -1825,6 +1910,7 @@ class VTKPanel:
         if handler_key in non_data_handlers:
             non_data_handlers[handler_key]()
             return
+
 
         # Handle Slice Navigation Keys
         anatomical_loaded = self.main_window.anatomical_image_data is not None
@@ -1989,6 +2075,11 @@ class VTKPanel:
             self.coronal_scene.add(cor_2d)
             self.sagittal_scene.add(sag_2d)
 
+            # X-flip for axial/coronal ROI actors to match anatomical actors
+            # Anatomical actors have SetScale(-1, 1, 1) for radiological convention
+            ax_2d.SetScale(-1, 1, 1)
+            cor_2d.SetScale(-1, 1, 1)
+
             # Get assigned color from MainWindow (or default to Red)
             assigned_color = (1.0, 0.0, 0.0)
             if self.main_window and key in self.main_window.roi_layers:
@@ -2108,7 +2199,7 @@ class VTKPanel:
             actor_obj = roi_actors.get(actor_type)
             if actor_obj:
                 current_pos = actor_obj.GetPosition()
-                # Flip in X direction
+                # X-flip: Convert FURY's neurological output to radiological display convention
                 actor_obj.SetScale(-1, 1, 1)
 
                 # Adjustment for position

@@ -4,6 +4,10 @@
 Utility functions, constants, and enums for the TractEdit application.
 """
 
+# ============================================================================
+# Imports
+# ============================================================================
+
 import os
 import ast
 import logging
@@ -16,7 +20,11 @@ from typing import Optional, Any, Union, List, Tuple
 
 logger = logging.getLogger(__name__)
 
+
+# ============================================================================
 # Constants
+# ============================================================================
+
 MAX_STACK_LEVELS: int = 20
 DEFAULT_SELECTION_RADIUS: float = 3.5
 MIN_SELECTION_RADIUS: float = 0.5
@@ -38,13 +46,22 @@ ROI_COLORS = [
 ]
 
 
-# Coloring Mode Enum
+# ============================================================================
+# Enums
+# ============================================================================
+
+
 class ColorMode(enum.Enum):
     """Enum defining the streamline coloring modes."""
 
     DEFAULT: int = 0
     ORIENTATION: int = 1
     SCALAR: int = 2
+
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
 
 
 def get_formatted_datetime() -> str:

@@ -5,11 +5,16 @@ Functions for loading and saving streamline files (trk, tck, trx)
 and loading anatomical image files (NIfTI).
 """
 
+# ============================================================================
+# Imports
+# ============================================================================
+
 import os
 import ast
 import logging
 import numpy as np
 import nibabel as nib
+from scipy.ndimage import gaussian_filter
 import trx.trx_file_memmap as tbx
 import vtk
 from vtk.util import numpy_support
@@ -23,9 +28,262 @@ from PyQt6.QtWidgets import (
 )
 from .utils import ColorMode
 from typing import Optional, List, Dict, Any, Tuple, Type, Union
-from numba import njit
+from numba import njit, prange
 
 logger = logging.getLogger(__name__)
+
+
+##TODO - This will be updated. Fury doesn't support memmap images
+# so to handle anatomical images in 3D main view we'll need to replace entirely Fury with VTK
+# We tried an hybrid approach by maintaining 2D high-res for 2D panels and downsampled images for the 3D view but it is messy
+# For now we avoid crashes with high-res images by downsampling both 3D and 2D views, in future we'll replace Fury with VTK
+
+# Auto-downsampling constants
+# 512³ (~134M voxels)
+MAX_VOXELS = 512**3  # ~134M voxels - target max for display
+
+# LRU cache size for memory-mapped slices (number of slices to cache)
+MMAP_SLICE_CACHE_SIZE = 64
+
+# Medoid calculation constants
+MEDOID_SAMPLING_THRESHOLD = 8000  # Streamline threshold for switching to approximate medoid (sampling-based; higher = more accurate but slower)
+MEDOID_SAMPLE_SIZE = 2000  # Number of samples to use for approximate medoid (higher = more accurate but slower)
+
+
+# ============================================================================
+# Memory-Mapped Image Wrapper
+# ============================================================================
+
+
+class MemoryMappedImage:
+    """
+    Memory-mapped NIfTI image wrapper for efficient on-demand slice extraction.
+
+    Uses nibabel's memory-mapping to avoid loading the entire volume into RAM.
+    Provides cached full-resolution slices for 2D panel display while preserving
+    radiological convention (RAS→LAS flip correction).
+    """
+
+    def __init__(
+        self,
+        img: nib.Nifti1Image,
+        needs_x_flip: bool = False,
+    ):
+        """
+        Initialize memory-mapped image wrapper.
+
+        Args:
+            img: NiBabel image object (will be accessed via memory-mapping).
+            needs_x_flip: If True, flip X-axis for LAS orientation.
+        """
+        self._img = img
+        self._affine = img.affine.copy()
+        self._shape = img.shape[:3]
+        self._needs_x_flip = needs_x_flip
+
+        # Adjust affine if X-flip is needed (for consistent world coordinates)
+        if needs_x_flip:
+            x_column = self._affine[:3, 0]
+            self._affine[:3, 3] += (self._shape[0] - 1) * x_column
+            self._affine[:3, 0] = -x_column
+
+        # Create cached slice getter
+        self._get_slice_cached = self._create_cached_slice_getter()
+
+    @property
+    def shape(self) -> Tuple[int, int, int]:
+        """Return the 3D shape of the image."""
+        return self._shape
+
+    @property
+    def affine(self) -> np.ndarray:
+        """Return the (possibly X-flipped) affine matrix."""
+        return self._affine
+
+    def _create_cached_slice_getter(self):
+        """Create an LRU-cached slice getter function."""
+        from functools import lru_cache
+
+        @lru_cache(maxsize=MMAP_SLICE_CACHE_SIZE)
+        def get_slice_cached(axis: str, index: int) -> np.ndarray:
+            """
+            Extract a single slice from the memory-mapped image.
+
+            Args:
+                axis: 'x' (sagittal), 'y' (coronal), or 'z' (axial).
+                index: Slice index along the specified axis.
+
+            Returns:
+                2D numpy array (float32) of the slice data.
+            """
+            # Use dataobj for memory-mapped access (no full load)
+            dataobj = self._img.dataobj
+
+            if axis == "x":
+                # Sagittal slice
+                if self._needs_x_flip:
+                    # Flip index for LAS orientation
+                    flipped_idx = self._shape[0] - 1 - index
+                    slice_data = np.asarray(dataobj[flipped_idx, :, :])
+                else:
+                    slice_data = np.asarray(dataobj[index, :, :])
+            elif axis == "y":
+                # Coronal slice
+                slice_data = np.asarray(dataobj[:, index, :])
+                if self._needs_x_flip:
+                    slice_data = np.flip(slice_data, axis=0)
+            elif axis == "z":
+                # Axial slice
+                slice_data = np.asarray(dataobj[:, :, index])
+                if self._needs_x_flip:
+                    slice_data = np.flip(slice_data, axis=0)
+            else:
+                raise ValueError(f"Invalid axis: {axis}. Use 'x', 'y', or 'z'.")
+
+            # Ensure contiguous float32 for VTK
+            return np.ascontiguousarray(slice_data, dtype=np.float32)
+
+        return get_slice_cached
+
+    def get_slice(self, axis: str, index: int) -> np.ndarray:
+        """
+        Get a cached full-resolution slice.
+
+        Args:
+            axis: 'x' (sagittal), 'y' (coronal), or 'z' (axial).
+            index: Slice index along the specified axis.
+
+        Returns:
+            2D numpy array (float32) of the slice data.
+        """
+        # Clamp index to valid range
+        axis_map = {"x": 0, "y": 1, "z": 2}
+        max_idx = self._shape[axis_map[axis]] - 1
+        index = max(0, min(index, max_idx))
+        return self._get_slice_cached(axis, index)
+
+    def get_value_range(self) -> Tuple[float, float]:
+        """
+        Get the min/max value range by sampling the image.
+
+        Uses a sampling approach to avoid loading the full volume.
+        """
+        # Sample slices at 25%, 50%, 75% through each axis
+        samples = []
+        for axis in ["x", "y", "z"]:
+            axis_map = {"x": 0, "y": 1, "z": 2}
+            size = self._shape[axis_map[axis]]
+            for pct in [0.25, 0.5, 0.75]:
+                idx = int(size * pct)
+                slice_data = self.get_slice(axis, idx)
+                samples.append(slice_data)
+
+        all_samples = np.concatenate([s.ravel() for s in samples])
+        finite_samples = all_samples[np.isfinite(all_samples)]
+
+        if finite_samples.size > 0:
+            return float(np.min(finite_samples)), float(np.max(finite_samples))
+        return 0.0, 1.0
+
+    def clear_cache(self):
+        """Clear the slice cache."""
+        self._get_slice_cached.cache_clear()
+
+
+def _maybe_downsample_image(
+    img: nib.Nifti1Image,
+    progress_callback: Optional[callable] = None,
+) -> Tuple[np.ndarray, np.ndarray, bool]:
+    """
+    Checks if an image is too large and downsamples if needed.
+
+    For large images, normalizes orientation to LAS (negative X) during
+    downsampling to ensure consistent behavior with the display code.
+
+    Args:
+        img: NiBabel image object.
+        progress_callback: Optional callback(percent, message) for progress updates.
+
+    Returns:
+        Tuple of (image_data, image_affine, was_downsampled).
+    """
+    shape = np.array(img.shape[:3])
+    total_voxels = shape[0] * shape[1] * shape[2]
+
+    if total_voxels <= MAX_VOXELS:
+        # Image is small enough, no downsampling needed
+        if progress_callback:
+            progress_callback(50, "Loading image data...")
+        return img.get_fdata(dtype=np.float32), img.affine.copy(), False
+
+    # Image is too large - calculate striding step
+    if progress_callback:
+        progress_callback(
+            30, f"Image too large ({shape[0]}×{shape[1]}×{shape[2]}), downsampling..."
+        )
+
+    # Calculate step to reach ~256³ voxels
+    target_size = int(MAX_VOXELS ** (1 / 3))  # ~256
+    step = max(1, int(np.ceil(max(shape) / target_size)))
+
+    if progress_callback:
+        progress_callback(40, "Loading original data...")
+
+    # Load the original data
+    original_data = img.get_fdata(dtype=np.float32)
+    original_affine = img.affine.copy()
+
+    # Check if X-axis needs to be flipped to match LAS orientation
+    x_is_positive = original_affine[0, 0] > 0
+
+    if x_is_positive:
+        if progress_callback:
+            progress_callback(50, "Normalizing orientation (RAS→LAS)...")
+
+        # Flip data along X axis
+        original_data = np.flip(original_data, axis=0)
+
+        # Adjust affine: negate X column and shift origin
+        # New origin = old_origin + (shape[0]-1) * x_column_vector
+        x_column = original_affine[:3, 0]
+        original_affine[:3, 3] += (shape[0] - 1) * x_column
+        original_affine[:3, 0] = -x_column
+
+        logger.info(
+            "Flipped image from RAS to LAS orientation for display compatibility"
+        )
+
+    if progress_callback:
+        progress_callback(60, f"Downsampling with step={step}...")
+
+    # Downsample using striding first (fast operation)
+    # Without this, FURY/VTK will be extremely slow on the non-contiguous strided view
+    resampled_data = np.ascontiguousarray(original_data[::step, ::step, ::step])
+
+    if progress_callback:
+        progress_callback(75, "Applying anti-aliasing filter...")
+
+    # Anti-aliasing: Apply mild Gaussian blur AFTER downsampling ##TODO - to add in 'Settings' menu
+    resampled_data = gaussian_filter(resampled_data, sigma=0.8, mode="nearest")
+
+    # Adjust affine: multiply the voxel-step columns by the step size
+    new_affine = original_affine.copy()
+    new_affine[:3, :3] *= step
+
+    if progress_callback:
+        progress_callback(90, "Done resampling...")
+
+    new_shape = resampled_data.shape[:3]
+    logger.info(
+        f"Downsampled image from {tuple(shape)} to {new_shape} " f"(step: {step})"
+    )
+
+    return resampled_data, new_affine, True
+
+
+# ============================================================================
+# Background Loader Threads
+# ============================================================================
 
 
 class StreamlineLoaderThread(QThread):
@@ -268,24 +526,30 @@ class StreamlineLoaderThread(QThread):
                 results["scalars"] = scalars
                 results["active_scalar"] = list(scalars.keys())[0] if scalars else None
 
-                # Geometry (Progressive)
-                self.progress.emit(30, "Finalizing...")
-                bboxes = []
-                total = len(trx_obj.streamlines)
-                step = max(1, total // 50)  # Update every 2%
-
-                for i, sl in enumerate(trx_obj.streamlines):
-                    if i % step == 0:
-                        pct = 30 + int(60 * (i / total))
-                        self.progress.emit(
-                            pct, f"Calculating geometry {int(i/total*100)}%..."
-                        )
-
-                    if len(sl) > 0:
-                        bboxes.append([np.min(sl, axis=0), np.max(sl, axis=0)])
-                    else:
-                        bboxes.append([np.zeros(3), np.zeros(3)])
-                results["bboxes"] = np.array(bboxes, dtype=np.float32)
+                # Geometry - Use Numba-optimized bounding box calculation
+                # TRX streamlines are ArraySequence with _data, _offsets, _lengths
+                self.progress.emit(30, "Computing bounding boxes...")
+                streamlines = trx_obj.streamlines
+                if (
+                    hasattr(streamlines, "_data")
+                    and hasattr(streamlines, "_offsets")
+                    and hasattr(streamlines, "_lengths")
+                ):
+                    # Fast path: use Numba-optimized function
+                    results["bboxes"] = _compute_bboxes_numba(
+                        streamlines._data,
+                        streamlines._offsets,
+                        streamlines._lengths,
+                    )
+                else:
+                    # Fallback for unexpected data structures
+                    bboxes = []
+                    for sl in streamlines:
+                        if len(sl) > 0:
+                            bboxes.append([np.min(sl, axis=0), np.max(sl, axis=0)])
+                        else:
+                            bboxes.append([np.zeros(3), np.zeros(3)])
+                    results["bboxes"] = np.array(bboxes, dtype=np.float32)
 
             else:
                 self.error.emit(f"Unsupported file format: {ext}")
@@ -293,6 +557,114 @@ class StreamlineLoaderThread(QThread):
 
             self.progress.emit(100, "Done")
             self.finished.emit(results)
+
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class MedoidCalculationThread(QThread):
+    """
+    Background thread to calculate medoid without freezing the GUI.
+    Allows for responsive cancellation and progress updates.
+    """
+
+    progress = pyqtSignal(int, str)  # Signal to update progress (percent, message)
+    finished = pyqtSignal(int)  # Signal when done (medoid index, -1 if cancelled)
+    error = pyqtSignal(str)  # Signal if an error occurs
+
+    def __init__(self, streamlines: List[np.ndarray], nb_points: int = 100):
+        super().__init__()
+        self.streamlines = streamlines
+        self.nb_points = nb_points
+        self._cancelled = False
+
+    def cancel(self):
+        """Request cancellation of the computation."""
+        self._cancelled = True
+
+    def run(self):
+        try:
+            n = len(self.streamlines)
+            if n == 0:
+                self.finished.emit(-1)
+                return
+            if n == 1:
+                self.finished.emit(0)
+                return
+
+            # Prepare data for batch processing (0-10%)
+            self.progress.emit(0, "Preparing streamlines...")
+
+            # Convert streamlines to ArraySequence for efficient flat data access
+            as_streamlines = nib.streamlines.ArraySequence(self.streamlines)
+            flat_data = np.ascontiguousarray(as_streamlines._data.astype(np.float64))
+            offsets = np.ascontiguousarray(as_streamlines._offsets.astype(np.int64))
+            lengths = np.ascontiguousarray(as_streamlines._lengths.astype(np.int64))
+
+            if self._cancelled:
+                self.finished.emit(-1)
+                return
+
+            # Batch Resampling with parallel Numba (10-40%)
+            self.progress.emit(10, "Batch resampling (parallel)...")
+            resampled = _resample_batch_numba(
+                flat_data, offsets, lengths, self.nb_points
+            )
+
+            if self._cancelled:
+                self.finished.emit(-1)
+                return
+
+            # Distance Computation (40-90%)
+            # For large bundles, use sampling-based approximate medoid
+            if n > MEDOID_SAMPLING_THRESHOLD:
+                # Approximate medoid using random sampling
+                sample_size = min(MEDOID_SAMPLE_SIZE, n // 3)
+                self.progress.emit(
+                    40,
+                    f"Computing distances (sampling {sample_size} of {n})...",
+                )
+
+                # Generate random sample indices
+                np.random.seed(42)  # Reproducible results
+                sample_indices = np.random.choice(n, sample_size, replace=False).astype(
+                    np.int64
+                )
+
+                if self._cancelled:
+                    self.finished.emit(-1)
+                    return
+
+                self.progress.emit(50, "Computing MDF distances (parallel)...")
+
+                # Compute distances from all streamlines to sampled ones
+                distances = _compute_distances_to_samples(resampled, sample_indices)
+
+                if self._cancelled:
+                    self.finished.emit(-1)
+                    return
+
+                # Sum distances to find approximate medoid
+                self.progress.emit(85, "Finding approximate medoid...")
+                total_dists = np.sum(distances, axis=1)
+
+            else:
+                # Exact medoid for smaller bundles
+                self.progress.emit(40, "Computing distance matrix (Numba-optimized)...")
+                dist_matrix = _compute_mdf_distance_matrix(resampled)
+
+                if self._cancelled:
+                    self.finished.emit(-1)
+                    return
+
+                self.progress.emit(85, "Finding medoid...")
+                total_dists = np.sum(dist_matrix, axis=1)
+
+            # Find Medoid (85-100%)
+            medoid_idx = int(np.argmin(total_dists))
+
+            self.progress.emit(100, "Done")
+            self.finished.emit(medoid_idx)
 
         except Exception as e:
             self.error.emit(str(e))
@@ -316,7 +688,7 @@ class AnatomicalImageLoaderThread(QThread):
         try:
             self.progress.emit(10, "Loading NIfTI header...")
 
-            # Load the NIfTI file
+            # Load the NIfTI file (lazy - data not loaded yet)
             img = nib.load(self.input_path)
 
             # Get file size estimate for progress feedback
@@ -327,17 +699,29 @@ class AnatomicalImageLoaderThread(QThread):
                 size_mb = (total_voxels * 4) / (1024 * 1024)  # float32 = 4 bytes
                 self.progress.emit(
                     20,
-                    f"Loading {shape[0]}×{shape[1]}×{shape[2]} ({size_mb:.0f} MB)...",
+                    f"Checking {shape[0]}×{shape[1]}×{shape[2]} ({size_mb:.0f} MB)...",
                 )
             else:
                 self.progress.emit(20, "Loading image data...")
 
-            # This is the slow part - get_fdata loads and converts the data
-            self.progress.emit(30, "Reading image data (this may take a while)...")
-            image_data = img.get_fdata(dtype=np.float32)
+            # Use auto-downsampling for large images
+            def progress_callback(percent, message):
+                self.progress.emit(percent, message)
 
-            self.progress.emit(80, "Validating...")
-            image_affine = img.affine
+            image_data, image_affine, was_downsampled = _maybe_downsample_image(
+                img, progress_callback
+            )
+
+            self.progress.emit(85, "Creating memory-mapped accessor...")
+
+            # Check if X-flip is needed for LAS orientation
+            # (positive X in affine means RAS orientation)
+            needs_x_flip = img.affine[0, 0] > 0
+
+            # Create memory-mapped image for full-resolution 2D slicing
+            mmap_image = MemoryMappedImage(img, needs_x_flip=needs_x_flip)
+
+            self.progress.emit(90, "Validating...")
 
             # Basic validation
             if image_data.ndim < 3:
@@ -351,12 +735,18 @@ class AnatomicalImageLoaderThread(QThread):
                 )
                 return
 
-            self.progress.emit(100, "Done")
+            status_msg = "Done"
+            if was_downsampled:
+                status_msg = f"Done (downsampled to {image_data.shape[0]}×{image_data.shape[1]}×{image_data.shape[2]})"
+
+            self.progress.emit(100, status_msg)
             self.finished.emit(
                 {
                     "data": image_data,
                     "affine": image_affine,
                     "path": self.input_path,
+                    "was_downsampled": was_downsampled,
+                    "mmap_image": mmap_image,
                 }
             )
 
@@ -368,13 +758,23 @@ class AnatomicalImageLoaderThread(QThread):
             self.error.emit(f"Error loading image: {type(e).__name__}: {e}")
 
 
-# Numba Optimized Helper
-@njit(nogil=True)
+# ============================================================================
+# Numba Optimized Functions
+# ============================================================================
+
+
+@njit(nogil=True, parallel=True, cache=True)
 def _compute_bboxes_numba(
     flat_data: np.ndarray, offsets: np.ndarray, lengths: np.ndarray
 ) -> np.ndarray:
     """
     Calculates bounding boxes for streamlines using Numba for high performance.
+
+    Uses parallel processing across streamlines for optimal performance
+    with large tractograms (millions of streamlines).
+
+    Note: cache=True stores the compiled function to disk, avoiding the
+    ~5-6 second JIT compilation overhead on subsequent application starts.
 
     Args:
         flat_data: The flattened coordinates array (N_total_points, 3).
@@ -382,12 +782,13 @@ def _compute_bboxes_numba(
         lengths: Array of point counts for each streamline.
 
     Returns:
-        A (N_streamlines, 2, 3) array containing [min_coords, max_coords] for each streamline.
+        A (N_streamlines, 2, 3) array containing [min_coords, max_coords]
+        for each streamline.
     """
     n_streamlines = len(lengths)
     bboxes = np.zeros((n_streamlines, 2, 3), dtype=np.float32)
 
-    for i in range(n_streamlines):
+    for i in prange(n_streamlines):
         start = offsets[i]
         length = lengths[i]
 
@@ -433,7 +834,11 @@ def _compute_bboxes_numba(
     return bboxes
 
 
+# ============================================================================
 # Helper Functions
+# ============================================================================
+
+
 def parse_numeric_tuple_from_string(
     input_value: Union[str, List, Tuple, np.ndarray, Any],
     target_type: Type = float,
@@ -552,7 +957,7 @@ def _check_numpy_shape(
     return arr.ndim == 1 and len(arr) == expected
 
 
-@njit(nogil=True)
+@njit(nogil=True, cache=True)
 def _resample_streamline_numba(streamline: np.ndarray, nb_points: int) -> np.ndarray:
     """
     Numba-optimized streamline resampling using linear interpolation.
@@ -619,7 +1024,111 @@ def _resample_streamline_numba(streamline: np.ndarray, nb_points: int) -> np.nda
     return result
 
 
-@njit(nogil=True, parallel=True)
+@njit(nogil=True, parallel=True, cache=True)
+def _resample_batch_numba(
+    flat_data: np.ndarray,
+    offsets: np.ndarray,
+    lengths: np.ndarray,
+    nb_points: int,
+) -> np.ndarray:
+    """
+    Batch resample all streamlines in parallel using Numba.
+
+    This function processes all streamlines simultaneously using parallel
+    execution, providing significant speedup for large bundles (50k+).
+
+    Args:
+        flat_data: Flattened streamline data of shape (N_total_points, 3).
+        offsets: Start indices for each streamline in flat_data.
+        lengths: Number of points in each streamline.
+        nb_points: Target number of points per resampled streamline.
+
+    Returns:
+        Array of shape (N_streamlines, nb_points, 3) with resampled data.
+    """
+    n_streamlines = len(lengths)
+    result = np.empty((n_streamlines, nb_points, 3), dtype=np.float64)
+
+    for i in prange(n_streamlines):
+        start = offsets[i]
+        length = lengths[i]
+
+        # Handle edge case: single point or empty streamline
+        if length <= 1:
+            if length == 1:
+                for k in range(nb_points):
+                    result[i, k, 0] = flat_data[start, 0]
+                    result[i, k, 1] = flat_data[start, 1]
+                    result[i, k, 2] = flat_data[start, 2]
+            else:
+                for k in range(nb_points):
+                    result[i, k, 0] = 0.0
+                    result[i, k, 1] = 0.0
+                    result[i, k, 2] = 0.0
+            continue
+
+        # Calculate cumulative distances for this streamline
+        cum_dists = np.zeros(length, dtype=np.float64)
+        for j in range(1, length):
+            idx = start + j
+            idx_prev = start + j - 1
+            dx = flat_data[idx, 0] - flat_data[idx_prev, 0]
+            dy = flat_data[idx, 1] - flat_data[idx_prev, 1]
+            dz = flat_data[idx, 2] - flat_data[idx_prev, 2]
+            cum_dists[j] = cum_dists[j - 1] + np.sqrt(dx * dx + dy * dy + dz * dz)
+
+        total_length = cum_dists[length - 1]
+
+        # Handle zero-length streamline
+        if total_length == 0.0:
+            for k in range(nb_points):
+                result[i, k, 0] = flat_data[start, 0]
+                result[i, k, 1] = flat_data[start, 1]
+                result[i, k, 2] = flat_data[start, 2]
+            continue
+
+        # Resample with linear interpolation
+        for k in range(nb_points):
+            target_dist = total_length * k / (nb_points - 1)
+
+            # Find segment containing target_dist
+            seg_idx = 0
+            for j in range(1, length):
+                if cum_dists[j] >= target_dist:
+                    seg_idx = j - 1
+                    break
+                seg_idx = j - 1
+
+            # Interpolate within segment
+            seg_start_dist = cum_dists[seg_idx]
+            seg_end_dist = (
+                cum_dists[seg_idx + 1] if seg_idx + 1 < length else seg_start_dist
+            )
+            seg_len = seg_end_dist - seg_start_dist
+
+            if seg_len > 0:
+                t = (target_dist - seg_start_dist) / seg_len
+            else:
+                t = 0.0
+
+            # Get point indices
+            p0 = start + seg_idx
+            p1 = start + seg_idx + 1 if seg_idx + 1 < length else p0
+
+            result[i, k, 0] = flat_data[p0, 0] + t * (
+                flat_data[p1, 0] - flat_data[p0, 0]
+            )
+            result[i, k, 1] = flat_data[p0, 1] + t * (
+                flat_data[p1, 1] - flat_data[p0, 1]
+            )
+            result[i, k, 2] = flat_data[p0, 2] + t * (
+                flat_data[p1, 2] - flat_data[p0, 2]
+            )
+
+    return result
+
+
+@njit(nogil=True, parallel=True, cache=True)
 def _compute_centroid_numba(
     resampled: np.ndarray,
 ) -> np.ndarray:
@@ -730,7 +1239,7 @@ def _compute_centroid_math(
     return _compute_centroid_numba(resampled)
 
 
-@njit(nogil=True, parallel=True)
+@njit(nogil=True, parallel=True, cache=True)
 def _compute_mdf_distance_matrix(resampled: np.ndarray) -> np.ndarray:
     """
     Computes MDF (Minimum Direct Flip) distance matrix using Numba.
@@ -745,7 +1254,7 @@ def _compute_mdf_distance_matrix(resampled: np.ndarray) -> np.ndarray:
     nb_points = resampled.shape[1]
     dist_matrix = np.zeros((n, n), dtype=np.float64)
 
-    for i in range(n):
+    for i in prange(n):
         for j in range(i + 1, n):
             # Direct distance
             d_direct = 0.0
@@ -774,81 +1283,135 @@ def _compute_mdf_distance_matrix(resampled: np.ndarray) -> np.ndarray:
     return dist_matrix
 
 
-def _compute_medoid_math(
-    streamlines: List[np.ndarray],
-    nb_points: int = 100,
-    parent: Optional[QWidget] = None,
-) -> int:
+@njit(nogil=True, parallel=True, cache=True)
+def _compute_distances_to_samples(
+    resampled: np.ndarray,
+    sample_indices: np.ndarray,
+) -> np.ndarray:
     """
-    Identifies the index of the medoid streamline.
-    The medoid is the streamline that minimizes the sum of distances (MDF) to all other streamlines.
-    Uses Numba-optimized distance calculation for performance.
-    """
-    if not streamlines:
-        return -1
+    Compute MDF distances from all streamlines to a subset of sampled streamlines.
 
-    n = len(streamlines)
-    if n == 1:
-        return 0
-
-    # Progress dialog for resampling phase
-    progress = QProgressDialog("Resampling streamlines...", "Cancel", 0, 100, parent)
-    progress.setWindowTitle("TractEdit - Medoid Calculation")
-    progress.setWindowModality(Qt.WindowModality.WindowModal)
-    progress.setMinimumDuration(0)
-    progress.setValue(0)
-    progress.show()
-    QApplication.processEvents()
-
-    # Resample streamlines for consistent distance calculation
-    resampled_list = []
-    for i, s in enumerate(streamlines):
-        if progress.wasCanceled():
-            return -1
-        resampled_list.append(_resample_streamline(s, nb_points))
-        if i % max(1, n // 20) == 0:  # Update every 5%
-            progress.setValue(int(40 * i / n))
-            QApplication.processEvents()
-
-    resampled = np.array(resampled_list, dtype=np.float64)
-
-    if progress.wasCanceled():
-        return -1
-
-    # Compute distance matrix using Numba (this is the fast part)
-    progress.setLabelText("Computing distance matrix (Numba-optimized)...")
-    progress.setValue(50)
-    QApplication.processEvents()
-
-    dist_matrix = _compute_mdf_distance_matrix(resampled)
-
-    progress.setValue(90)
-    QApplication.processEvents()
-
-    # Sum rows to find total distance for each candidate
-    total_dists = np.sum(dist_matrix, axis=1)
-
-    progress.setValue(100)
-
-    # Argmin is the medoid index
-    return int(np.argmin(total_dists))
-
-
-def calculate_and_save_statistic(main_window: Any, method: str) -> None:
-    """
-    Calculates and saves a statistic (centroid or medoid) of the visible streamlines.
-    Unifies logic for calculate_and_save_centroid and calculate_and_save_medoid
-    while preserving UX and logic.
+    This reduces the O(N²) full distance matrix to O(N×k) where k << N,
+    enabling approximate medoid calculation for very large bundles (50k+).
 
     Args:
-        main_window: The main application window instance.
-        method: 'centroid' or 'medoid'.
-    """
-    method = method.lower()
-    if method not in ["centroid", "medoid"]:
-        logger.error(f"Invalid method for statistic calculation: {method}")
-        return
+        resampled: Array of shape (N, nb_points, 3) containing resampled streamlines.
+        sample_indices: Array of indices for the sampled streamlines (length k).
 
+    Returns:
+        Distance array of shape (N, k) where each row contains distances
+        from streamline i to all sampled streamlines.
+    """
+    n = resampled.shape[0]
+    nb_points = resampled.shape[1]
+    k = len(sample_indices)
+    distances = np.zeros((n, k), dtype=np.float64)
+
+    for i in prange(n):
+        for j_idx in range(k):
+            j = sample_indices[j_idx]
+
+            # Skip self-distance (will be 0)
+            if i == j:
+                continue
+
+            # Direct distance
+            d_direct = 0.0
+            for pt in range(nb_points):
+                dx = resampled[i, pt, 0] - resampled[j, pt, 0]
+                dy = resampled[i, pt, 1] - resampled[j, pt, 1]
+                dz = resampled[i, pt, 2] - resampled[j, pt, 2]
+                d_direct += np.sqrt(dx * dx + dy * dy + dz * dz)
+            d_direct /= nb_points
+
+            # Flipped distance
+            d_flipped = 0.0
+            for pt in range(nb_points):
+                flipped_pt = nb_points - 1 - pt
+                dx = resampled[i, pt, 0] - resampled[j, flipped_pt, 0]
+                dy = resampled[i, pt, 1] - resampled[j, flipped_pt, 1]
+                dz = resampled[i, pt, 2] - resampled[j, flipped_pt, 2]
+                d_flipped += np.sqrt(dx * dx + dy * dy + dz * dz)
+            d_flipped /= nb_points
+
+            # MDF = minimum of direct and flipped
+            distances[i, j_idx] = d_direct if d_direct < d_flipped else d_flipped
+
+    return distances
+
+
+def warmup_numba_functions() -> None:
+    """
+    Pre-compiles all Numba JIT functions by calling them with minimal dummy data.
+
+    This should be called during application startup (e.g., while splash screen
+    is showing) to avoid the ~1-3 second JIT compilation delay when first
+    loading a file.
+
+    With cache=True on the Numba decorators, subsequent app starts will load
+    the compiled functions from disk cache, making this fast.
+    """
+    # Minimal dummy data for warmup (10 streamlines, 5 points each)
+    dummy_data = np.zeros((50, 3), dtype=np.float32)
+    dummy_offsets = np.arange(0, 50, 5, dtype=np.int64)
+    dummy_lengths = np.full(10, 5, dtype=np.int64)
+
+    # Warmup _compute_bboxes_numba
+    try:
+        _compute_bboxes_numba(dummy_data, dummy_offsets, dummy_lengths)
+    except Exception:
+        pass
+
+    # Warmup _filter_streamlines_by_roi_numba
+    dummy_roi = np.zeros((10, 10, 10), dtype=np.uint8)
+    dummy_inv_affine = np.eye(4, dtype=np.float64)
+    try:
+        _filter_streamlines_by_roi_numba(
+            dummy_data, dummy_offsets, dummy_lengths, dummy_roi, dummy_inv_affine
+        )
+    except Exception:
+        pass
+
+    # Warmup _filter_streamlines_by_multiple_rois_numba
+    try:
+        _filter_streamlines_by_multiple_rois_numba(
+            dummy_data, dummy_offsets, dummy_lengths, [dummy_roi], [dummy_inv_affine]
+        )
+    except Exception:
+        pass
+
+    # Warmup medoid calculation functions (batch resampling + distance matrix)
+    dummy_data_f64 = np.zeros((50, 3), dtype=np.float64)
+    try:
+        # Warmup batch resampling
+        _resample_batch_numba(dummy_data_f64, dummy_offsets, dummy_lengths, 20)
+    except Exception:
+        pass
+
+    try:
+        # Warmup MDF distance matrix with small resampled data
+        dummy_resampled = np.zeros((10, 20, 3), dtype=np.float64)
+        _compute_mdf_distance_matrix(dummy_resampled)
+    except Exception:
+        pass
+
+    try:
+        # Warmup sampling-based distance function
+        dummy_resampled = np.zeros((10, 20, 3), dtype=np.float64)
+        dummy_sample_indices = np.array([0, 1, 2], dtype=np.int64)
+        _compute_distances_to_samples(dummy_resampled, dummy_sample_indices)
+    except Exception:
+        pass
+
+    logger.debug("Numba functions warmed up")
+
+
+def _finalize_statistic_save(
+    main_window: Any, result_streamline: np.ndarray, method: str
+) -> None:
+    """
+    Helper to save the calculated statistic (centroid/medoid) to a file.
+    """
     method_ui = method.capitalize()
     status_updater = getattr(
         main_window.vtk_panel,
@@ -856,57 +1419,7 @@ def calculate_and_save_statistic(main_window: Any, method: str) -> None:
         lambda msg: logger.info(f"Status: {msg}"),
     )
 
-    # Validation
-    if not _validate_save_prerequisites(main_window):
-        return
-    if not main_window.visible_indices:
-        QMessageBox.warning(
-            main_window,
-            "Calculation Error",
-            f"No visible streamlines to calculate {method}.",
-        )
-        return
-
-    # Safety Check for Medoid
-    if method == "medoid" and len(main_window.visible_indices) > 100000:
-        QMessageBox.warning(
-            main_window,
-            "Safety Warning",
-            f"Too many streamlines selected ({len(main_window.visible_indices)}).\n"
-            "Medoid calculation is computationally intensive (O(N²)) and would freeze the application.\n"
-            "Please reduce the selection to below 100,000 streamlines.",
-        )
-        status_updater("Medoid calculation aborted (too many streamlines).")
-        return
-
-    # Extract Visible Data
-    tractogram_data = main_window.tractogram_data
-    visible_streamlines = [tractogram_data[i] for i in main_window.visible_indices]
-
-    # Status Update
-    if method == "medoid":
-        status_updater("Calculating medoid (O(N^2) complexity)...")
-    else:
-        status_updater("Calculating centroid (this may take a moment)...")
-
-    QApplication.processEvents()
-
     try:
-        # Calculate
-        result_streamline = None
-
-        if method == "centroid":
-            result_streamline = _compute_centroid_math(visible_streamlines)
-        elif method == "medoid":
-            # Medoid math returns an index, need to check for cancellation (-1)
-            medoid_local_index = _compute_medoid_math(
-                visible_streamlines, parent=main_window
-            )
-            if medoid_local_index == -1:
-                status_updater("Medoid calculation cancelled by user.")
-                return
-            result_streamline = visible_streamlines[medoid_local_index]
-
         # Prepare for Saving
         affine = main_window.original_trk_affine
 
@@ -949,11 +1462,115 @@ def calculate_and_save_statistic(main_window: Any, method: str) -> None:
         status_updater(f"{method_ui} saved: {os.path.basename(output_path)}")
 
     except Exception as e:
-        logger.error(f"Failed to calculate {method}: {e}", exc_info=True)
-        QMessageBox.critical(
-            main_window, "Error", f"Failed to calculate {method}:\n{e}"
+        logger.error(f"Failed to save {method}: {e}", exc_info=True)
+        QMessageBox.critical(main_window, "Error", f"Failed to save {method}:\n{e}")
+        status_updater(f"Error saving {method}.")
+
+
+def calculate_and_save_statistic(main_window: Any, method: str) -> None:
+    """
+    Calculates and saves a statistic (centroid or medoid) of the visible streamlines.
+    Unifies logic for calculate_and_save_centroid and calculate_and_save_medoid
+    while preserving UX and logic.
+
+    Args:
+        main_window: The main application window instance.
+        method: 'centroid' or 'medoid'.
+    """
+    method = method.lower()
+    if method not in ["centroid", "medoid"]:
+        logger.error(f"Invalid method for statistic calculation: {method}")
+        return
+
+    status_updater = getattr(
+        main_window.vtk_panel,
+        "update_status",
+        lambda msg: logger.info(f"Status: {msg}"),
+    )
+
+    # Validation
+    if not _validate_save_prerequisites(main_window):
+        return
+    if not main_window.visible_indices:
+        QMessageBox.warning(
+            main_window,
+            "Calculation Error",
+            f"No visible streamlines to calculate {method}.",
         )
-        status_updater(f"Error calculating {method}.")
+        return
+
+    # Safety Check for Medoid
+    if method == "medoid" and len(main_window.visible_indices) > 100000:
+        QMessageBox.warning(
+            main_window,
+            "Safety Warning",
+            f"Too many streamlines selected ({len(main_window.visible_indices)}).\n"
+            "Medoid calculation is computationally intensive (O(N²)) and would freeze the application.\n"
+            "Please reduce the selection to below 100,000 streamlines.",
+        )
+        status_updater("Medoid calculation aborted (too many streamlines).")
+        return
+
+    # Extract Visible Data
+    tractogram_data = main_window.tractogram_data
+    visible_streamlines = [tractogram_data[i] for i in main_window.visible_indices]
+
+    if method == "centroid":
+        status_updater("Calculating centroid (this may take a moment)...")
+        QApplication.processEvents()
+        try:
+            result_streamline = _compute_centroid_math(visible_streamlines)
+            _finalize_statistic_save(main_window, result_streamline, method)
+        except Exception as e:
+            logger.error(f"Failed to calculate centroid: {e}", exc_info=True)
+            QMessageBox.critical(
+                main_window, "Error", f"Failed to calculate centroid:\n{e}"
+            )
+            status_updater("Error calculating centroid.")
+
+    elif method == "medoid":
+        # Setup Progress Dialog
+        progress = QProgressDialog("Initializing...", "Cancel", 0, 100, main_window)
+        progress.setWindowTitle("TractEdit - Medoid Calculation")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+
+        # Create Thread
+        thread = MedoidCalculationThread(visible_streamlines)
+        main_window._medoid_thread = thread  # Keep reference
+
+        def on_progress(val, msg):
+            progress.setValue(val)
+            progress.setLabelText(msg)
+
+        def on_finished(idx):
+            progress.close()
+            if idx == -1:
+                status_updater("Medoid calculation cancelled.")
+            else:
+                result_streamline = visible_streamlines[idx]
+                _finalize_statistic_save(main_window, result_streamline, method)
+
+            # Clean up reference
+            if hasattr(main_window, "_medoid_thread"):
+                del main_window._medoid_thread
+
+        def on_error(msg):
+            progress.close()
+            QMessageBox.critical(
+                main_window, "Error", f"Medoid calculation failed:\n{msg}"
+            )
+            if hasattr(main_window, "_medoid_thread"):
+                del main_window._medoid_thread
+
+        thread.progress.connect(on_progress)
+        thread.finished.connect(on_finished)
+        thread.error.connect(on_error)
+        progress.canceled.connect(thread.cancel)
+
+        thread.start()
 
 
 # Helper Function for VTK/UI Update
@@ -1014,18 +1631,22 @@ def _update_vtk_and_ui_after_load(
 def load_anatomical_image(
     main_window: Any,
     file_path: Optional[str] = None,
-) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[str]]:
+) -> Tuple[
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+    Optional[str],
+    Optional["MemoryMappedImage"],
+]:
     """
     Loads a NIfTI image file (.nii, .nii.gz).
-    Returns the image data array and affine matrix.
+    Returns the image data array, affine matrix, and memory-mapped accessor.
 
     Args:
         main_window: The instance of the main application window.
         file_path: Optional path to the file to load. If None, opens a dialog.
 
     Returns:
-        tuple: (numpy.ndarray, numpy.ndarray, str) containing image data,
-               affine matrix, and file path, or (None, None, None) on failure/cancel.
+        tuple: (image_data, affine, path, mmap_image) or (None, None, None, None).
     """
     if not hasattr(main_window, "vtk_panel") or not main_window.vtk_panel.scene:
         logger.error("Scene not initialized in vtk_panel.")
@@ -1053,7 +1674,7 @@ def load_anatomical_image(
             lambda msg: logger.info(f"Status: {msg}"),
         )
         status_updater("Anatomical image load cancelled.")
-        return None, None, None
+        return None, None, None, None
 
     status_updater = getattr(
         main_window.vtk_panel,
@@ -1064,10 +1685,15 @@ def load_anatomical_image(
     QApplication.processEvents()
 
     try:
-        # Load NIfTI
+        # Load NIfTI (lazy - data not loaded yet)
         img = nib.load(input_path)
-        image_data = img.get_fdata(dtype=np.float32)  # Ensure float for VTK/FURY
-        image_affine = img.affine
+
+        # Use auto-downsampling for large images
+        image_data, image_affine, was_downsampled = _maybe_downsample_image(img)
+
+        # Create memory-mapped accessor for full-resolution 2D slicing
+        needs_x_flip = img.affine[0, 0] > 0
+        mmap_image = MemoryMappedImage(img, needs_x_flip=needs_x_flip)
 
         # Basic validation
         if image_data.ndim < 3:
@@ -1079,29 +1705,34 @@ def load_anatomical_image(
                 f"Loaded image affine has shape {image_affine.shape}, expected (4, 4)."
             )
 
-        status_updater(
-            f"Successfully loaded anatomical image: {os.path.basename(input_path)}"
-        )
-        return image_data, image_affine, input_path
+        if was_downsampled:
+            status_updater(
+                f"Loaded {os.path.basename(input_path)} (downsampled to {image_data.shape[0]}×{image_data.shape[1]}×{image_data.shape[2]})"
+            )
+        else:
+            status_updater(
+                f"Successfully loaded anatomical image: {os.path.basename(input_path)}"
+            )
+        return image_data, image_affine, input_path, mmap_image
 
     except FileNotFoundError:
         error_msg = f"Error: Anatomical image file not found:\n{input_path}"
         logger.error(error_msg)
         QMessageBox.critical(main_window, "Load Error", error_msg)
         status_updater(f"Error: File not found - {os.path.basename(input_path)}")
-        return None, None, None
+        return None, None, None, None
     except nib.filebasedimages.ImageFileError as e:
         error_msg = f"Nibabel Error loading anatomical image:\n{e}\n\nIs '{os.path.basename(input_path)}' a valid NIfTI file?"
         logger.error(error_msg)
         QMessageBox.critical(main_window, "Load Error", error_msg)
         status_updater(f"Error loading NIfTI: {os.path.basename(input_path)}")
-        return None, None, None
+        return None, None, None, None
     except Exception as e:
         error_msg = f"An unexpected error occurred loading the anatomical image:\n{type(e).__name__}: {e}\n\nPath: {input_path}\n\nSee console for details."
         logger.error(error_msg)
         QMessageBox.critical(main_window, "Load Error", error_msg)
         status_updater(f"Error loading image: {os.path.basename(input_path)}")
-        return None, None, None
+        return None, None, None, None
 
 
 # ROI Image Loading Function
@@ -1164,10 +1795,39 @@ def load_roi_images(
 
         try:
             img = nib.load(input_path)
-            image_data = img.get_fdata(dtype=np.float32).astype(
-                np.uint8
-            )  # load as float32 for get_fdata, then convert to uint8 for optimization
+            image_data_raw = img.get_fdata()
             image_affine = img.affine
+
+            # Preserve data integrity while optimizing memory
+            is_integer_data = np.allclose(image_data_raw, np.round(image_data_raw))
+
+            if is_integer_data:
+                # Round to handle floating point artifacts (e.g., 1.9999999 -> 2)
+                image_data_rounded = np.round(image_data_raw)
+                min_val = image_data_rounded.min()
+                max_val = image_data_rounded.max()
+
+                # Choose smallest appropriate integer type
+                if min_val >= 0 and max_val <= 255:
+                    image_data = image_data_rounded.astype(np.uint8)
+                elif min_val >= 0 and max_val <= 65535:
+                    image_data = image_data_rounded.astype(np.uint16)
+                elif min_val >= -32768 and max_val <= 32767:
+                    image_data = image_data_rounded.astype(np.int16)
+                else:
+                    image_data = image_data_rounded.astype(np.int32)
+
+                logger.debug(
+                    f"ROI '{os.path.basename(input_path)}' loaded as {image_data.dtype} "
+                    f"(range: {min_val:.0f} to {max_val:.0f})"
+                )
+            else:
+                # Preserve floating point for probability maps, partial volume estimates, etc.
+                image_data = image_data_raw.astype(np.float32)
+                logger.debug(
+                    f"ROI '{os.path.basename(input_path)}' loaded as float32 "
+                    f"(contains non-integer values, range: {image_data_raw.min():.4f} to {image_data_raw.max():.4f})"
+                )
 
             if image_data.ndim < 3:
                 logger.warning(
@@ -1229,44 +1889,48 @@ def load_streamlines_file(
     progress.setMinimumDuration(0)
     progress.setMinimumWidth(350)
 
-    # Apply custom style to match VTK panel theme and color (#05B8CC)
-    progress.setStyleSheet(
+    # Apply theme-aware style
+    if hasattr(main_window, "theme_manager"):
+        progress.setStyleSheet(main_window.theme_manager.get_progress_dialog_style())
+    else:
+        # Fallback to dark style if theme manager not available
+        progress.setStyleSheet(
+            """
+            QProgressDialog {
+                background-color: #2b2b2b;
+                color: #dddddd;
+            }
+            QLabel {
+                color: #dddddd;
+                font-size: 12px;
+                font-weight: bold;
+                margin-bottom: 5px;
+            }
+            QProgressBar {
+                border: 1px solid #555;
+                border-radius: 4px;
+                background-color: #333;
+                color: white;
+                text-align: center;
+                font-size: 12px;
+                height: 25px;
+            }
+            QProgressBar::chunk {
+                background-color: #05B8CC;
+                border-radius: 3px;
+            }
+            QPushButton {
+                background-color: #444;
+                color: #ddd;
+                border: 1px solid #555;
+                border-radius: 4px;
+                padding: 4px 12px;
+            }
+            QPushButton:hover {
+                background-color: #555;
+            }
         """
-        QProgressDialog {
-            background-color: #2b2b2b;
-            color: #dddddd;
-        }
-        QLabel {
-            color: #dddddd;
-            font-size: 12px;
-            font-weight: bold;
-            margin-bottom: 5px;
-        }
-        QProgressBar {
-            border: 1px solid #555;
-            border-radius: 4px;
-            background-color: #333;
-            color: white;
-            text-align: center;
-            font-size: 12px;
-            height: 25px;
-        }
-        QProgressBar::chunk {
-            background-color: #05B8CC;
-            border-radius: 3px;
-        }
-        QPushButton {
-            background-color: #444;
-            color: #ddd;
-            border: 1px solid #555;
-            border-radius: 4px;
-            padding: 4px 12px;
-        }
-        QPushButton:hover {
-            background-color: #555;
-        }
-    """
-    )
+        )
 
     progress.setValue(0)
     progress.show()
@@ -1720,7 +2384,7 @@ def _prepare_tck_header(
     base_header: Optional[Dict[str, Any]], nb_streamlines: int
 ) -> Dict[str, Any]:
     """Prepares the header dictionary for TCK saving."""
-    # Start with a clean header to avoid TRK-specific fields (like 'magic') polluting TCK
+    # Start with a clean header to avoid TRK-specific fields polluting TCK
     header = {}
     header["count"] = str(nb_streamlines)
 
@@ -1831,7 +2495,7 @@ def _prepare_trx_header(
     else:
         header["voxel_sizes"] = valid_vox_sizes
 
-    # Ensure voxel_order exists (TRX might use it or ignore it, but good to have)
+    # Ensure voxel_order exists
     if "voxel_order" not in header:
         header["voxel_order"] = "RAS"
 

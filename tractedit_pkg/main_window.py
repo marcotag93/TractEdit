@@ -8,6 +8,10 @@ and coordinates interactions between UI elements, data state,
 file I/O, and the VTK panel.
 """
 
+# ============================================================================
+# Imports
+# ============================================================================
+
 import os
 import numpy as np
 from typing import Optional, List, Set, Dict, Any
@@ -71,7 +75,14 @@ from .utils import (
     ROI_COLORS,
 )
 from .visualization import VTKPanel
-from .ui import ActionsManager, ToolbarsManager, DataPanelManager, DrawingModesManager
+from .ui import (
+    ActionsManager,
+    ToolbarsManager,
+    DataPanelManager,
+    DrawingModesManager,
+    ThemeManager,
+    ThemeMode,
+)
 from .logic import ROIManager, StateManager, ScalarManager, ConnectivityManager
 from nibabel.processing import resample_from_to
 from nibabel.orientations import ornt_transform, apply_orientation, io_orientation
@@ -79,7 +90,11 @@ from nibabel.orientations import ornt_transform, apply_orientation, io_orientati
 logger = logging.getLogger(__name__)
 
 
-# Main GUI class
+# ============================================================================
+# Main Window Class
+# ============================================================================
+
+
 class MainWindow(QMainWindow):
     """
     Main application window for TractEdit.
@@ -104,6 +119,7 @@ class MainWindow(QMainWindow):
         self.original_file_extension: Optional[str] = (
             None  # '.trk', '.tck', '.trx', or None
         )
+        self.trx_file_reference: Optional[Any] = None  # TRX memmap object reference
         self.scalar_data_per_point: Optional[
             Dict[str, "nib.streamlines.ArraySequence"]
         ] = None  # Dictionary: {scalar_name: [scalar_array_sl0, ...]}
@@ -121,13 +137,17 @@ class MainWindow(QMainWindow):
         self.image_opacity: float = 1.0
         self.roi_opacities: Dict[str, float] = {}
 
+        # Background thread references (for cleanup)
+        self._loader_thread: Optional[Any] = None
+        self._image_loader_thread: Optional[Any] = None
+
         # Initialize Anatomical Image Data Variables
         self.anatomical_image_path: Optional[str] = None
         self.anatomical_image_data: Optional[np.ndarray] = None  # Numpy array
         self.anatomical_image_affine: Optional[np.ndarray] = None  # 4x4 numpy array
+        self.anatomical_mmap_image: Optional["file_io.MemoryMappedImage"] = None
 
         # Unified Undo/Redo Stacks (all operations - streamlines and ROI)
-        # Each entry is a dict with 'action_type' key to identify the operation
         self.unified_undo_stack: List[Dict[str, Any]] = []
         self.unified_redo_stack: List[Dict[str, Any]] = []
 
@@ -155,9 +175,11 @@ class MainWindow(QMainWindow):
         # ODF / Glyphs Data
         self.odf_data: Optional[np.ndarray] = None
         self.odf_affine: Optional[np.ndarray] = None
+        self.odf_path: Optional[str] = None
         self.odf_sh_order: int = 0
         self.odf_sphere = None
         self.odf_basis_matrix = None
+        self.odf_tunnel_is_visible: bool = False
         self.MAX_ODF_STREAMLINES = 26000  # Safety limit for Tunnel View
 
         # Parcellation / Connectivity Data
@@ -207,13 +229,14 @@ class MainWindow(QMainWindow):
 
         # Window Properties
         self.setWindowTitle("TractEdit GUI - Interactive Editor")
-        self.setGeometry(100, 100, 1100, 850)
+        self.setMinimumSize(800, 600)
 
         # UI Managers
         self.actions_manager = ActionsManager(self)
         self.toolbars_manager = ToolbarsManager(self)
         self.data_panel_manager = DataPanelManager(self)
         self.drawing_modes_manager = DrawingModesManager(self)
+        self.theme_manager = ThemeManager(self)
 
         # Logic Managers
         self.roi_manager = ROIManager(self)
@@ -229,6 +252,9 @@ class MainWindow(QMainWindow):
         self.toolbars_manager.create_scalar_toolbar()
         self.toolbars_manager.setup_status_bar()
         self.toolbars_manager.setup_central_widget()  # This creates the VTKPanel
+
+        # Initialize theme after all UI components are created
+        self.theme_manager.initialize_theme()
 
         # Initial Status Update
         self._update_initial_status()
@@ -268,7 +294,7 @@ class MainWindow(QMainWindow):
         center_3d = roi_params["center"].copy()
         stored_view_type = roi_params.get("view_type", "axial")
 
-        # Un-flip X for display
+        # Undo radiological X-flip for 2D preview display (stored center is in 3D world coords)
         center_display = center_3d.copy()
         if stored_view_type in ["axial", "coronal"]:
             center_display[0] = -center_display[0]
@@ -309,7 +335,6 @@ class MainWindow(QMainWindow):
             return
 
         # Check if sphere params exist for this ROI
-
         if not hasattr(self.vtk_panel, "sphere_params_per_roi"):
             return
         if roi_name not in self.vtk_panel.sphere_params_per_roi:
@@ -344,14 +369,14 @@ class MainWindow(QMainWindow):
 
         # Convert center from world to voxel coordinates
         center_world = center_3d.copy()
-        # Un-flip X for the voxel transformation
+        # Undo radiological X-flip: stored center was flipped for 3D display
         if stored_view_type in ["axial", "coronal"]:
             center_world[0] = -center_world[0]
 
         p_h = np.append(center_world, 1.0)
         center_vox = np.dot(roi_inv_affine, p_h)[:3]
 
-        # Apply view-specific flip
+        # Compensate for radiological display X-flip when rasterizing to voxel space
         if stored_view_type in ["axial", "coronal"]:
             center_vox[0] = (shape[0] - 1) - center_vox[0]
         elif stored_view_type == "sagittal":
@@ -388,7 +413,7 @@ class MainWindow(QMainWindow):
         # Update stored radius
         self.vtk_panel.sphere_params_per_roi[roi_name]["radius"] = value
 
-        # Remove any existing 3D preview sphere (black sphere)
+        # Remove any existing 3D preview sphere
         if roi_name in self.vtk_panel.roi_slice_actors:
             old_sphere = self.vtk_panel.roi_slice_actors[roi_name].get("sphere_3d")
             if old_sphere:
@@ -430,7 +455,6 @@ class MainWindow(QMainWindow):
         self.skip_spinbox.setEnabled(checked)
 
         if checked:
-            # If enabled, apply whatever value is currently in the spinbox
             self._on_skip_changed()
         else:
             # If disabled, force reset to 0% skip (Show All)
@@ -599,6 +623,7 @@ class MainWindow(QMainWindow):
 
             self.odf_data = data
             self.odf_affine = affine
+            self.odf_path = file_path
             self.odf_sh_order = sh_order
 
             # Pre-compute Sphere and Basis (Tournier07) ##TODO - handle other basis types
@@ -616,6 +641,7 @@ class MainWindow(QMainWindow):
                 f"ODF Loaded (Order {sh_order}). Ready for Tunnel View."
             )
             self._update_action_states()
+            self._update_data_panel_display()
 
         except Exception as e:
             logger.error(f"Error loading ODF: {e}", exc_info=True)
@@ -760,8 +786,10 @@ class MainWindow(QMainWindow):
     def _toggle_odf_tunnel(self, checked: bool) -> None:
         """Computes the mask and updates the VTK actor with progress indication."""
         if not checked:
+            self.odf_tunnel_is_visible = False
             if self.vtk_panel:
                 self.vtk_panel.remove_odf_actor()
+            self._update_data_panel_display()
             return
 
         if self.odf_data is None or self.tractogram_data is None:
@@ -853,12 +881,81 @@ class MainWindow(QMainWindow):
             self.vtk_panel.update_progress_bar(TOTAL_STEPS, TOTAL_STEPS, visible=True)
             QApplication.processEvents()
 
+            # Mark tunnel as visible and update data panel
+            self.odf_tunnel_is_visible = True
+            self._update_data_panel_display()
+
         except Exception as e:
             logger.error(f"Error computing Tunnel View: {e}", exc_info=True)
             self.vtk_panel.update_status("Error generating Tunnel View.")
             self.view_odf_tunnel_action.setChecked(False)
+            self.odf_tunnel_is_visible = False
         finally:
             self.vtk_panel.update_progress_bar(0, 0, visible=False)
+
+    def _toggle_odf_tunnel_visibility(self, visible: bool) -> None:
+        """
+        Toggles the visibility of the ODF tunnel actor without recomputing.
+
+        Args:
+            visible: True to show, False to hide the ODF tunnel.
+        """
+        if not self.vtk_panel or not self.vtk_panel.odf_actor:
+            return
+
+        try:
+            self.vtk_panel.odf_actor.SetVisibility(visible)
+            self.odf_tunnel_is_visible = visible
+
+            # Sync the menu action state
+            self.view_odf_tunnel_action.blockSignals(True)
+            self.view_odf_tunnel_action.setChecked(visible)
+            self.view_odf_tunnel_action.blockSignals(False)
+
+            if self.vtk_panel.render_window:
+                self.vtk_panel.render_window.Render()
+
+            status = "shown" if visible else "hidden"
+            self.vtk_panel.update_status(f"ODF Tunnel {status}")
+
+        except Exception as e:
+            logger.error(f"Error toggling ODF tunnel visibility: {e}", exc_info=True)
+
+    def _remove_odf_data(self) -> None:
+        """
+        Removes the ODF data and tunnel actor from the scene.
+
+        Clears all ODF-related data and updates the UI accordingly.
+        """
+        try:
+            # Remove the ODF actor from the scene
+            if self.vtk_panel:
+                self.vtk_panel.remove_odf_actor()
+
+            # Clear ODF data
+            self.odf_data = None
+            self.odf_affine = None
+            self.odf_path = None
+            self.odf_sh_order = 0
+            self.odf_sphere = None
+            self.odf_basis_matrix = None
+            self.odf_tunnel_is_visible = False
+
+            # Update the menu action state
+            self.view_odf_tunnel_action.blockSignals(True)
+            self.view_odf_tunnel_action.setChecked(False)
+            self.view_odf_tunnel_action.setEnabled(False)
+            self.view_odf_tunnel_action.blockSignals(False)
+
+            # Update the data panel
+            self._update_data_panel_display()
+            self._update_action_states()
+
+            if self.vtk_panel:
+                self.vtk_panel.update_status("ODF data removed")
+
+        except Exception as e:
+            logger.error(f"Error removing ODF data: {e}", exc_info=True)
 
     def _update_bundle_info_display(self) -> None:
         """Updates the data information QLabel in the status bar for both streamlines and image."""
@@ -944,7 +1041,6 @@ class MainWindow(QMainWindow):
             final_text = f" {bundle_text}{separator}{image_text}{roi_text} "
 
         self.data_info_label.setText(final_text)
-
 
     def _update_data_panel_display(self) -> None:
         """
@@ -1133,6 +1229,50 @@ class MainWindow(QMainWindow):
                 roi_item.setToolTip(0, f"Path: {path}\nShape: {shape_str}")
 
             roi_root_item.setExpanded(True)
+
+        # ===== ODF TUNNEL SECTION =====
+        if self.odf_data is not None:
+            odf_header = QTreeWidgetItem(self.data_tree_widget, ["ODF Data"])
+            odf_header.setIcon(
+                0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
+            )
+
+            odf_name = (
+                os.path.basename(self.odf_path) if self.odf_path else "Loaded ODF"
+            )
+
+            # Main ODF file item (not checkable, just informational)
+            odf_file_item = QTreeWidgetItem(odf_header, [odf_name])
+            odf_file_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "odf_data"})
+            shape_str = format_tuple(self.odf_data.shape, precision=0)
+            odf_file_item.setToolTip(
+                0,
+                f"Path: {self.odf_path}\n"
+                f"Shape: {shape_str}\n"
+                f"SH Order: {self.odf_sh_order}",
+            )
+
+            # ODF Tunnel View item (checkable for visibility toggle)
+            # Only show if tunnel has been computed (actor exists)
+            if self.vtk_panel and self.vtk_panel.odf_actor is not None:
+                tunnel_item = QTreeWidgetItem(odf_header, ["ODF Tunnel View"])
+                tunnel_item.setFlags(
+                    tunnel_item.flags() | Qt.ItemFlag.ItemIsUserCheckable
+                )
+                tunnel_state = (
+                    Qt.CheckState.Checked
+                    if self.odf_tunnel_is_visible
+                    else Qt.CheckState.Unchecked
+                )
+                tunnel_item.setCheckState(0, tunnel_state)
+                tunnel_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "odf_tunnel"})
+                tunnel_item.setToolTip(
+                    0,
+                    "Toggle visibility of the ODF Tunnel View.\n"
+                    "Right-click to remove.",
+                )
+
+            odf_header.setExpanded(True)
 
         # ===== FREESURFER PARCELLATION SECTION =====
         if self.parcellation_data is not None:
@@ -1440,11 +1580,25 @@ class MainWindow(QMainWindow):
             self.original_trk_affine = None
             self.original_trk_path = None
             self.original_file_extension = None
+
+            # Close TRX memmap file reference (releases temp directory)
+            if self.trx_file_reference is not None:
+                try:
+                    if hasattr(self.trx_file_reference, "close"):
+                        self.trx_file_reference.close()
+                except Exception:
+                    pass
+                self.trx_file_reference = None
+
             self.scalar_data_per_point = None
             self.active_scalar_name = None
             self.odf_data = None
             self.odf_affine = None
+            self.odf_path = None
             self.odf_sh_order = 0
+            self.odf_sphere = None
+            self.odf_basis_matrix = None
+            self.odf_tunnel_is_visible = False
             self.view_odf_tunnel_action.blockSignals(True)  # Prevent triggering logic
             self.view_odf_tunnel_action.setChecked(False)
             self.view_odf_tunnel_action.setEnabled(False)
@@ -1486,6 +1640,7 @@ class MainWindow(QMainWindow):
             # Update UI
             self._update_bundle_info_display()
             self._update_action_states()
+            self._update_data_panel_display()  # Refresh data panel tree widget
 
         except Exception as e:
             logger.error(f"Error in _close_bundle: {e}", exc_info=True)
@@ -1506,17 +1661,18 @@ class MainWindow(QMainWindow):
             if anat_path:
                 if os.path.exists(anat_path):
                     logger.info(f"Loading initial anatomical image: {anat_path}")
-                    # Clear existing ROIs/Image if any 
+                    # Clear existing ROIs/Image if any
                     self._trigger_clear_anatomical_image(notify=False)
 
-                    img_data, img_affine, img_path = file_io.load_anatomical_image(
-                        self, file_path=anat_path
+                    img_data, img_affine, img_path, mmap_img = (
+                        file_io.load_anatomical_image(self, file_path=anat_path)
                     )
 
                     if img_data is not None and img_affine is not None:
                         self.anatomical_image_data = img_data
                         self.anatomical_image_affine = img_affine
                         self.anatomical_image_path = img_path
+                        self.anatomical_mmap_image = mmap_img
                         self.image_is_visible = True
 
                         if self.vtk_panel:
@@ -1552,7 +1708,7 @@ class MainWindow(QMainWindow):
                     logger.info(f"Loading initial ROIs: {valid_rois}")
                     loaded_rois = file_io.load_roi_images(self, file_paths=valid_rois)
 
-                    # Iterate through every loaded ROI 
+                    # Iterate through every loaded ROI
                     for _, _, roi_path in loaded_rois:
                         if roi_path in self.roi_layers:
                             logger.warning(
@@ -1649,7 +1805,7 @@ class MainWindow(QMainWindow):
                     # Create New ROI
                     self._trigger_new_roi()
 
-                    # Get the newly created ROI name 
+                    # Get the newly created ROI name
                     roi_name = self.current_drawing_roi
                     if roi_name:
                         # Draw Sphere
@@ -1734,6 +1890,9 @@ class MainWindow(QMainWindow):
         self.anatomical_image_data = None
         self.anatomical_image_affine = None
         self.anatomical_image_path = None
+        if self.anatomical_mmap_image:
+            self.anatomical_mmap_image.clear_cache()
+        self.anatomical_mmap_image = None
         self.image_is_visible = True  # Reset visibility flag
 
         if self.vtk_panel:
@@ -1741,7 +1900,7 @@ class MainWindow(QMainWindow):
             if notify:
                 self.vtk_panel.update_status("Anatomical image cleared.")
 
-            # If no bundle is loaded, reset camera 
+            # If no bundle is loaded, reset camera
             if not self.tractogram_data and self.vtk_panel.scene:
                 self.vtk_panel.scene.reset_camera()
 
@@ -1793,11 +1952,11 @@ class MainWindow(QMainWindow):
         if not self.tractogram_data:
             return
 
-        # Determine Target Grid 
+        # Determine Target Grid
         affine = None
         shape = None
 
-        # Priority A: Loaded Anatomical Image 
+        # Priority A: Loaded Anatomical Image
         if self.anatomical_image_data is not None:
             affine = self.anatomical_image_affine
             shape = self.anatomical_image_data.shape[:3]
@@ -2032,14 +2191,20 @@ class MainWindow(QMainWindow):
         saved_trk_path = self.original_trk_path
 
         if self.anatomical_image_data is not None:
-            reply = QMessageBox.question(
-                self,
-                "Replace Image?",
-                "An anatomical image is already loaded.\nReplace it?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if reply == QMessageBox.StandardButton.No:
+            # Custom message box to enforce "Yes" on the Left and "No" on the Right
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("Replace Image?")
+            msg_box.setText("An anatomical image is already loaded.\nReplace it?")
+            msg_box.setIcon(QMessageBox.Icon.Question)
+
+            # Use ActionRole to prevent platform-specific reordering
+            yes_btn = msg_box.addButton("Yes", QMessageBox.ButtonRole.ActionRole)
+            no_btn = msg_box.addButton("No", QMessageBox.ButtonRole.ActionRole)
+
+            msg_box.setDefaultButton(no_btn)
+            msg_box.exec()
+
+            if msg_box.clickedButton() != yes_btn:
                 return
             else:
                 self._trigger_clear_anatomical_image()  # Clear before loading new one
@@ -2047,6 +2212,9 @@ class MainWindow(QMainWindow):
         # Clear ROIs if present
         if self.roi_layers:
             self._trigger_clear_all_rois(notify=False)
+
+        # Reset all drawing modes to prevent stuck state after clearing ROIs
+        self._reset_all_drawing_modes()
 
         # Get file path first (this is fast)
         file_filter = "NIfTI Image Files (*.nii *.nii.gz);;All Files (*.*)"
@@ -2072,44 +2240,8 @@ class MainWindow(QMainWindow):
         progress.setMinimumDuration(0)
         progress.setMinimumWidth(350)
 
-        # Apply custom style to match VTK panel theme
-        progress.setStyleSheet(
-            """
-            QProgressDialog {
-                background-color: #2b2b2b;
-                color: #dddddd;
-            }
-            QLabel {
-                color: #dddddd;
-                font-size: 12px;
-                font-weight: bold;
-                margin-bottom: 5px;
-            }
-            QProgressBar {
-                border: 1px solid #555;
-                border-radius: 4px;
-                background-color: #333;
-                color: white;
-                text-align: center;
-                font-size: 12px;
-                height: 25px;
-            }
-            QProgressBar::chunk {
-                background-color: #05B8CC;
-                border-radius: 3px;
-            }
-            QPushButton {
-                background-color: #444;
-                color: #ddd;
-                border: 1px solid #555;
-                border-radius: 4px;
-                padding: 4px 12px;
-            }
-            QPushButton:hover {
-                background-color: #555;
-            }
-        """
-        )
+        # Apply theme-aware style
+        progress.setStyleSheet(self.theme_manager.get_progress_dialog_style())
 
         progress.setValue(0)
         progress.show()
@@ -2129,15 +2261,20 @@ class MainWindow(QMainWindow):
 
         def on_finished(data):
             try:
-                progress.close()
+                # Update progress to show we're creating VTK actors (this is the heavy part)
+                progress.setLabelText("Creating slicer actors...")
+                progress.setValue(95)
+                QApplication.processEvents()  # Keep UI responsive
 
                 self.anatomical_image_data = data["data"]
                 self.anatomical_image_affine = data["affine"]
                 self.anatomical_image_path = data["path"]
+                self.anatomical_mmap_image = data.get("mmap_image")
                 self.image_is_visible = True
 
                 if self.vtk_panel:
                     self.vtk_panel.update_anatomical_slices()
+                    QApplication.processEvents()  # Allow UI to update after heavy work
                     if self.vtk_panel.scene:
                         self.vtk_panel.scene.reset_camera()
                         self.vtk_panel.scene.reset_clipping_range()
@@ -2151,8 +2288,12 @@ class MainWindow(QMainWindow):
                 self._update_action_states()
                 self._update_data_panel_display()
 
+                # Close progress dialog after ALL work is complete
+                progress.close()
+
             except Exception as e:
                 logger.error(f"Error in on_finished: {e}", exc_info=True)
+                progress.close()  # Ensure progress is closed on error
                 QMessageBox.critical(self, "Load Error", f"Error finalizing load:\n{e}")
 
         # Connect Signals
@@ -2297,6 +2438,24 @@ class MainWindow(QMainWindow):
         if not self.roi_layers:
             return
 
+        # Check if any ROI had active filters before clearing
+        # If so, auto-enable skip to prevent rendering millions of streamlines
+        had_active_filters = any(
+            state.get("include", False) or state.get("exclude", False)
+            for state in self.roi_states.values()
+        )
+
+        if had_active_filters:
+            if self.tractogram_data is not None and len(self.tractogram_data) > 20000:
+                if (
+                    hasattr(self, "skip_checkbox")
+                    and not self.skip_checkbox.isChecked()
+                ):
+                    self._auto_calculate_skip_level()
+
+        # Reset all drawing modes (fixes crosshair navigation bug)
+        self._reset_all_drawing_modes()
+
         # Clear Data Containers
         self.roi_layers.clear()
         self.roi_visibility.clear()
@@ -2330,6 +2489,13 @@ class MainWindow(QMainWindow):
 
         if not has_data:
             return
+
+        # IMPORTANT: Auto-enable skip BEFORE clearing filters to prevent
+        # rendering millions of streamlines when filters are removed.
+        # This fixes the freeze/crash when Clear All is pressed with skip off.
+        if self.tractogram_data is not None and len(self.tractogram_data) > 20000:
+            if hasattr(self, "skip_checkbox") and not self.skip_checkbox.isChecked():
+                self._auto_calculate_skip_level()
 
         # Clear ROIs first
         if self.roi_layers:
@@ -2518,56 +2684,179 @@ class MainWindow(QMainWindow):
         )
         prompt_message = "Data (streamlines and/or image) is currently loaded.\nAre you sure you want to quit?"
 
+        should_exit = False
+
         if data_loaded:
-            reply = QMessageBox.question(
-                self,
-                "Confirm Quit",
-                prompt_message,
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if reply == QMessageBox.StandardButton.Yes:
+            # Custom message box to enforce "Yes" on the Left and "No" on the Right
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("Confirm Quit")
+            msg_box.setText(prompt_message)
+            msg_box.setIcon(QMessageBox.Icon.Question)
+
+            # Use ActionRole to prevent platform-specific reordering
+            yes_btn = msg_box.addButton("Yes", QMessageBox.ButtonRole.ActionRole)
+            no_btn = msg_box.addButton("No", QMessageBox.ButtonRole.ActionRole)
+
+            msg_box.setDefaultButton(no_btn)
+            msg_box.exec()
+
+            if msg_box.clickedButton() == yes_btn:
                 logger.info("User confirmed quit. Cleaning up...")
+                self._cleanup_resources()
                 self._cleanup_vtk()
                 event.accept()
+                should_exit = True
             else:
                 logger.info("User cancelled quit.")
                 event.ignore()
         else:
             logger.info("No data loaded. Cleaning up...")
+            self._cleanup_resources()
             self._cleanup_vtk()
             event.accept()
+            should_exit = True
+
+        # On Linux, force immediate exit to prevent VTK/Qt cleanup conflicts
+        # that cause segmentation faults.
+        # Windows and macOS don't typically have this issue.
+        if should_exit:
+            import sys
+
+            if sys.platform.startswith("linux"):
+                import os
+
+                logger.info("Exiting application (Linux workaround)...")
+                os._exit(0)
+
+    def _cleanup_resources(self) -> None:
+        """Cleans up non-VTK resources before application exit."""
+        # Terminate any running background threads
+        for thread_attr in ("_loader_thread", "_image_loader_thread"):
+            thread = getattr(self, thread_attr, None)
+            if thread is not None:
+                try:
+                    if thread.isRunning():
+                        logger.info(f"Terminating {thread_attr}...")
+                        thread.terminate()
+                        thread.wait(1000)  # Wait up to 1 second
+                except Exception as e:
+                    logger.warning(f"Error terminating {thread_attr}: {e}")
+
+        # Clear memory-mapped image cache
+        if self.anatomical_mmap_image is not None:
+            try:
+                self.anatomical_mmap_image.clear_cache()
+            except Exception:
+                pass
+            self.anatomical_mmap_image = None
+
+        # Close TRX memmap file reference (releases temp directory)
+        if self.trx_file_reference is not None:
+            try:
+                if hasattr(self.trx_file_reference, "close"):
+                    self.trx_file_reference.close()
+            except Exception:
+                pass
+            self.trx_file_reference = None
+
+        # Clear large data arrays to help garbage collection
+        self.tractogram_data = None
+        self.streamline_bboxes = None
+        self.anatomical_image_data = None
+        self.odf_data = None
+        self.parcellation_data = None
 
     def _cleanup_vtk(self) -> None:
-        """Safely cleans up VTK resources."""
-        logger.info("Starting VTK cleanup...")
-        if hasattr(self, "vtk_panel") and self.vtk_panel:
-            if hasattr(self.vtk_panel, "scene") and self.vtk_panel.scene:
-                try:
-                    logger.info("Clearing scene...")
-                    self.vtk_panel.scene.clear()
-                except Exception as e:
-                    logger.error(f"Error clearing FURY scene: {e}")
+        """Safely cleans up VTK resources for all 4 views."""
+        if not hasattr(self, "vtk_panel") or not self.vtk_panel:
+            return
 
-            if hasattr(self.vtk_panel, "interactor") and self.vtk_panel.interactor:
-                try:
-                    logger.info("Terminating interactor...")
-                    if self.vtk_panel.interactor.GetInitialized():
-                        self.vtk_panel.interactor.TerminateApp()
-                    self.vtk_panel.interactor.RemoveAllObservers()
-                except Exception as e:
-                    logger.error(f"Error terminating/cleaning VTK interactor: {e}")
+        panel = self.vtk_panel
 
-            if (
-                hasattr(self.vtk_panel, "render_window")
-                and self.vtk_panel.render_window
-            ):
+        # Step 1: Clear all scenes (remove actors to prevent dangling references)
+        scenes_to_clear = [
+            panel.scene,
+            getattr(panel, "axial_scene", None),
+            getattr(panel, "coronal_scene", None),
+            getattr(panel, "sagittal_scene", None),
+        ]
+        for scene in scenes_to_clear:
+            if scene:
                 try:
-                    logger.info("Finalizing render window...")
-                    self.vtk_panel.render_window.Finalize()
-                except Exception as e:
-                    logger.error(f"Error finalizing VTK render window: {e}")
-        logger.info("VTK cleanup finished.")
+                    scene.clear()
+                except Exception:
+                    pass
+
+        # Step 2: Remove all observers and terminate all interactors
+        interactors = [
+            getattr(panel, "interactor", None),
+            getattr(panel, "axial_interactor", None),
+            getattr(panel, "coronal_interactor", None),
+            getattr(panel, "sagittal_interactor", None),
+        ]
+        for interactor in interactors:
+            if interactor:
+                try:
+                    interactor.RemoveAllObservers()
+                    if interactor.GetInitialized():
+                        interactor.TerminateApp()
+                except Exception:
+                    pass
+
+        # Step 3: Close QVTKRenderWindowInteractor widgets
+        # This prevents Qt from trying to access finalized VTK resources
+        qt_vtk_widgets = [
+            getattr(panel, "vtk_widget", None),
+            getattr(panel, "axial_vtk_widget", None),
+            getattr(panel, "coronal_vtk_widget", None),
+            getattr(panel, "sagittal_vtk_widget", None),
+        ]
+        for widget in qt_vtk_widgets:
+            if widget:
+                try:
+                    rw = widget.GetRenderWindow()
+                    if rw:
+                        rw.Finalize()
+                    widget.close()
+                except Exception:
+                    pass
+
+        # Step 4: Set references to None to help garbage collection
+        panel.scene = None
+        panel.axial_scene = None
+        panel.coronal_scene = None
+        panel.sagittal_scene = None
+        panel.interactor = None
+        panel.axial_interactor = None
+        panel.coronal_interactor = None
+        panel.sagittal_interactor = None
+        panel.render_window = None
+        panel.axial_render_window = None
+        panel.coronal_render_window = None
+        panel.sagittal_render_window = None
+        panel.vtk_widget = None
+        panel.axial_vtk_widget = None
+        panel.coronal_vtk_widget = None
+        panel.sagittal_vtk_widget = None
+
+    # Theme switching methods
+    def _set_theme_light(self) -> None:
+        """Sets the application to light theme."""
+        self.theme_manager.set_theme(ThemeMode.LIGHT)
+        if self.vtk_panel:
+            self.vtk_panel.update_status("Theme changed to Light")
+
+    def _set_theme_dark(self) -> None:
+        """Sets the application to dark theme."""
+        self.theme_manager.set_theme(ThemeMode.DARK)
+        if self.vtk_panel:
+            self.vtk_panel.update_status("Theme changed to Dark")
+
+    def _set_theme_system(self) -> None:
+        """Sets the application to follow system theme."""
+        self.theme_manager.set_theme(ThemeMode.SYSTEM)
+        if self.vtk_panel:
+            self.vtk_panel.update_status("Theme changed to System")
 
     # Help-About dialog
     def _show_about_dialog(self) -> None:
@@ -2591,7 +2880,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.warning(f"Could not load logo for About dialog: {e}")
 
-        about_text = """<b>TractEdit version 3.0.1</b><br><br>
+        about_text = """<b>TractEdit version 3.2.0</b><br><br>
         Author: Marco Tagliaferri, PhD Candidate in Neuroscience<br>
         Center for Mind/Brain Sciences (CIMeC)
         University of Trento, Italy

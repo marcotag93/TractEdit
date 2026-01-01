@@ -7,6 +7,10 @@ Handles drawing mode toggles (pencil, eraser, sphere, rectangle)
 and their related UI updates.
 """
 
+# ============================================================================
+# Imports
+# ============================================================================
+
 from __future__ import annotations
 
 import logging
@@ -22,44 +26,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Common button styles
-BUTTON_STYLE_DEFAULT = """
-    QToolButton {
-        background-color: #f0f0f0;
-        border: 1px solid #c0c0c0;
-        border-radius: 5px;
-        padding: 2px;
-        margin-left: 5px;
-    }
-    QToolButton:hover {
-        background-color: #e8e8e8;
-        border: 1px solid #b0b0b0;
-    }
-    QToolButton:checked {
-        background-color: #d0d0d0;
-        border: 1px inset #a0a0a0;
-        padding: 3px 1px 1px 3px;
-    }
-"""
 
-BUTTON_STYLE_ACTIVE = """
-    QToolButton {
-        background-color: rgb(0, 188, 212);  /* Cyan */
-        border: 1px solid #00ACC1;
-        border-radius: 5px;
-        padding: 2px;
-        margin-left: 5px;
-    }
-    QToolButton:hover {
-        background-color: rgb(0, 172, 193);
-        border: 1px solid #0097A7;
-    }
-    QToolButton:checked {
-        background-color: rgb(0, 151, 167);
-        border: 1px inset #00838F;
-        padding: 3px 1px 1px 3px;
-    }
-"""
+# ============================================================================
+# Drawing Modes Manager Class
+# ============================================================================
 
 
 class DrawingModesManager:
@@ -81,6 +51,54 @@ class DrawingModesManager:
             main_window: Reference to the parent MainWindow instance.
         """
         self.mw = main_window
+
+    def _get_button_style_default(self) -> str:
+        """Returns the default button style from theme manager."""
+        if hasattr(self.mw, "theme_manager"):
+            return self.mw.theme_manager.get_button_style_default()
+        # Fallback light style if theme manager not available
+        return """
+            QToolButton {
+                background-color: #f0f0f0;
+                border: 1px solid #c0c0c0;
+                border-radius: 5px;
+                padding: 2px;
+                margin-left: 5px;
+            }
+            QToolButton:hover {
+                background-color: #e8e8e8;
+                border: 1px solid #b0b0b0;
+            }
+            QToolButton:checked {
+                background-color: #d0d0d0;
+                border: 1px inset #a0a0a0;
+                padding: 3px 1px 1px 3px;
+            }
+        """
+
+    def _get_button_style_active(self) -> str:
+        """Returns the active button style from theme manager."""
+        if hasattr(self.mw, "theme_manager"):
+            return self.mw.theme_manager.get_button_style_active()
+        # Fallback active style if theme manager not available
+        return """
+            QToolButton {
+                background-color: rgb(0, 188, 212);
+                border: 1px solid #00ACC1;
+                border-radius: 5px;
+                padding: 2px;
+                margin-left: 5px;
+            }
+            QToolButton:hover {
+                background-color: rgb(0, 172, 193);
+                border: 1px solid #0097A7;
+            }
+            QToolButton:checked {
+                background-color: rgb(0, 151, 167);
+                border: 1px inset #00838F;
+                padding: 3px 1px 1px 3px;
+            }
+        """
 
     def trigger_new_roi(self) -> None:
         """Creates a new empty ROI image for manual drawing."""
@@ -148,6 +166,16 @@ class DrawingModesManager:
     def toggle_draw_mode(self, checked: bool) -> None:
         """Toggles between drawing mode and navigation mode."""
         mw = self.mw
+
+        # Guard: Prevent activation when no ROIs exist
+        if checked and not mw.roi_layers:
+            mw.draw_mode_action.setChecked(False)
+            if mw.vtk_panel:
+                mw.vtk_panel.update_status(
+                    "Draw Mode: No ROI available. Create or load an ROI first."
+                )
+            return
+
         mw.is_drawing_mode = checked
 
         # Turn off other modes if draw mode is activated
@@ -158,9 +186,9 @@ class DrawingModesManager:
 
         # Update button style
         if checked:
-            mw.draw_mode_button.setStyleSheet(BUTTON_STYLE_ACTIVE)
+            mw.draw_mode_button.setStyleSheet(self._get_button_style_active())
         else:
-            mw.draw_mode_button.setStyleSheet(BUTTON_STYLE_DEFAULT)
+            mw.draw_mode_button.setStyleSheet(self._get_button_style_default())
 
         # Update VTK panel
         if mw.vtk_panel:
@@ -189,6 +217,16 @@ class DrawingModesManager:
     def toggle_erase_mode(self, checked: bool) -> None:
         """Toggles between eraser mode and navigation mode."""
         mw = self.mw
+
+        # Guard: Prevent activation when no ROIs exist
+        if checked and not mw.roi_layers:
+            mw.erase_mode_action.setChecked(False)
+            if mw.vtk_panel:
+                mw.vtk_panel.update_status(
+                    "Erase Mode: No ROI available. Create or load an ROI first."
+                )
+            return
+
         mw.is_eraser_mode = checked
 
         # Turn off other modes if eraser mode is activated
@@ -199,9 +237,9 @@ class DrawingModesManager:
 
         # Update button style
         if checked:
-            mw.erase_mode_button.setStyleSheet(BUTTON_STYLE_ACTIVE)
+            mw.erase_mode_button.setStyleSheet(self._get_button_style_active())
         else:
-            mw.erase_mode_button.setStyleSheet(BUTTON_STYLE_DEFAULT)
+            mw.erase_mode_button.setStyleSheet(self._get_button_style_default())
 
         # Update VTK panel
         if mw.vtk_panel:
@@ -230,6 +268,15 @@ class DrawingModesManager:
         """Toggles between sphere drawing mode and navigation mode."""
         mw = self.mw
 
+        # Guard: Prevent activation when no ROIs exist
+        if checked and not mw.roi_layers:
+            mw.sphere_mode_action.setChecked(False)
+            if mw.vtk_panel:
+                mw.vtk_panel.update_status(
+                    "Sphere Mode: No ROI available. Create or load an ROI first."
+                )
+            return
+
         # Turn off other modes
         if checked:
             self._deactivate_draw_mode()
@@ -238,9 +285,9 @@ class DrawingModesManager:
 
         # Update button style
         if checked:
-            mw.sphere_mode_button.setStyleSheet(BUTTON_STYLE_ACTIVE)
+            mw.sphere_mode_button.setStyleSheet(self._get_button_style_active())
         else:
-            mw.sphere_mode_button.setStyleSheet(BUTTON_STYLE_DEFAULT)
+            mw.sphere_mode_button.setStyleSheet(self._get_button_style_default())
 
         # Show/hide sphere radius control
         if hasattr(mw, "sphere_radius_container"):
@@ -288,6 +335,15 @@ class DrawingModesManager:
         """Toggles between rectangle drawing mode and navigation mode."""
         mw = self.mw
 
+        # Guard: Prevent activation when no ROIs exist
+        if checked and not mw.roi_layers:
+            mw.rectangle_mode_action.setChecked(False)
+            if mw.vtk_panel:
+                mw.vtk_panel.update_status(
+                    "Rectangle Mode: No ROI available. Create or load an ROI first."
+                )
+            return
+
         # Turn off other modes
         if checked:
             self._deactivate_draw_mode()
@@ -296,9 +352,9 @@ class DrawingModesManager:
 
         # Update button style
         if checked:
-            mw.rectangle_mode_button.setStyleSheet(BUTTON_STYLE_ACTIVE)
+            mw.rectangle_mode_button.setStyleSheet(self._get_button_style_active())
         else:
-            mw.rectangle_mode_button.setStyleSheet(BUTTON_STYLE_DEFAULT)
+            mw.rectangle_mode_button.setStyleSheet(self._get_button_style_default())
 
         # Update VTK panel
         if mw.vtk_panel:
@@ -333,18 +389,18 @@ class DrawingModesManager:
         # Reset Drawing Mode
         mw.is_drawing_mode = False
         mw.draw_mode_action.setChecked(False)
-        mw.draw_mode_button.setStyleSheet(BUTTON_STYLE_DEFAULT)
+        mw.draw_mode_button.setStyleSheet(self._get_button_style_default())
 
         # Reset Eraser Mode
         mw.is_eraser_mode = False
         mw.erase_mode_action.setChecked(False)
-        mw.erase_mode_button.setStyleSheet(BUTTON_STYLE_DEFAULT)
+        mw.erase_mode_button.setStyleSheet(self._get_button_style_default())
 
         # Reset Sphere Mode
         if hasattr(mw, "is_sphere_mode"):
             mw.is_sphere_mode = False
         mw.sphere_mode_action.setChecked(False)
-        mw.sphere_mode_button.setStyleSheet(BUTTON_STYLE_DEFAULT)
+        mw.sphere_mode_button.setStyleSheet(self._get_button_style_default())
         if hasattr(mw, "sphere_radius_container"):
             mw.sphere_radius_container.setVisible(False)
 
@@ -352,7 +408,7 @@ class DrawingModesManager:
         if hasattr(mw, "is_rectangle_mode"):
             mw.is_rectangle_mode = False
         mw.rectangle_mode_action.setChecked(False)
-        mw.rectangle_mode_button.setStyleSheet(BUTTON_STYLE_DEFAULT)
+        mw.rectangle_mode_button.setStyleSheet(self._get_button_style_default())
 
         # Reset current drawing ROI
         mw.current_drawing_roi = None
@@ -369,7 +425,7 @@ class DrawingModesManager:
         if mw.is_drawing_mode:
             mw.is_drawing_mode = False
             mw.draw_mode_action.setChecked(False)
-            mw.draw_mode_button.setStyleSheet(BUTTON_STYLE_DEFAULT)
+            mw.draw_mode_button.setStyleSheet(self._get_button_style_default())
 
     def _deactivate_eraser_mode(self) -> None:
         """Deactivates eraser mode without triggering the toggle handler."""
@@ -377,7 +433,7 @@ class DrawingModesManager:
         if mw.is_eraser_mode:
             mw.is_eraser_mode = False
             mw.erase_mode_action.setChecked(False)
-            mw.erase_mode_button.setStyleSheet(BUTTON_STYLE_DEFAULT)
+            mw.erase_mode_button.setStyleSheet(self._get_button_style_default())
 
     def _deactivate_sphere_mode(self) -> None:
         """Deactivates sphere mode without triggering the toggle handler."""
@@ -385,7 +441,7 @@ class DrawingModesManager:
         if getattr(mw, "is_sphere_mode", False):
             mw.is_sphere_mode = False
             mw.sphere_mode_action.setChecked(False)
-            mw.sphere_mode_button.setStyleSheet(BUTTON_STYLE_DEFAULT)
+            mw.sphere_mode_button.setStyleSheet(self._get_button_style_default())
             if hasattr(mw, "sphere_radius_container"):
                 mw.sphere_radius_container.setVisible(False)
 
@@ -395,4 +451,4 @@ class DrawingModesManager:
         if getattr(mw, "is_rectangle_mode", False):
             mw.is_rectangle_mode = False
             mw.rectangle_mode_action.setChecked(False)
-            mw.rectangle_mode_button.setStyleSheet(BUTTON_STYLE_DEFAULT)
+            mw.rectangle_mode_button.setStyleSheet(self._get_button_style_default())

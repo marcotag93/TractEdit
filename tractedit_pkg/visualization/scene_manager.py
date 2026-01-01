@@ -7,6 +7,10 @@ Manages the 4-view camera states, crosshair updates, and scene
 initialization for the axial, coronal, sagittal, and 3D views.
 """
 
+# ============================================================================
+# Imports
+# ============================================================================
+
 import logging
 from typing import TYPE_CHECKING, Optional, Dict, List, Tuple, Any
 
@@ -21,6 +25,11 @@ if TYPE_CHECKING:
     from .vtk_panel import VTKPanel
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Scene Manager Class
+# ============================================================================
 
 
 class SceneManager:

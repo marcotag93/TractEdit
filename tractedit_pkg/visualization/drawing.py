@@ -7,6 +7,10 @@ Handles pencil, eraser, sphere, and rectangle drawing modes,
 including preview visualization and rasterization to 3D volumes.
 """
 
+# ============================================================================
+# Imports
+# ============================================================================
+
 from __future__ import annotations
 
 import logging
@@ -21,6 +25,11 @@ if TYPE_CHECKING:
     from .vtk_panel import VTKPanel
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Drawing Manager Class
+# ============================================================================
 
 
 class DrawingManager:
@@ -655,10 +664,8 @@ class DrawingManager:
         if not roi_actors or actor_key not in roi_actors:
             # Fallback to affine
             vox_points_float = np.dot(roi_inv_affine, homog_points.T).T[:, :3]
-            if view_type in ["axial", "coronal"]:
-                vox_points_float[:, 0] = (shape[0] - 1) - vox_points_float[:, 0]
-            elif view_type == "sagittal":
-                vox_points_float[:, 0] = (shape[0] - 1) - vox_points_float[:, 0] - 1
+            # Apply X-flip for radiological display convention
+            vox_points_float[:, 0] = (shape[0] - 1) - vox_points_float[:, 0]
         else:
             actor_obj = roi_actors[actor_key]
             matrix = actor_obj.GetMatrix()
@@ -697,11 +704,14 @@ class DrawingManager:
             else:
                 vox_points_float = model_points
 
-            # Apply flips
-            if view_type in ["axial", "coronal"]:
+            # Compensate for radiological display X-flip
+            if view_type in ["axial", "coronal", "sagittal"]:
                 vox_points_float[:, 0] = (shape[0] - 1) - vox_points_float[:, 0]
-            elif view_type == "sagittal":
-                vox_points_float[:, 0] = (shape[0] - 1) - vox_points_float[:, 0] - 1
+
+            # Compensate for sagittal +1 display offset
+            # (see vtk_panel.py add_roi_layer line ~2039 and slice navigation line ~1504)
+            if view_type == "sagittal":
+                vox_points_float[:, 0] = vox_points_float[:, 0] - 1
 
         return vox_points_float
 
@@ -1008,7 +1018,8 @@ class DrawingManager:
         current_radius = roi_params["radius"]
         stored_view_type = roi_params.get("view_type", "axial")
 
-        # Un-flip X for Axial/Coronal
+        # Undo radiological X-flip: stored center was flipped for 3D display,
+        # restore to world coordinates for rasterization
         if stored_view_type in ["axial", "coronal"]:
             center_world[0] = -center_world[0]
 
@@ -1151,13 +1162,10 @@ class DrawingManager:
             p_h_e = np.append(edge_w, 1.0)
             edge_vox = np.dot(roi_inv_affine, p_h_e)[:3]
 
-        # Apply flips
-        if view_type in ["axial", "coronal"]:
+        # Compensate for radiological display X-flip when rasterizing to voxel space
+        if view_type in ["axial", "coronal", "sagittal"]:
             center_vox[0] = (shape[0] - 1) - center_vox[0]
             edge_vox[0] = (shape[0] - 1) - edge_vox[0]
-        elif view_type == "sagittal":
-            center_vox[0] = (shape[0] - 1) - center_vox[0] - 1
-            edge_vox[0] = (shape[0] - 1) - edge_vox[0] - 1
 
         radius_v = np.linalg.norm(center_vox - edge_vox)
 

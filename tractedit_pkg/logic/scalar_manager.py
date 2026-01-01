@@ -11,6 +11,10 @@ Handles scalar-related operations including:
 - RAS coordinate display and parsing
 """
 
+# ============================================================================
+# Imports
+# ============================================================================
+
 from __future__ import annotations
 
 import logging
@@ -25,6 +29,11 @@ if TYPE_CHECKING:
     from ..main_window import MainWindow
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Scalar Manager Class
+# ============================================================================
 
 
 class ScalarManager:
@@ -226,7 +235,7 @@ class ScalarManager:
             mw.scalar_min_val = max_val
             min_val = max_val
 
-        # Update widgets one last time to be sure they are synced
+        # Update widgets
         self.update_scalar_range_widgets()
 
         # Trigger Update

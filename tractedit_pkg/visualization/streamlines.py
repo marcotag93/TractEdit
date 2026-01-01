@@ -7,6 +7,10 @@ Handles streamline visualization including actor creation, color mapping,
 scalar bar management, and highlight actors for selected streamlines.
 """
 
+# ============================================================================
+# Imports
+# ============================================================================
+
 from __future__ import annotations
 
 import logging
@@ -25,6 +29,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# ============================================================================
+# Streamlines Manager Class
+# ============================================================================
+
+
 class StreamlinesManager:
     """
     Manages streamline visualization operations.
@@ -32,6 +41,9 @@ class StreamlinesManager:
     Handles actor creation, color mapping, scalar bar display,
     and highlight actors for selected streamlines.
     """
+
+    # Threshold for incremental vs full rebuild
+    INCREMENTAL_THRESHOLD = 50
 
     def __init__(self, vtk_panel: "VTKPanel") -> None:
         """
@@ -41,20 +53,55 @@ class StreamlinesManager:
             vtk_panel: Reference to the parent VTKPanel instance.
         """
         self.panel = vtk_panel
+        # Cache for incremental highlight updates
+        self._last_selected_indices: Set[int] = set()
+        # Deferred update state
+        self._pending_highlight_update: bool = False
+        self._update_timer = None
 
     def update_highlight(self) -> None:
         """Updates the actor for highlighted/selected streamlines."""
         if not self.panel.scene:
             return
 
+        # Check prerequisites early
+        if (
+            not self.panel.main_window
+            or not hasattr(self.panel.main_window, "selected_streamline_indices")
+            or not self.panel.main_window.tractogram_data
+        ):
+            # Remove any existing highlight actor
+            if self.panel.highlight_actor is not None:
+                try:
+                    self.panel.scene.rm(self.panel.highlight_actor)
+                except (ValueError, AttributeError):
+                    pass
+                self.panel.highlight_actor = None
+            if self.panel.main_window:
+                self.panel.main_window._update_action_states()
+            return
+
+        selected_indices: Set[int] = self.panel.main_window.selected_streamline_indices
+
+        # EARLY EXIT: If selection is empty, just remove existing actor and return
+        if not selected_indices:
+            if self.panel.highlight_actor is not None:
+                try:
+                    self.panel.scene.rm(self.panel.highlight_actor)
+                except (ValueError, AttributeError):
+                    pass
+                self.panel.highlight_actor = None
+            self._last_selected_indices = set()
+            if self.panel.main_window:
+                self.panel.main_window._update_action_states()
+            return
+
         # Safely Remove Existing Highlight Actor
-        actor_removed = False
         if self.panel.highlight_actor is not None:
             try:
                 self.panel.scene.rm(self.panel.highlight_actor)
-                actor_removed = True
             except (ValueError, AttributeError):
-                actor_removed = True
+                pass
             except Exception as e:
                 logger.error(
                     f"  Error removing highlight actor: {e}. Proceeding cautiously."
@@ -62,34 +109,53 @@ class StreamlinesManager:
             finally:
                 self.panel.highlight_actor = None
 
-        # Check prerequisites
-        if (
-            not self.panel.main_window
-            or not hasattr(self.panel.main_window, "selected_streamline_indices")
-            or not self.panel.main_window.tractogram_data
-        ):
-            if self.panel.main_window:
-                self.panel.main_window._update_action_states()
-            return
-
-        selected_indices: Set[int] = self.panel.main_window.selected_streamline_indices
         tractogram = self.panel.main_window.tractogram_data
 
         # Create new actor only if there's a valid selection
         if selected_indices:
-            valid_indices = {
-                idx for idx in selected_indices if 0 <= idx < len(tractogram)
-            }
+            tractogram_len = len(tractogram)
+            valid_indices_arr = np.array(
+                [idx for idx in selected_indices if 0 <= idx < tractogram_len],
+                dtype=np.int64,
+            )
 
-            # Create a concrete list of *non-empty* selected streamlines
+            if len(valid_indices_arr) == 0:
+                if self.panel.main_window:
+                    self.panel.main_window._update_action_states()
+                return
+
+            # Optimized: use ArraySequence internals if available
             selected_sl_data_list = []
-            for idx in valid_indices:
-                try:
-                    sl = tractogram[idx]
-                    if sl is not None and len(sl) > 0:
-                        selected_sl_data_list.append(sl.astype(np.float32, copy=False))
-                except Exception:
-                    pass  # Ignore if index fails
+            has_array_sequence = (
+                hasattr(tractogram, "_data")
+                and hasattr(tractogram, "_offsets")
+                and hasattr(tractogram, "_lengths")
+            )
+
+            if has_array_sequence:
+                # FAST PATH: Direct array slicing
+                src_data = tractogram._data
+                src_offsets = tractogram._offsets
+                src_lengths = tractogram._lengths
+
+                for idx in valid_indices_arr:
+                    length = src_lengths[idx]
+                    if length > 0:
+                        start = src_offsets[idx]
+                        end = start + length
+                        sl = src_data[start:end].astype(np.float32, copy=False)
+                        selected_sl_data_list.append(sl)
+            else:
+                # SLOW PATH: Individual indexing
+                for idx in valid_indices_arr:
+                    try:
+                        sl = tractogram[idx]
+                        if sl is not None and len(sl) > 0:
+                            selected_sl_data_list.append(
+                                sl.astype(np.float32, copy=False)
+                            )
+                    except Exception:
+                        pass
 
             if selected_sl_data_list:  # Check if the list is not empty
                 try:
@@ -98,7 +164,7 @@ class StreamlinesManager:
                         selected_sl_data_list,  # Pass the list
                         colors=(1, 1, 0),
                         linewidth=highlight_linewidth,
-                        opacity=1.0,  # Fully opaque
+                        opacity=1.0,
                     )
                     self.panel.scene.add(self.panel.highlight_actor)
 
@@ -129,6 +195,59 @@ class StreamlinesManager:
         if self.panel.main_window:
             self.panel.main_window._update_action_states()
 
+        # Cache current selection for future comparison
+        self._last_selected_indices = (
+            selected_indices.copy() if selected_indices else set()
+        )
+
+    def schedule_highlight_update(self, delay_ms: int = 30) -> None:
+        """
+        Schedule a deferred highlight update with debouncing.
+
+        Multiple calls within the delay period will be coalesced into
+        a single update, preventing redundant rebuilds during rapid
+        selection operations.
+
+        Args:
+            delay_ms: Delay in milliseconds before executing the update.
+        """
+        from PyQt6.QtCore import QTimer
+
+        self._pending_highlight_update = True
+
+        # Cancel existing timer if any
+        if self._update_timer is not None:
+            self._update_timer.stop()
+            self._update_timer.deleteLater()
+
+        # Create new timer
+        self._update_timer = QTimer()
+        self._update_timer.setSingleShot(True)
+        self._update_timer.timeout.connect(self._execute_deferred_highlight)
+        self._update_timer.start(delay_ms)
+
+    def _execute_deferred_highlight(self) -> None:
+        """Execute the deferred highlight update."""
+        self._pending_highlight_update = False
+        self._update_timer = None
+        self.update_highlight()
+
+    def has_selection_changed_significantly(self) -> bool:
+        """
+        Check if the selection has changed significantly enough to warrant rebuild.
+
+        Returns:
+            True if selection changed by more than INCREMENTAL_THRESHOLD items.
+        """
+        if not self.panel.main_window:
+            return True
+
+        current = self.panel.main_window.selected_streamline_indices or set()
+        added = current - self._last_selected_indices
+        removed = self._last_selected_indices - current
+
+        return len(added) + len(removed) > self.INCREMENTAL_THRESHOLD
+
     def update_roi_highlight_actor(self) -> None:
         """
         Updates the Red highlight actor based on ROI 'Select' indices.
@@ -151,17 +270,45 @@ class StreamlinesManager:
         if not indices:
             return
 
-        # Get actual streamline data
+        # Get actual streamline data - optimized for ArraySequence
         tractogram = self.panel.main_window.tractogram_data
+        tractogram_len = len(tractogram)
+
+        valid_indices_arr = np.array(
+            [idx for idx in indices if 0 <= idx < tractogram_len], dtype=np.int64
+        )
+
+        if len(valid_indices_arr) == 0:
+            return
+
         streamlines_list = []
-        for idx in indices:
-            try:
-                if idx < len(tractogram):
+        has_array_sequence = (
+            hasattr(tractogram, "_data")
+            and hasattr(tractogram, "_offsets")
+            and hasattr(tractogram, "_lengths")
+        )
+
+        if has_array_sequence:
+            src_data = tractogram._data
+            src_offsets = tractogram._offsets
+            src_lengths = tractogram._lengths
+
+            for idx in valid_indices_arr:
+                length = src_lengths[idx]
+                if length > 0:
+                    start = src_offsets[idx]
+                    end = start + length
+                    streamlines_list.append(
+                        src_data[start:end].astype(np.float32, copy=False)
+                    )
+        else:
+            for idx in valid_indices_arr:
+                try:
                     sl = tractogram[idx]
-                    if len(sl) > 0:
+                    if sl is not None and len(sl) > 0:
                         streamlines_list.append(sl.astype(np.float32, copy=False))
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
         if not streamlines_list:
             return
@@ -326,8 +473,10 @@ class StreamlinesManager:
     def get_streamline_actor_params(self) -> Dict[str, Any]:
         """
         Determines parameters for the main streamlines actor using STRIDE.
+
         Optimized to avoid double-copying data by using simple lists instead
-        of rebuilding ArraySequence containers.
+        of rebuilding ArraySequence containers. Uses ArraySequence internals
+        for batch extraction when available.
 
         Returns:
             Dictionary with streamline visualization parameters.
@@ -346,22 +495,49 @@ class StreamlinesManager:
             return params
 
         tractogram = self.panel.main_window.tractogram_data
+        visible_indices = self.panel.main_window.visible_indices
 
-        # Get ALL Visible Indices
-        visible_indices_list = sorted(list(self.panel.main_window.visible_indices))
-
-        # Apply STRIDE (Skip Logic)
-        stride = self.panel.main_window.render_stride
-        subset_indices = visible_indices_list[::stride]  # Only pick 1 every N
-
-        if not subset_indices:
+        if not visible_indices:
             params["streamlines_list"] = []
             return params
 
-        # Ensure float32 for VTK compatibility
-        visible_streamlines_list = [
-            tractogram[i].astype(np.float32, copy=False) for i in subset_indices
-        ]
+        # Convert to numpy array for efficient slicing (no sorting needed)
+        visible_indices_arr = np.fromiter(visible_indices, dtype=np.int64)
+
+        # Apply STRIDE (Skip Logic)
+        stride = self.panel.main_window.render_stride
+        subset_indices = visible_indices_arr[::stride]  # Only pick 1 every N
+
+        if len(subset_indices) == 0:
+            params["streamlines_list"] = []
+            return params
+
+        # FAST PATH: Use ArraySequence internals for batch extraction
+        has_array_sequence = (
+            hasattr(tractogram, "_data")
+            and hasattr(tractogram, "_offsets")
+            and hasattr(tractogram, "_lengths")
+        )
+
+        if has_array_sequence:
+            src_data = tractogram._data
+            src_offsets = tractogram._offsets
+            src_lengths = tractogram._lengths
+
+            visible_streamlines_list = []
+            for idx in subset_indices:
+                length = src_lengths[idx]
+                if length > 0:
+                    start = src_offsets[idx]
+                    end = start + length
+                    visible_streamlines_list.append(
+                        src_data[start:end].astype(np.float32, copy=False)
+                    )
+        else:
+            # SLOW PATH: Fall back to individual indexing
+            visible_streamlines_list = [
+                tractogram[i].astype(np.float32, copy=False) for i in subset_indices
+            ]
 
         # Coloring Logic
         current_mode = self.panel.main_window.current_color_mode

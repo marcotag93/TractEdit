@@ -13,6 +13,10 @@ Features:
 - Parse FreeSurfer color LUT for region names
 """
 
+# ============================================================================
+# Imports
+# ============================================================================
+
 from __future__ import annotations
 
 import os
@@ -36,6 +40,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+# ============================================================================
+# Constants
+# ============================================================================
 
 # Default FreeSurfer LUT location (can be overridden)
 FREESURFER_LUT_PATHS = [
@@ -171,6 +179,11 @@ FREESURFER_BUILTIN_LABELS = {
 }
 
 
+# ============================================================================
+# Numba Optimized Functions
+# ============================================================================
+
+
 @njit(parallel=True, cache=True)
 def _compute_endpoint_labels(
     start_points: np.ndarray,
@@ -264,6 +277,11 @@ def _compute_endpoint_labels(
             end_labels[i] = 0  # Unknown/outside
 
     return start_labels, end_labels
+
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
 
 
 def parse_freesurfer_lut(lut_path: Optional[str] = None) -> Dict[int, str]:
@@ -416,6 +434,11 @@ def _create_connectivity_visualization(
     except Exception as e:
         logger.warning(f"Failed to create connectivity visualization: {e}")
         return False
+
+
+# ============================================================================
+# Connectivity Manager Class
+# ============================================================================
 
 
 class ConnectivityManager:

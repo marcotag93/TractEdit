@@ -37,8 +37,11 @@ Desktop.ini
 
 # Testing
 .pytest_cache/
+.tox/
+.coverage
 
 # Cache/Logs
 .cache/
 *.log
 *.locals
+htmlcov/

@@ -6,6 +6,10 @@ Toolbars manager for TractEdit UI.
 Handles creation of toolbars, status bar, and central widget setup.
 """
 
+# ============================================================================
+# Imports
+# ============================================================================
+
 from __future__ import annotations
 
 import logging
@@ -28,7 +32,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
 )
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QAction, QIcon, QPixmap
+from PyQt6.QtGui import QAction, QIcon, QPixmap, QPainter, QImage
 
 from ..utils import get_asset_path
 
@@ -37,8 +41,18 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+# ============================================================================
+# Constants
+# ============================================================================
+
 # Constant for slider precision
 SLIDER_PRECISION = 1000
+
+
+# ============================================================================
+# Toolbars Manager Class
+# ============================================================================
 
 
 class ToolbarsManager:
@@ -60,6 +74,36 @@ class ToolbarsManager:
             main_window: Reference to the parent MainWindow instance.
         """
         self.mw = main_window
+
+    def _get_button_style_default(self) -> str:
+        """Returns the default button style from theme manager."""
+        if hasattr(self.mw, "theme_manager"):
+            return self.mw.theme_manager.get_button_style_default()
+        # Fallback light style if theme manager not available
+        return """
+            QToolButton {
+                background-color: #f0f0f0;
+                border: 1px solid #c0c0c0;
+                border-radius: 5px;
+                padding: 2px;
+                margin-left: 5px;
+            }
+            QToolButton:hover {
+                background-color: #e8e8e8;
+                border: 1px solid #b0b0b0;
+            }
+            QToolButton:checked {
+                background-color: #d0d0d0;
+                border: 1px inset #a0a0a0;
+                padding: 3px 1px 1px 3px;
+            }
+        """
+
+    def _get_label_color(self) -> str:
+        """Returns the label color based on current theme."""
+        if hasattr(self.mw, "theme_manager") and self.mw.theme_manager.is_dark_theme():
+            return "#dddddd"
+        return "#333333"
 
     def create_main_toolbar(self) -> None:
         """Creates the main toolbar with skip, opacity, and drawing controls."""
@@ -119,9 +163,9 @@ class ToolbarsManager:
         layout.addWidget(QLabel("|"))
         layout.addSpacing(15)
 
-        brush_label = QLabel("Brush:")
-        brush_label.setStyleSheet("font-weight: bold; color: #333;")
-        layout.addWidget(brush_label)
+        mw.brush_label = QLabel("Brush:")
+        mw.brush_label.setStyleSheet("font-weight: bold; color: #dddddd;")
+        layout.addWidget(mw.brush_label)
 
         # Brush size value label
         mw.brush_size_label = QLabel(f"{mw.draw_brush_size}")
@@ -177,25 +221,8 @@ class ToolbarsManager:
         """Adds drawing mode buttons to the toolbar layout."""
         mw = self.mw
 
-        # Common button style
-        button_style = """
-            QToolButton {
-                background-color: #f0f0f0;
-                border: 1px solid #c0c0c0;
-                border-radius: 5px;
-                padding: 2px;
-                margin-left: 5px;
-            }
-            QToolButton:hover {
-                background-color: #e8e8e8;
-                border: 1px solid #b0b0b0;
-            }
-            QToolButton:checked {
-                background-color: #d0d0d0;
-                border: 1px inset #a0a0a0;
-                padding: 3px 1px 1px 3px;
-            }
-        """
+        # Get theme-aware button style
+        button_style = self._get_button_style_default()
 
         # Draw Mode Button
         mw.draw_mode_button = QToolButton()
@@ -305,41 +332,56 @@ class ToolbarsManager:
         layout.addWidget(mw.sphere_radius_container)
         mw.sphere_radius_container.setVisible(False)
 
-    def _create_pencil_icon(self) -> QIcon:
-        """Loads the pencil icon from the assets folder."""
-        icon_path = get_asset_path("pencil.png")
+    def _is_dark_theme(self) -> bool:
+        """Checks if the current theme is dark."""
+        if hasattr(self.mw, "theme_manager"):
+            return self.mw.theme_manager.is_dark_theme()
+        return False
+
+    def _create_themed_icon(self, asset_name: str) -> QIcon:
+        """
+        Creates a theme-aware icon from the given asset.
+
+        For dark themes, the icon is inverted to ensure visibility.
+        For light themes, the original icon is used.
+
+        Args:
+            asset_name: Name of the icon file in the assets folder.
+
+        Returns:
+            QIcon: Themed icon suitable for the current theme.
+        """
+        icon_path = get_asset_path(asset_name)
         pixmap = QPixmap(icon_path)
+
         if pixmap.isNull():
-            logger.warning(f"Could not load pencil icon from {icon_path}")
+            logger.warning(f"Could not load icon from {icon_path}")
             return QIcon()
+
+        if self._is_dark_theme():
+            # Convert to QImage and use Qt's optimized inversion
+            # InvertRgb mode inverts only RGB values, preserving alpha channel
+            image = pixmap.toImage()
+            image.invertPixels(QImage.InvertMode.InvertRgb)
+            pixmap = QPixmap.fromImage(image)
+
         return QIcon(pixmap)
+
+    def _create_pencil_icon(self) -> QIcon:
+        """Loads the pencil icon from the assets folder with theme awareness."""
+        return self._create_themed_icon("pencil.png")
 
     def _create_eraser_icon(self) -> QIcon:
-        """Loads the eraser icon from the assets folder."""
-        icon_path = get_asset_path("eraser.png")
-        pixmap = QPixmap(icon_path)
-        if pixmap.isNull():
-            logger.warning(f"Could not load eraser icon from {icon_path}")
-            return QIcon()
-        return QIcon(pixmap)
+        """Loads the eraser icon from the assets folder with theme awareness."""
+        return self._create_themed_icon("eraser.png")
 
     def _create_sphere_icon(self) -> QIcon:
-        """Loads the sphere icon from the assets folder."""
-        icon_path = get_asset_path("sphere.png")
-        pixmap = QPixmap(icon_path)
-        if pixmap.isNull():
-            logger.warning(f"Could not load sphere icon from {icon_path}")
-            return QIcon()
-        return QIcon(pixmap)
+        """Loads the sphere icon from the assets folder with theme awareness."""
+        return self._create_themed_icon("sphere.png")
 
     def _create_rectangle_icon(self) -> QIcon:
-        """Loads the rectangle icon from the assets folder."""
-        icon_path = get_asset_path("rectangle.png")
-        pixmap = QPixmap(icon_path)
-        if pixmap.isNull():
-            logger.warning(f"Could not load rectangle icon from {icon_path}")
-            return QIcon()
-        return QIcon(pixmap)
+        """Loads the rectangle icon from the assets folder with theme awareness."""
+        return self._create_themed_icon("rectangle.png")
 
     def create_scalar_toolbar(self) -> None:
         """Creates the toolbar for scalar range adjustment with sliders."""
