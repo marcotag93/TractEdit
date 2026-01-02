@@ -27,15 +27,16 @@ classifiers = [
 # Runtime dependencies - minimum tested versions (PEP 440 compliant)
 # Officially supports Python 3.11 only
 dependencies = [
-    "PyQt6>=6.7.0",
-    "vtk>=9.2.6",
-    "fury>=0.12.0",
-    "nibabel>=5.0.0",
-    "numpy>=1.24.0",
-    "numba>=0.58.0",
-    "scipy>=1.10.0",
-    "pytz>=2024.1",
-    "trx-python>=0.3",
+    "PyQt6==6.7.0",
+    "PyQt6-Qt6==6.7.3",
+    "vtk==9.2.6",
+    "fury==0.12.0",
+    "nibabel==5.3.3",
+    "numpy==2.3.5",
+    "numba==0.63.1",
+    "scipy==1.16.3",
+    "pytz==2025.2",
+    "trx-python==0.3",
 ]
 
 # Optional dependency groups
