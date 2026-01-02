@@ -10,6 +10,11 @@ Tractedit GUI - Main Application Runner
 
 import os
 import sys
+import multiprocessing
+
+# PyInstaller freeze support
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
 
 if sys.platform == "darwin":  # macOS
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")

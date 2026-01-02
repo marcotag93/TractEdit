@@ -166,10 +166,10 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=True,  # Strip debug symbols to reduce size
-    upx=True,
+    upx=False,  # UPX disabled - causes issues on macOS ARM64
     console=False,  # No console window for GUI app
     disable_windowed_traceback=False,
-    argv_emulation=True,  # macOS: enables drag-and-drop file opening
+    argv_emulation=False,  # Disabled to avoid PyQt6 event loop conflicts
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
@@ -181,8 +181,8 @@ coll = COLLECT(
     a.binaries,
     a.zipfiles,
     a.datas,
-    strip=True,  # Strip debug symbols from collected binaries
-    upx=True,
+    strip=False,  # Don't strip collected binaries - can break code signing on macOS
+    upx=False,  # UPX disabled - causes issues on macOS ARM64
     upx_exclude=[],
     name='TractEdit',
 )
