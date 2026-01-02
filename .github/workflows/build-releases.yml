@@ -86,7 +86,7 @@ jobs:
 
       - name: Checkout code
         if: steps.check.outputs.should_build == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python 3.11
         if: steps.check.outputs.should_build == 'true'
