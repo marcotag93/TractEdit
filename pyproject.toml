@@ -1,18 +1,19 @@
 [build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
+requires = ["poetry-core>=2.0.0"]
+build-backend = "poetry.core.masonry.api"
 
-[project]
+[tool.poetry]
 name = "tractedit"
 version = "3.2.0"
-authors = [
-    { name = "Marco Tagliaferri", email = "marco.tagliaferri@unitn.it" },
-    { name = "Marco Tagliaferri", email = "marco.tagliaferri93@gmail.com" },
-]
 description = "A Python-based graphical interface for interactively viewing, selecting, and editing tractography bundles in .trk, .tck and .trx formats."
+authors = [
+    "Marco Tagliaferri <marco.tagliaferri@unitn.it>",
+    "Marco Tagliaferri <marco.tagliaferri93@gmail.com>",
+]
+license = "MIT"
 readme = "README.md"
-license = { file = "LICENSE" }
-requires-python = ">=3.11,<3.12"
+homepage = "https://github.com/marcotag93/TractEdit"
+repository = "https://github.com/marcotag93/TractEdit"
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
@@ -23,49 +24,33 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: X11 Applications :: Qt",
 ]
+packages = [{ include = "tractedit_pkg" }, { include = "main.py" }]
 
-# Runtime dependencies - minimum tested versions (PEP 440 compliant)
-# Officially supports Python 3.11 only
-dependencies = [
-    "PyQt6==6.7.0",
-    "PyQt6-Qt6==6.7.3",
-    "vtk==9.2.6",
-    "fury==0.12.0",
-    "nibabel==5.3.3",
-    "numpy==2.3.5",
-    "numba==0.63.1",
-    "scipy==1.16.3",
-    "pytz==2025.2",
-    "trx-python==0.3",
-]
+[tool.poetry.dependencies]
+python = ">=3.11,<3.12"
+PyQt6 = "6.7.0"
+PyQt6-Qt6 = "6.7.3"
+vtk = "9.2.6"
+fury = "0.12.0"
+nibabel = "5.3.3"
+numpy = "2.3.5"
+numba = "0.63.1"
+scipy = "1.16.3"
+pytz = "2025.2"
+trx-python = "0.3"
 
-# Optional dependency groups
-[project.optional-dependencies]
-test = [
-    "pytest>=7.0",
-    "pytest-cov>=4.0",
-    "pytest-xvfb>=3.0",
-    "tox>=4.0",
-]
-dev = [
-    "tractedit[test]",
-    "black>=23.0",
-    "flake8>=6.0",
-]
+[tool.poetry.group.test.dependencies]
+pytest = "==9.0.2"
+pytest-cov = "==7.0.0"
+pytest-xvfb = "==3.1.1"
+tox = "==4.33.0"
 
-# Command-line script 'tractedit'
-[project.scripts]
+[tool.poetry.group.dev.dependencies]
+black = "==25.12.0"
+flake8 = "==7.3.0"
+
+[tool.poetry.scripts]
 tractedit = "main:main"
 
-[project.urls]
-Homepage = "https://github.com/marcotag93/TractEdit"
+[tool.poetry.urls]
 Bug-Tracker = "https://github.com/marcotag93/TractEdit/issues"
-
-[tool.setuptools]
-py-modules = ["main"]
-
-[tool.setuptools.packages.find]
-include = ["tractedit_pkg*"]
-
-[tool.setuptools.package-data]
-"tractedit_pkg" = ["assets/*"]

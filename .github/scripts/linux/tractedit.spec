@@ -17,6 +17,21 @@ project_root = Path(SPECPATH).parent.parent.parent
 import fury
 fury_path = os.path.dirname(fury.__file__)
 
+# Find numpy package location for __config__ module
+import numpy
+numpy_path = os.path.dirname(numpy.__file__)
+
+# Collect numpy __config__.py if it exists (this is a generated file)
+numpy_config_files = []
+numpy_config_path = os.path.join(numpy_path, '__config__.py')
+if os.path.exists(numpy_config_path):
+    numpy_config_files.append((numpy_config_path, 'numpy'))
+
+# Collect numpy.libs directory if it exists (contains required DLLs/SOs)
+numpy_libs_path = os.path.join(os.path.dirname(numpy_path), 'numpy.libs')
+if os.path.exists(numpy_libs_path):
+    numpy_config_files.append((numpy_libs_path, 'numpy.libs'))
+
 # Collect all fury .pyi stub files
 fury_stubs = []
 for root, dirs, files in os.walk(fury_path):
@@ -40,7 +55,7 @@ a = Analysis(
         (str(project_root / 'tractedit_pkg' / 'assets'), 'tractedit_pkg/assets'),
         # Include fury data directory
         (os.path.join(fury_path, 'data'), 'fury/data'),
-    ] + fury_stubs,  # Add all fury stub files
+    ] + fury_stubs + numpy_config_files,  # Add all fury stub files and numpy config
     hiddenimports=[
         'tractedit_pkg',
         'tractedit_pkg.assets',
@@ -88,6 +103,9 @@ a = Analysis(
         'vtkmodules.vtkRenderingVolumeOpenGL2',
         # Scientific stack
         'numpy',
+        'numpy.__config__',
+        'numpy._core',
+        'numpy._distributor_init',
         'scipy',
         'nibabel',
         'numba',
@@ -96,7 +114,7 @@ a = Analysis(
     ],
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=[str(Path(SPECPATH) / 'hook-numpy.py')],
     excludes=[
         # GUI frameworks we don't use
         'tkinter',
@@ -173,7 +191,7 @@ exe = EXE(
     name='tractedit',
     debug=False,
     bootloader_ignore_signals=False,
-    strip=True,  # Strip debug symbols to reduce size
+    strip=False,  # Disabled: stripping can cause ELF alignment issues with scipy/OpenBLAS
     upx=True,
     console=False,  # No console window for GUI app
     disable_windowed_traceback=False,
@@ -189,7 +207,7 @@ coll = COLLECT(
     a.binaries,
     a.zipfiles,
     a.datas,
-    strip=True,  # Strip debug symbols from collected binaries
+    strip=False,  # Disabled: stripping can cause ELF alignment issues with scipy/OpenBLAS
     upx=True,
     upx_exclude=[],
     name='tractedit',

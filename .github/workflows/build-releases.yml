@@ -33,11 +33,11 @@ jobs:
             target: dmg
             name: macOS DMG
             artifact_name: TractEdit-macOS-arm64
-          - os: ubuntu-22.04
+          - os: ubuntu-24.04
             target: appimage
             name: Linux AppImage
             artifact_name: TractEdit-Linux-AppImage
-          - os: ubuntu-22.04
+          - os: ubuntu-24.04
             target: deb
             name: Linux DEB
             artifact_name: TractEdit-Linux-DEB
@@ -136,28 +136,33 @@ jobs:
             imagemagick
 
       # ========== Common Python setup ==========
-      - name: Install Python dependencies
+      - name: Install Poetry
         if: steps.check.outputs.should_build == 'true'
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller
-          pip install .
+          pip install poetry
+
+      - name: Install Python dependencies
+        if: steps.check.outputs.should_build == 'true'
+        run: |
+          poetry install --no-interaction --no-root
+          poetry run pip install pyinstaller
 
       # ========== Build with PyInstaller ==========
       - name: Build with PyInstaller (Linux)
         if: steps.check.outputs.should_build == 'true' && runner.os == 'Linux'
         run: |
-          pyinstaller .github/scripts/linux/tractedit.spec --noconfirm
+          poetry run pyinstaller .github/scripts/linux/tractedit.spec --noconfirm
 
       - name: Build with PyInstaller (macOS)
         if: steps.check.outputs.should_build == 'true' && runner.os == 'macOS'
         run: |
-          pyinstaller .github/scripts/macos/tractedit.spec --noconfirm
+          poetry run pyinstaller .github/scripts/macos/tractedit.spec --noconfirm
 
       - name: Build with PyInstaller (Windows)
         if: steps.check.outputs.should_build == 'true' && runner.os == 'Windows'
         run: |
-          pyinstaller .github/scripts/windows/tractedit.spec --noconfirm
+          poetry run pyinstaller .github/scripts/windows/tractedit.spec --noconfirm
 
       # ========== macOS DMG ==========
       - name: Create DMG

@@ -60,6 +60,14 @@ class LoadingSplash(QSplashScreen):
         self.text_color = QColor(135, 206, 250)  # progress bar text
         self.setCursor(Qt.CursorShape.WaitCursor)
 
+    def mousePressEvent(self, event):
+        """Ignore mouse clicks to prevent splash from closing."""
+        event.ignore()
+
+    def keyPressEvent(self, event):
+        """Ignore keyboard input to prevent splash from closing."""
+        event.ignore()
+
     def set_progress(self, value, message=None):
         self.progress = value
         if message:
@@ -654,6 +662,7 @@ def main() -> None:
     # VTK (goes first)
     if splash:
         splash.set_progress(10, "Initializing VTK System...")
+    logger.info("Initializing VTK...")
 
     try:
         import vtk
@@ -661,6 +670,7 @@ def main() -> None:
         out_window: vtk.vtkOutputWindow = vtk.vtkOutputWindow()
         vtk.vtkOutputWindow.SetInstance(out_window)
         vtk.vtkObject.GlobalWarningDisplayOff()
+        logger.info("VTK initialized successfully.")
     except ImportError:
         logger.warning("Warning: VTK not found.")
     except Exception as e:
@@ -669,9 +679,12 @@ def main() -> None:
     # Heavy imports
     if splash:
         splash.set_progress(30, "Loading Libraries...")
+    logger.info("Loading main window module...")
 
     try:
         from tractedit_pkg.main_window import MainWindow
+
+        logger.info("Main window module loaded.")
     except ImportError as e:
         logger.error(f"Error importing necessary modules: {e}")
         sys.exit(1)
@@ -679,17 +692,20 @@ def main() -> None:
     # Pre-compile Numba functions (while splash is visible)
     if splash:
         splash.set_progress(50, "Optimizing performance...")
+    logger.info("Warming up Numba JIT functions...")
 
     try:
         from tractedit_pkg.file_io import warmup_numba_functions
 
         warmup_numba_functions()
+        logger.info("Numba warmup complete.")
     except Exception as e:
         logger.warning(f"Numba warmup failed (non-critical): {e}")
 
     # Pre-import heavy libraries to speed up first bundle load
     if splash:
         splash.set_progress(60, "Pre-loading streamline libraries...")
+    logger.info("Pre-loading streamline libraries...")
 
     try:
         import nibabel.streamlines
@@ -699,13 +715,14 @@ def main() -> None:
         import nibabel.streamlines.tck
         import trx.trx_file_memmap
 
-        logger.debug("Streamline libraries pre-loaded")
+        logger.info("Streamline libraries pre-loaded.")
     except Exception as e:
         logger.warning(f"Library pre-load failed (non-critical): {e}")
 
     # Warmup selection numba functions (sphere/box selection)
     if splash:
         splash.set_progress(65, "Optimizing selection tools...")
+    logger.info("Warming up selection Numba functions...")
 
     try:
         from tractedit_pkg.visualization.selection import (
@@ -713,31 +730,24 @@ def main() -> None:
         )
 
         warmup_selection_numba_functions()
+        logger.info("Selection warmup complete.")
     except Exception as e:
         logger.warning(f"Selection warmup failed (non-critical): {e}")
 
     # Main Window
     if splash:
         splash.set_progress(70, "Building User Interface...")
+    logger.info("Building main window UI...")
 
     main_window: MainWindow = MainWindow()
+    logger.info("Main window created.")
 
     if splash:
         splash.set_progress(90, "Starting...")
 
-    # Launch - cross-platform window maximization
-    screen = app.primaryScreen()
-    if screen:
-        available_geometry = screen.availableGeometry()
-        main_window.setGeometry(available_geometry)
-
-    main_window.show()
-
-    # Delay maximize to ensure window manager has fully initialized the window
-    def ensure_maximized():
-        main_window.showMaximized()
-
-    QTimer.singleShot(50, ensure_maximized)
+    # Launch - start maximized
+    logger.info("Launching application window...")
+    main_window.showMaximized()
 
     if splash:
         splash.finish(main_window)
