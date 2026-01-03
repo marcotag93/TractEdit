@@ -19,9 +19,6 @@ def create_dummy_numpy_config():
     """
     Create a dummy numpy.__config__ module if it doesn't exist.
 
-    This is the KEY FIX: numpy's __init__.py does:
-        from numpy.__config__ import show_config
-
     If this import fails with ModuleNotFoundError for "numpy.__config__",
     numpy raises the "source directory" error. We pre-create this module
     to prevent that check from failing.
