@@ -6,46 +6,59 @@ Runs before the application to prevent false positives in bundled apps.
 import sys
 import os
 
+# Debug: Log that this hook is running
+_DEBUG = True
+if _DEBUG:
+    try:
+        import datetime
+
+        _debug_msg = f"[{datetime.datetime.now()}] numpy hook running, frozen={getattr(sys, 'frozen', False)}"
+        if getattr(sys, "frozen", False):
+            _debug_msg += f", MEIPASS={getattr(sys, '_MEIPASS', 'N/A')}"
+        print(_debug_msg, file=sys.stderr)
+    except Exception:
+        pass
+
 # Set environment variable early
-os.environ['NUMPY_EXPERIMENTAL_ARRAY_FUNCTION'] = '1'
+os.environ["NUMPY_EXPERIMENTAL_ARRAY_FUNCTION"] = "1"
 
 
 def patch_numpy_source_detection():
     """Remove or rename files that trigger numpy's source directory detection."""
-    if not getattr(sys, 'frozen', False):
+    if not getattr(sys, "frozen", False):
         return
 
     base_path = sys._MEIPASS
-    
+
     # Check both MEIPASS root and _internal subdirectory
     search_paths = [base_path]
-    internal_path = os.path.join(base_path, '_internal')
+    internal_path = os.path.join(base_path, "_internal")
     if os.path.exists(internal_path):
         search_paths.append(internal_path)
-    
+
     for search_base in search_paths:
         problematic_files = [
-            os.path.join(search_base, 'setup.py'),
-            os.path.join(search_base, 'pyproject.toml'),
-            os.path.join(search_base, 'numpy', 'setup.py'),
-            os.path.join(search_base, 'numpy', 'pyproject.toml'),
+            os.path.join(search_base, "setup.py"),
+            os.path.join(search_base, "pyproject.toml"),
+            os.path.join(search_base, "numpy", "setup.py"),
+            os.path.join(search_base, "numpy", "pyproject.toml"),
         ]
 
         for filepath in problematic_files:
             if os.path.exists(filepath):
                 try:
-                    os.rename(filepath, filepath + '.disabled')
+                    os.rename(filepath, filepath + ".disabled")
                 except (OSError, PermissionError):
-                    pass 
+                    pass
 
 
 def cleanup_source_paths():
     """Remove source-tree-like paths from sys.path."""
-    if not getattr(sys, 'frozen', False):
+    if not getattr(sys, "frozen", False):
         return
 
     base_path = sys._MEIPASS
-    internal_path = os.path.join(base_path, '_internal')
+    internal_path = os.path.join(base_path, "_internal")
 
     # Ensure _internal is first in path
     if os.path.exists(internal_path) and internal_path not in sys.path:
@@ -55,15 +68,17 @@ def cleanup_source_paths():
     cleaned_path = []
     for p in sys.path:
         if os.path.isdir(p):
-            setup_py = os.path.join(p, 'setup.py')
-            pyproject = os.path.join(p, 'pyproject.toml')
-            numpy_dir = os.path.join(p, 'numpy')
-            
-            # Skip paths 
-            if os.path.exists(numpy_dir) and (os.path.exists(setup_py) or os.path.exists(pyproject)):
+            setup_py = os.path.join(p, "setup.py")
+            pyproject = os.path.join(p, "pyproject.toml")
+            numpy_dir = os.path.join(p, "numpy")
+
+            # Skip paths
+            if os.path.exists(numpy_dir) and (
+                os.path.exists(setup_py) or os.path.exists(pyproject)
+            ):
                 continue
         cleaned_path.append(p)
-    
+
     sys.path[:] = cleaned_path
 
 
