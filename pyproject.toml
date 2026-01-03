@@ -5,7 +5,7 @@ build-backend = "poetry.core.masonry.api"
 [tool.poetry]
 name = "tractedit"
 version = "3.2.0"
-description = "A Python-based interactive tool for virtual dissection and manual refinement of diffusion MRI tractography. Supports .trk, .tck, .trx, .vtk, .vtp"
+description = "A Python-based graphical interface for interactively viewing, selecting, and editing tractography bundles in .trk, .tck and .trx formats."
 authors = [
     "Marco Tagliaferri <marco.tagliaferri@unitn.it>",
     "Marco Tagliaferri <marco.tagliaferri93@gmail.com>",
@@ -40,14 +40,14 @@ pytz = "2025.2"
 trx-python = "0.3"
 
 [tool.poetry.group.test.dependencies]
-pytest = "9.0.2"
-pytest-cov = "7.0.0"
-pytest-xvfb = "3.1.1"
-tox = "4.33.0"
+pytest = "==9.0.2"
+pytest-cov = "==7.0.0"
+pytest-xvfb = "==3.1.1"
+tox = "==4.33.0"
 
 [tool.poetry.group.dev.dependencies]
-black = "25.12.0"
-flake8 = "7.3.0"
+black = "==25.12.0"
+flake8 = "==7.3.0"
 
 [tool.poetry.scripts]
 tractedit = "main:main"
