@@ -191,7 +191,7 @@ exe = EXE(
     name='tractedit',
     debug=False,
     bootloader_ignore_signals=False,
-    strip=True,  # Strip debug symbols to reduce size
+    strip=False,  # Disabled: stripping can cause ELF alignment issues with scipy/OpenBLAS
     upx=True,
     console=False,  # No console window for GUI app
     disable_windowed_traceback=False,
@@ -207,7 +207,7 @@ coll = COLLECT(
     a.binaries,
     a.zipfiles,
     a.datas,
-    strip=True,  # Strip debug symbols from collected binaries
+    strip=False,  # Disabled: stripping can cause ELF alignment issues with scipy/OpenBLAS
     upx=True,
     upx_exclude=[],
     name='tractedit',

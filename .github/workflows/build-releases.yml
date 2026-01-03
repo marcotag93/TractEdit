@@ -33,11 +33,11 @@ jobs:
             target: dmg
             name: macOS DMG
             artifact_name: TractEdit-macOS-arm64
-          - os: ubuntu-22.04
+          - os: ubuntu-24.04
             target: appimage
             name: Linux AppImage
             artifact_name: TractEdit-Linux-AppImage
-          - os: ubuntu-22.04
+          - os: ubuntu-24.04
             target: deb
             name: Linux DEB
             artifact_name: TractEdit-Linux-DEB
