@@ -96,7 +96,7 @@ a = Analysis(
     ],
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=[str(Path(SPECPATH) / 'hook-numpy.py')],
     excludes=[
         # GUI frameworks we don't use
         'tkinter',
