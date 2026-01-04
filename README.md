@@ -206,7 +206,7 @@ The application can now be launched using the tractedit command installed via pi
 ```bash
 tractedit
 ```
-> **Note:** The first launch may be slower due to one-time JIT compilation. Subsequent runs will be significantly faster. 
+*📌 The first launch may be slower due to one-time JIT compilation. Subsequent runs will be significantly faster.*
 
 #### Command Line Options
 ```bash
@@ -248,7 +248,7 @@ No Python setup is required for these versions. Download the latest release for 
 * **Linux (AppImage):** Use `.AppImage` — portable, runs on most Linux distributions without installation. Simply make it executable (`chmod +x`) and run.
 * **Linux (Debian/Ubuntu):** Use `.deb` — native package for Debian-based distributions. Install with `sudo dpkg -i TractEdit_3.2.0_amd64.deb`.
 
-> **Note:** The first launch may be slower due to one-time JIT compilation. Subsequent runs will be significantly faster. 
+*📌 The first launch may be slower due to one-time JIT compilation. Subsequent runs will be significantly faster.*
 
 ---
 
