@@ -151,7 +151,7 @@ Load & save streamlines in `.trk`, `.tck`, `.trx`, `.vtk`, `.vtp` formats with w
 - **Memory-Mapped Images:** Efficient on-demand slice extraction for large anatomical images without loading full volume into RAM
 - **Modular Architecture:** Refactored codebase with dedicated manager classes (ThemeManager, StateManager, SelectionManager, etc.) for improved maintainability
 - **Performance Optimizations:** Numba JIT compilation with parallel batch processing for geometric computations, Numpy vectorizations, debounced UI updates, pre-computed bounding boxes for fast selection
-- **Reliability:** Comprehensive automated test suite (88 tests) ensuring stability of core features
+- **Reliability:** Comprehensive automated test suite (90 tests) ensuring stability of core features
 
 #### 💡 Tips for Large Datasets
 
