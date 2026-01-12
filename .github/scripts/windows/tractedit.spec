@@ -183,7 +183,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,  # Windows doesn't support strip like Unix
-    upx=True,  # Enable UPX compression (if UPX is available)
+    upx=False,  # Disable UPX compression to avoid AV scanning delays
     console=False,  # No console window for GUI app
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -199,7 +199,7 @@ coll = COLLECT(
     a.zipfiles,
     a.datas,
     strip=False,  # Windows doesn't support strip
-    upx=True,  # Enable UPX compression on collected binaries
+    upx=False,  # Disable UPX compression to avoid AV scanning delays
     upx_exclude=[
         # Exclude files that don't compress well or cause issues with UPX
         'vcruntime140.dll',
