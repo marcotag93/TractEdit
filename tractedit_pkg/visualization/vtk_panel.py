@@ -1034,7 +1034,7 @@ class VTKPanel:
         self.image_extents["z"] = (0, shape[2] - 1)
 
         # Store full-resolution shape from mmap image if available
-        mmap_img = getattr(self.main_window, 'anatomical_mmap_image', None)
+        mmap_img = getattr(self.main_window, "anatomical_mmap_image", None)
         if mmap_img is not None:
             mmap_shape = mmap_img.shape
             self.mmap_image_shape = mmap_shape
@@ -1653,7 +1653,7 @@ class VTKPanel:
             or self.main_window.anatomical_image_affine is None
             or not all(self.image_extents.values())
             or self.image_extents["x"] is None
-        ): 
+        ):
 
             self.update_status(
                 "Error: Cannot set slices from RAS, no anatomical image loaded."
@@ -1878,6 +1878,10 @@ class VTKPanel:
         """Handles the logic for selecting streamlines. Delegates to SelectionManager."""
         self.selection_manager.handle_streamline_selection()
 
+    def _handle_inverse_selection(self) -> None:
+        """Handles the logic for invert selection. Delegates to SelectionManager."""
+        self.selection_manager.invert_selection()
+
     def key_press_callback(self, obj: vtk.vtkObject, event_id: str) -> None:
         """Handles key press events forwarded from the VTK interactor."""
         if not self.scene or not self.main_window:
@@ -1911,7 +1915,6 @@ class VTKPanel:
             non_data_handlers[handler_key]()
             return
 
-
         # Handle Slice Navigation Keys
         anatomical_loaded = self.main_window.anatomical_image_data is not None
         if anatomical_loaded:
@@ -1932,13 +1935,14 @@ class VTKPanel:
         # Handle Streamline-dependent keys
         streamline_data_handlers = {
             "s": self._handle_streamline_selection,
+            "i": self._handle_inverse_selection,
             "plus": lambda: self._handle_radius_change(increase=True),
             "equal": lambda: self._handle_radius_change(increase=True),
             "minus": lambda: self._handle_radius_change(increase=False),
             "d": self.main_window._perform_delete_selection,
             "c": self.main_window._perform_clear_selection,
         }
-        streamline_keys_for_status = {"s", "plus", "equal", "minus", "d", "c"}
+        streamline_keys_for_status = {"s", "i", "plus", "equal", "minus", "d", "c"}
 
         streamlines_loaded = bool(self.main_window.tractogram_data)
         if not streamlines_loaded:

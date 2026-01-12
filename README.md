@@ -206,7 +206,7 @@ The application can now be launched using the tractedit command installed via pi
 ```bash
 tractedit
 ```
-*📌 The first launch may be slower due to one-time JIT compilation. Subsequent runs will be significantly faster.*
+> **Note:** The first launch may be slower due to one-time JIT compilation. Subsequent runs will be significantly faster. 
 
 #### Command Line Options
 ```bash
@@ -246,9 +246,9 @@ No Python setup is required for these versions. Download the latest release for 
 * **Windows:** Use the `.exe` file.
 * **macOS (Apple Silicon):** Use the `.dmg` file.
 * **Linux (AppImage):** Use `.AppImage` — portable, runs on most Linux distributions without installation. Simply make it executable (`chmod +x`) and run.
-* **Linux (Debian/Ubuntu):** Use `.deb` — native package for Debian-based distributions. Install with `sudo dpkg -i TractEdit_3.2.0_amd64.deb`.
+* **Linux (Debian/Ubuntu):** Use `.deb` — native package for Debian-based distributions. Install with `sudo dpkg -i TractEdit_3.3.0_amd64.deb`.
 
-*📌 The first launch may be slower due to one-time JIT compilation. Subsequent runs will be significantly faster.*
+> **Note:** The first launch may be slower due to one-time JIT compilation. Subsequent runs will be significantly faster. 
 
 ---
 
@@ -257,8 +257,9 @@ No Python setup is required for these versions. Download the latest release for 
 | Key / Combo          | Action                                      |
 |----------------------|---------------------------------------------|
 | **s**                | Select/Deselect streamlines at cursor       |
-| **c**                | Clear current selection                     |
+| **i**                | Invert selection                            |
 | **d**                | Delete selected streamlines                 |
+| **c**                | Clear current selection                     |
 | **+ / =**            | Increase selection sphere radius            |
 | **-**                | Decrease selection sphere radius            |
 | **↑ / ↓**            | Axial Slice navigation (Z-axis)             |
@@ -302,6 +303,7 @@ File → Load Image    → Add anatomical image (NIfTI)
 
 `+`/`-` adjust radius <br>
 Press `S` to select <br>
+Press `I` to invert selection <br>
 `D` to delete
 
 </td>

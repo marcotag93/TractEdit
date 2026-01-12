@@ -123,7 +123,11 @@ class ToolbarsManager:
         mw.skip_checkbox.toggled.connect(mw._on_skip_toggled)
         layout.addWidget(mw.skip_checkbox)
 
-        layout.addWidget(QLabel("Skip %: "))
+        # Skip label - natural width to keep it attached to the spinbox
+        skip_label = QLabel("Skip %: ")
+        layout.addWidget(skip_label)
+
+        # Skip spinbox with fixed width for consistent layout
         mw.skip_spinbox = QSpinBox()
         mw.skip_spinbox.setRange(0, 99)
         mw.skip_spinbox.setValue(0)
@@ -131,6 +135,8 @@ class ToolbarsManager:
             "Percentage of streamlines to skip for rendering (0 = Show All, 99 = Show 1%)"
         )
         mw.skip_spinbox.setEnabled(False)
+        mw.skip_spinbox.setFixedWidth(75)
+        mw.skip_spinbox.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         mw.skip_spinbox.editingFinished.connect(mw._on_skip_changed)
         layout.addWidget(mw.skip_spinbox)
 

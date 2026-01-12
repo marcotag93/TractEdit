@@ -11,10 +11,33 @@ Tractedit GUI - Main Application Runner
 import os
 import sys
 import multiprocessing
+import pathlib
 
 # PyInstaller freeze support
 if __name__ == "__main__":
     multiprocessing.freeze_support()
+
+# ============================================================================
+# Numba Configuration
+# ============================================================================
+try:
+    # OS cache directory
+    if sys.platform == "win32":
+        # Windows: %LOCALAPPDATA%
+        base_cache = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+    elif sys.platform == "darwin":
+        # macOS: ~/Library/Caches
+        base_cache = os.path.expanduser("~/Library/Caches")
+    else:
+        # Linux/Unix: ~/.cache or $XDG_CACHE_HOME
+        base_cache = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+
+    # Use standard cache/tractedit/numba for persistent JIT cache
+    _cache_dir = os.path.join(base_cache, "tractedit", "numba")
+    os.makedirs(_cache_dir, exist_ok=True)
+    os.environ["NUMBA_CACHE_DIR"] = _cache_dir
+except Exception as _e:
+    print(f"Warning: Failed to set Numba cache directory: {_e}", file=sys.stderr)
 
 if sys.platform == "darwin":  # macOS
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")

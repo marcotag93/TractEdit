@@ -580,9 +580,24 @@ class DrawingManager:
                     roi_name, roi_data, vox_points_float, shape, view_type
                 )
             else:
-                changed = self._rasterize_freehand(
+                # Freehand drawing
+                auto_fill = getattr(self.panel.main_window, "auto_fill_voxels", False)
+                # Only fill in Draw mode (not eraser)
+                is_eraser = getattr(self.panel, "is_eraser_mode", False)
+
+                # Apply the stroke first (outline)
+                changed_stroke = self._rasterize_freehand(
                     roi_data, vox_points_float, shape, view_type
                 )
+
+                # Apply fill if enabled
+                changed_fill = False
+                if auto_fill and not is_eraser:
+                    changed_fill = self._fill_polygon(
+                        roi_name, roi_data, vox_points_float, shape, view_type
+                    )
+
+                changed = changed_stroke or changed_fill
 
             # Update actor if changed
             if changed:
@@ -1385,3 +1400,104 @@ class DrawingManager:
 
         if render:
             self.panel.render_window.Render()
+
+    def _fill_polygon(
+        self,
+        roi_name: str,
+        roi_data: np.ndarray,
+        vox_points_float: np.ndarray,
+        shape: Tuple[int, ...],
+        view_type: str,
+    ) -> bool:
+        """Fills the interior of the drawn polygon using ray casting."""
+        if len(vox_points_float) < 3:
+            return False
+
+        # Determine indices (columns) for 2D plane
+        const_axis = 2  # Default axial
+        plane_axes = (0, 1)
+
+        if view_type == "axial":
+            const_axis = 2
+            plane_axes = (0, 1)
+        elif view_type == "coronal":
+            const_axis = 1
+            plane_axes = (0, 2)
+        elif view_type == "sagittal":
+            const_axis = 0
+            plane_axes = (1, 2)
+
+        # Get the slice index (average of all points in const axis)
+        const_val = int(np.round(np.mean(vox_points_float[:, const_axis])))
+        if const_val < 0 or const_val >= shape[const_axis]:
+            return False
+
+        # Get 2D polygon vertices
+        poly = vox_points_float[:, plane_axes]
+
+        # Bounding Box
+        min_x = int(np.floor(np.min(poly[:, 0])))
+        max_x = int(np.ceil(np.max(poly[:, 0])))
+        min_y = int(np.floor(np.min(poly[:, 1])))
+        max_y = int(np.ceil(np.max(poly[:, 1])))
+
+        min_x = max(0, min_x)
+        max_x = min(shape[plane_axes[0]] - 1, max_x)
+        min_y = max(0, min_y)
+        max_y = min(shape[plane_axes[1]] - 1, max_y)
+
+        # Create grid points
+        x_range = np.arange(min_x, max_x + 1)
+        y_range = np.arange(min_y, max_y + 1)
+
+        if len(x_range) == 0 or len(y_range) == 0:
+            return False
+
+        xx, yy = np.meshgrid(x_range, y_range)
+        points = np.vstack((xx.flatten(), yy.flatten())).T
+
+        if len(points) == 0:
+            return False
+
+        # Ray Casting Algorithm (Vectorized)
+        path = poly
+        n_vertices = len(path)
+        j = n_vertices - 1
+
+        x = points[:, 0]
+        y = points[:, 1]
+
+        mask = np.zeros(len(points), dtype=bool)
+
+        for i in range(n_vertices):
+            xi, yi = path[i]
+            xj, yj = path[j]
+
+            # Intersection condition
+            # 1. Edge must cross the horizontal ray line (yi > y) != (yj > y)
+            # 2. Intersection x-coordinate must be less than point x (ray to the right)
+
+            intersect = ((yi > y) != (yj > y)) & (
+                x < (xj - xi) * (y - yi) / (yj - yi + 1e-10) + xi
+            )
+
+            mask ^= intersect
+            j = i
+
+        # Reshape mask back to grid shape (rows=y, cols=x)
+        mask_grid = mask.reshape(len(y_range), len(x_range))
+
+        # Transpose to match (X, Y) indexing for ROI data assignment
+        mask_transposed = mask_grid.T
+
+        # Build slicing tuple
+        slices = [slice(None)] * 3
+        slices[const_axis] = const_val
+        slices[plane_axes[0]] = slice(min_x, max_x + 1)
+        slices[plane_axes[1]] = slice(min_y, max_y + 1)
+
+        # Fill
+        roi_patch = roi_data[tuple(slices)]
+        roi_patch[mask_transposed] = 1
+
+        return True

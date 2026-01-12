@@ -830,6 +830,60 @@ class SelectionManager:
                 f"Radius Sel: Found {len(indices_to_toggle)}. Selection unchanged."
             )
 
+    def invert_selection(self) -> None:
+        """
+        Inverts the current selection based on visible streamlines.
+        Selects all visible streamlines that are NOT currently selected.
+        """
+        if (
+            not self.panel.main_window
+            or not self.panel.main_window.tractogram_data
+            or not hasattr(self.panel.main_window, "selected_streamline_indices")
+        ):
+            self.panel.update_status(
+                "Inverse Sel: No streamlines loaded or selection state unavailable."
+            )
+            return
+
+        visible_indices = self.panel.main_window.visible_indices
+        if visible_indices is None or len(visible_indices) == 0:
+            self.panel.update_status("Inverse Sel: No visible streamlines to select.")
+            return
+
+        current_selection: Set[int] = self.panel.main_window.selected_streamline_indices
+        if current_selection is None:
+            current_selection = set()
+            self.panel.main_window.selected_streamline_indices = current_selection
+
+        # Convert to numpy array for fast set difference if possible, or sets
+        # Using sets for clarity and typical selection sizes
+        visible_set = set(visible_indices)
+
+        # New selection = Visible - Currently Selected
+        # This will select everything visible that wasn't selected,
+        # and unselect everything that was selected (effectively, though we rewrite the set).
+        # Note: If there are selected items that are NOT visible (e.g. filtered out),
+        # should they remain selected? "Inverse" typically implies "swap state".
+        # If I am looking at a subset, "Inverse" usually means "Select the other part of this subset".
+        # So we should probably clearer: new_selection = Visible - (Visible & Current)
+        # effectively: new_selection = visible_set - current_selection
+
+        new_selection = visible_set - current_selection
+
+        # Update the main set
+        # We replace the content of the set to maintain the reference if used elsewhere,
+        # or just reassign. Reassigning is safer if we own it.
+        # But 'selected_streamline_indices' is likely a set object on main_window.
+        # Let's clear and update to be safe and keep the object reference if it matters.
+
+        current_selection.clear()
+        current_selection.update(new_selection)
+
+        self.panel.update_status(
+            f"Inverse Sel: Selected {len(current_selection)} streamlines."
+        )
+        self.panel.update_highlight()
+
     def handle_streamline_selection(self) -> None:
         """Handles the logic for selecting streamlines triggered by the 's' key."""
         if (

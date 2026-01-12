@@ -58,7 +58,7 @@ from PyQt6.QtGui import (
     QBrush,
     QColor,
 )
-from PyQt6.QtCore import Qt, pyqtSlot, QTimer
+from PyQt6.QtCore import Qt, pyqtSlot, QTimer, QSettings
 
 from . import file_io
 from . import odf_utils
@@ -231,6 +231,10 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("TractEdit GUI - Interactive Editor")
         self.setMinimumSize(800, 600)
 
+        # Settings
+        self.auto_fill_voxels: bool = False
+        self.settings = QSettings("TractEdit", "TractEdit")
+
         # UI Managers
         self.actions_manager = ActionsManager(self)
         self.toolbars_manager = ToolbarsManager(self)
@@ -260,6 +264,9 @@ class MainWindow(QMainWindow):
         self._update_initial_status()
         self._update_action_states()
         self._update_bundle_info_display()
+
+        # Load persisted settings
+        self._load_settings()
 
     def _on_brush_size_changed(self, value: int) -> None:
         """Updates the brush size when the slider value changes."""
@@ -1456,6 +1463,12 @@ class MainWindow(QMainWindow):
 
         # Unblock signals now that rebuild is complete
         self.data_tree_widget.blockSignals(False)
+
+        # Force visual update to ensure checkbox states are immediately reflected
+        # This fixes the issue where checkboxes appear unchecked after data load
+        # even though the visibility flags are True
+        if self.data_tree_widget.viewport():
+            self.data_tree_widget.viewport().update()
 
     def _collect_expanded_items(
         self, item: QTreeWidgetItem, path: str, expanded_set: set
@@ -2858,6 +2871,29 @@ class MainWindow(QMainWindow):
         if self.vtk_panel:
             self.vtk_panel.update_status("Theme changed to System")
 
+    def _toggle_auto_fill(self, checked: bool) -> None:
+        """Toggles the ROI auto-fill setting."""
+        self.auto_fill_voxels = checked
+        self._save_settings()
+        status = "Enabled" if checked else "Disabled"
+        if self.vtk_panel:
+            self.vtk_panel.update_status(f"ROI Auto-fill {status}")
+
+    def _load_settings(self) -> None:
+        """Loads persistent application settings."""
+        # Load Auto-fill setting (default False)
+        self.auto_fill_voxels = self.settings.value(
+            "drawing/auto_fill", False, type=bool
+        )
+
+        # Sync UI action if it exists
+        if hasattr(self, "auto_fill_action"):
+            self.auto_fill_action.setChecked(self.auto_fill_voxels)
+
+    def _save_settings(self) -> None:
+        """Saves persistent application settings."""
+        self.settings.setValue("drawing/auto_fill", self.auto_fill_voxels)
+
     # Help-About dialog
     def _show_about_dialog(self) -> None:
         """Displays the About tractedit information box with the application logo."""
@@ -2880,7 +2916,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.warning(f"Could not load logo for About dialog: {e}")
 
-        about_text = """<b>TractEdit version 3.2.0</b><br><br>
+        about_text = """<b>TractEdit version 3.3.0</b><br><br>
         Author: Marco Tagliaferri, PhD Candidate in Neuroscience<br>
         Center for Mind/Brain Sciences (CIMeC)
         University of Trento, Italy

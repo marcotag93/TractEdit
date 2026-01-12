@@ -379,6 +379,15 @@ class ActionsManager:
         mw.theme_dark_action.setCheckable(True)
         mw.theme_dark_action.triggered.connect(mw._set_theme_dark)
 
+        # Auto-Fill Action (Settings)
+        mw.auto_fill_action = QAction("Auto-fill Voxels", mw)
+        mw.auto_fill_action.setStatusTip(
+            "Automatically fill the interior of drawn ROI polygons"
+        )
+        mw.auto_fill_action.setCheckable(True)
+        # Initial checked state will be set by _load_settings in MainWindow
+        mw.auto_fill_action.triggered.connect(mw._toggle_auto_fill)
+
         mw.theme_system_action = QAction("&System", mw)
         mw.theme_system_action.setStatusTip("Follow system theme")
         mw.theme_system_action.setCheckable(True)
@@ -476,6 +485,9 @@ class ActionsManager:
         # Settings Menu
         settings_menu = main_bar.addMenu("&Settings")
 
+        settings_menu.addAction(mw.auto_fill_action)
+        settings_menu.addSeparator()
+
         # Theme Sub-menu
         theme_menu = settings_menu.addMenu("&Theme")
         theme_menu.addAction(mw.theme_light_action)
@@ -497,12 +509,8 @@ class ActionsManager:
             # Default to system if theme manager not yet initialized
             mw.theme_system_action.setChecked(True)
 
-        # Help Menu
-        help_menu = main_bar.addMenu("&Help")
-        help_menu.addAction(mw.about_action)
-
-        # Shortcuts Submenu List
-        shortcuts_menu = help_menu.addMenu("Keyboard &Shortcuts")
+        # Shortcuts Menu
+        shortcuts_menu = main_bar.addMenu("&Shortcuts")
 
         # Helper to add static text items
         def add_shortcut_item(text: str) -> None:
@@ -513,6 +521,7 @@ class ActionsManager:
         # Selection Group
         shortcuts_menu.addSection("Selection Tools")
         add_shortcut_item("s  :  Select/Deselect at cursor")
+        add_shortcut_item("i  :  Invert selection")
         add_shortcut_item("d  :  Delete selection")
         add_shortcut_item("c  :  Clear selection")
         add_shortcut_item("+ / =  :  Increase sphere radius")
@@ -539,7 +548,8 @@ class ActionsManager:
         add_shortcut_item("Ctrl + P  :  Screenshot")
         add_shortcut_item("Ctrl + Q  :  Quit")
 
-        help_menu.addSeparator()
+        # Help Menu
+        help_menu = main_bar.addMenu("&Help")
         help_menu.addAction(mw.about_action)
 
     def update_action_states(self) -> None:
