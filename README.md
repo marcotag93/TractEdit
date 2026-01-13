@@ -320,10 +320,50 @@ File → Load Image    → Add anatomical image (NIfTI)
 <tr>
 <td width="25%" align="center">
 
+**🎯 Manual Selection**
+
+`+`/`-` adjust radius <br>
+Press `S` to select <br>
+Press `I` to invert selection <br>
+`D` to delete
+
+</td>
+<td width="25%" align="center">
+
+**📂 Load ROIs**
+
+File → Load ROI  
+Right-click for  
+Include/Exclude  
+
+</td>
+<td width="25%" align="center">
+
+**✏️ Draw ROIs**
+
+`1` Pencil · `2` Eraser  
+`3` Sphere · `4` Rectangle  
+Ctrl+drag to move 
+Include/Exclude 
+
+</td>
+<td width="25%" align="center">
+
+**🧠 Parcellation**
+
+File → Load Parcellation  
+Right-click regions  
+Include/Exclude  
+
+</td>
+</tr>
+</table>
+
+
 ### Step 4: Finalize & Export
 
-| Action                    | Menu                              |
-| ------------------------- | --------------------------------- |
+| Action                    | Menu                             |
+| ------------------------- | -------------------------------- |
 | Change colors             | View → Streamline Color          |
 | Calculate centroid/medoid | File → Calculate Centroid/Medoid |
 | Save density map          | File → Save Density Map          |
