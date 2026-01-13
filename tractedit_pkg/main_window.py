@@ -2729,16 +2729,15 @@ class MainWindow(QMainWindow):
             event.accept()
             should_exit = True
 
-        # On Linux, force immediate exit to prevent VTK/Qt cleanup conflicts
-        # that cause segmentation faults.
-        # Windows and macOS don't typically have this issue.
+        # On Linux and macOS, force immediate exit to prevent VTK/Qt cleanup
+        # conflicts that cause segmentation faults during Py_FinalizeEx.
         if should_exit:
             import sys
 
-            if sys.platform.startswith("linux"):
+            if sys.platform.startswith("linux") or sys.platform == "darwin":
                 import os
 
-                logger.info("Exiting application (Linux workaround)...")
+                logger.info("Exiting application (Unix workaround)...")
                 os._exit(0)
 
     def _cleanup_resources(self) -> None:
@@ -2786,7 +2785,16 @@ class MainWindow(QMainWindow):
 
         panel = self.vtk_panel
 
-        # Step 1: Clear all scenes (remove actors to prevent dangling references)
+        # Disable and release orientation widget
+        if hasattr(panel, "orientation_widget") and panel.orientation_widget:
+            try:
+                panel.orientation_widget.SetEnabled(0)
+                panel.orientation_widget.SetInteractor(None)
+                panel.orientation_widget = None
+            except Exception:
+                pass
+
+        # Clear all scenes
         scenes_to_clear = [
             panel.scene,
             getattr(panel, "axial_scene", None),
@@ -2800,7 +2808,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
 
-        # Step 2: Remove all observers and terminate all interactors
+        # Remove all observers and terminate all interactors
         interactors = [
             getattr(panel, "interactor", None),
             getattr(panel, "axial_interactor", None),
@@ -2816,8 +2824,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
 
-        # Step 3: Close QVTKRenderWindowInteractor widgets
-        # This prevents Qt from trying to access finalized VTK resources
+        # Close QVTKRenderWindowInteractor widgets
         qt_vtk_widgets = [
             getattr(panel, "vtk_widget", None),
             getattr(panel, "axial_vtk_widget", None),
@@ -2834,7 +2841,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
 
-        # Step 4: Set references to None to help garbage collection
+        # Set references to None to help garbage collection
         panel.scene = None
         panel.axial_scene = None
         panel.coronal_scene = None
