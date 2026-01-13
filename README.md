@@ -34,7 +34,7 @@ https://github.com/user-attachments/assets/f97633bb-2f16-493c-8487-64055d8f164d
 
 If you use TractEdit in your research, please cite:
 
-> Tagliaferri, M. (2026). TractEdit: An Open-Source Interactive Tool for Virtual Dissection and Manual Refinement of Diffusion MRI Tractography (Version 3.3.0). Zenodo. https://doi.org/10.5281/zenodo.18118153
+> Tagliaferri, M. (2026). TractEdit: An Open-Source Interactive Tool for Virtual Dissection and Manual Refinement of Diffusion MRI Tractography. Zenodo. https://doi.org/10.5281/zenodo.18118153
 
 **BibTeX:**
 
