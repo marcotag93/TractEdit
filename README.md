@@ -15,6 +15,9 @@
 <p align="center">
   <a href="https://github.com/marcotag93/TractEdit/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"/></a>
   <a href="https://doi.org/10.5281/zenodo.18118153"><img src="https://zenodo.org/badge/DOI/10.5281/zenodo.18118153.svg" alt="DOI"></a>
+  <a href="https://gitcgr.com/marcotag93/TractEdit">
+    <img src="https://gitcgr.com/badge/marcotag93/TractEdit.svg" alt="gitcgr" />
+  </a>
   <img src="https://img.shields.io/badge/python-3.11-green.svg" alt="Python"/>
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey" alt="Platform"/>
 </p>
