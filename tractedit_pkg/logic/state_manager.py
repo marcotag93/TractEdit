@@ -25,10 +25,12 @@ import numpy as np
 from PyQt6.QtWidgets import QMessageBox
 
 from ..utils import (
+    AUTO_SKIP_THRESHOLD,
     ColorMode,
     MAX_STACK_LEVELS,
     MIN_SELECTION_RADIUS,
     RADIUS_INCREMENT,
+    TARGET_RENDER_COUNT,
 )
 
 if TYPE_CHECKING:
@@ -43,8 +45,7 @@ logger = logging.getLogger(__name__)
 
 
 class ActionType(Enum):
-    """
-    Enum defining the types of undoable actions.
+    """Enum defining the types of undoable actions.
 
     This enables unified undo/redo across all modes without requiring
     the user to be in a specific mode to undo a particular action type.
@@ -52,6 +53,7 @@ class ActionType(Enum):
 
     STREAMLINE_DELETION = auto()
     ROI_MODIFICATION = auto()
+    SELECTION_CHANGE = auto()
 
 
 # ============================================================================
@@ -105,6 +107,8 @@ class StateManager:
             self._undo_roi_action(action)
         elif action_type == ActionType.STREAMLINE_DELETION:
             self._undo_streamline_action(action)
+        elif action_type == ActionType.SELECTION_CHANGE:
+            self._undo_selection_action(action)
         else:
             logger.warning(f"Unknown action type in undo stack: {action_type}")
 
@@ -131,14 +135,22 @@ class StateManager:
             self._redo_roi_action(action)
         elif action_type == ActionType.STREAMLINE_DELETION:
             self._redo_streamline_action(action)
+        elif action_type == ActionType.SELECTION_CHANGE:
+            self._redo_selection_action(action)
         else:
             logger.warning(f"Unknown action type in redo stack: {action_type}")
 
         mw._update_action_states()
 
     def _undo_streamline_action(self, action: Dict[str, Any]) -> None:
-        """
-        Undoes a streamline deletion action.
+        """Undo a streamline deletion, restoring visibility and re-applying skip.
+
+        After restoring deleted streamlines, the skip level is always
+        recalculated via ``_auto_calculate_skip_level()``.  For tractograms
+        at or above ``AUTO_SKIP_THRESHOLD``, the user's manual
+        skip-disable override is also cleared and a conservative pre-stride
+        is applied before the ROI filter pass to prevent a transient
+        stride-1 render from exhausting RAM.
 
         Args:
             action: The action record containing deleted_indices.
@@ -149,25 +161,46 @@ class StateManager:
         if not deleted_indices:
             return
 
-        # Create redo action with current state
         redo_action = {
             "action_type": ActionType.STREAMLINE_DELETION,
             "deleted_indices": deleted_indices.copy(),
         }
         mw.unified_redo_stack.append(redo_action)
-
-        # Limit redo stack size
         if len(mw.unified_redo_stack) > MAX_STACK_LEVELS:
             mw.unified_redo_stack.pop(0)
 
-        # Restore the deleted streamlines
         mw.manual_visible_indices.update(deleted_indices)
+
+        force_auto_skip = self._should_force_auto_skip_for_undo_redo()
+        if force_auto_skip:
+            mw._skip_user_disabled = False
+
+            approx_visible = len(mw.manual_visible_indices)
+            if approx_visible > TARGET_RENDER_COUNT:
+                mw.render_stride = max(1, approx_visible // TARGET_RENDER_COUNT)
+            else:
+                mw.render_stride = 1
+
         mw.roi_manager.apply_logic_filters()
+        mw._auto_calculate_skip_level()
 
         if mw.vtk_panel:
             mw.vtk_panel.update_status(
                 f"Undone: Restored {len(deleted_indices)} streamline(s)."
             )
+
+    def _should_force_auto_skip_for_undo_redo(self) -> bool:
+        """Return True when undo/redo should force auto-skip protection."""
+        tractogram_data = self.mw.tractogram_data
+        if tractogram_data is None:
+            return False
+
+        try:
+            total_streamlines = len(tractogram_data)
+        except TypeError:
+            return False
+
+        return total_streamlines >= AUTO_SKIP_THRESHOLD
 
     def _redo_streamline_action(self, action: Dict[str, Any]) -> None:
         """
@@ -372,6 +405,175 @@ class StateManager:
         mw.roi_manager.update_roi_visual_selection()
         mw.roi_manager.apply_logic_filters()
 
+    def save_selection_change_for_undo(
+        self, added_indices: Set[int], removed_indices: Set[int]
+    ) -> None:
+        """Save a sphere selection change to the unified undo stack.
+
+        Called by :meth:`~tractedit_pkg.visualization.selection.SelectionManager.apply_selection`
+        **before** mutating ``selected_streamline_indices``, so the delta is
+        always recorded against the pre-operation state.
+
+        The record stores only the net delta (which indices were added / removed),
+        not a full snapshot, keeping memory consumption proportional to the
+        sphere selection size rather than the total tractogram size.
+
+        Args:
+            added_indices: Indices that will be added to the selection
+                (empty set for a deselect-in-sphere operation).
+            removed_indices: Indices that will be removed from the selection
+                (empty set for an add-only operation).
+        """
+        mw = self.mw
+
+        if not added_indices and not removed_indices:
+            return
+
+        action = {
+            "action_type": ActionType.SELECTION_CHANGE,
+            "added_indices": added_indices.copy(),
+            "removed_indices": removed_indices.copy(),
+        }
+        mw.unified_undo_stack.append(action)
+
+        # Any new action invalidates the redo history.
+        mw.unified_redo_stack.clear()
+
+        if len(mw.unified_undo_stack) > MAX_STACK_LEVELS:
+            mw.unified_undo_stack.pop(0)
+
+    def _undo_selection_action(self, action: Dict[str, Any]) -> None:
+        """Undo a sphere selection change, reversing the recorded delta.
+
+        - Indices that were *added* are removed from the current selection.
+        - Indices that were *removed* are re-added to the current selection.
+
+        Both operations use a single C-level ``set`` method, consistent with
+        the performance approach used in
+        :meth:`~tractedit_pkg.visualization.selection.SelectionManager.apply_selection`.
+
+        If inversion mode is active when this method is called, it is exited
+        first by restoring the pre-inversion keeper set.  This is necessary
+        because the undo delta was recorded against the pre-inversion state:
+        applying it directly to the inverted selection would produce a
+        semantically incorrect result and leave ``_inversion_active`` set,
+        causing subsequent ``S`` / ``D`` operations to misbehave silently.
+
+        Args:
+            action: The action record produced by
+                :meth:`save_selection_change_for_undo`.
+        """
+        mw = self.mw
+
+        added_indices: Set[int] = action.get("added_indices", set())
+        removed_indices: Set[int] = action.get("removed_indices", set())
+
+        if not added_indices and not removed_indices:
+            return
+
+        # Push the inverse delta onto the redo stack so the operation can be
+        # replayed.  The redo record is the mirror image of the undo record.
+        redo_action = {
+            "action_type": ActionType.SELECTION_CHANGE,
+            "added_indices": added_indices.copy(),
+            "removed_indices": removed_indices.copy(),
+        }
+        mw.unified_redo_stack.append(redo_action)
+        if len(mw.unified_redo_stack) > MAX_STACK_LEVELS:
+            mw.unified_redo_stack.pop(0)
+
+        current_selection: Set[int] = mw.selected_streamline_indices
+        if current_selection is None:
+            current_selection = set()
+            mw.selected_streamline_indices = current_selection
+
+        # If inversion mode is active, restore the pre-inversion (keeper) state
+        # before applying the delta.  The keeper set is the selection that
+        # existed just before ``I`` was pressed — i.e., the correct baseline
+        # for reversing the recorded ``S`` / ``Shift+S`` delta.
+        if mw._inversion_active:
+            current_selection.clear()
+            current_selection.update(mw._inversion_keeper_indices)
+            mw._inversion_active = False
+            mw._inversion_keeper_indices = set()
+            if mw.vtk_panel:
+                mw.vtk_panel.clear_invert_contour()
+
+        # Reverse the original delta with single C-level set operations.
+        current_selection.difference_update(added_indices)
+        current_selection.update(removed_indices)
+
+        n_changed = len(added_indices) + len(removed_indices)
+        total = len(current_selection)
+
+        if mw.vtk_panel:
+            mw.vtk_panel.update_highlight()
+            mw.vtk_panel.update_status(
+                f"Undone: Selection change ({n_changed:,} streamline(s)). "
+                f"Total selected: {total:,}"
+            )
+
+    def _redo_selection_action(self, action: Dict[str, Any]) -> None:
+        """Redo a sphere selection change, re-applying the original delta.
+
+        - Indices that were originally *added* are re-added.
+        - Indices that were originally *removed* are re-removed.
+
+        As with :meth:`_undo_selection_action`, any active inversion mode is
+        exited before the delta is applied to ensure a consistent baseline.
+
+        Args:
+            action: The action record produced by
+                :meth:`save_selection_change_for_undo`.
+        """
+        mw = self.mw
+
+        added_indices: Set[int] = action.get("added_indices", set())
+        removed_indices: Set[int] = action.get("removed_indices", set())
+
+        if not added_indices and not removed_indices:
+            return
+
+        # Push the inverse delta back onto the undo stack.
+        undo_action = {
+            "action_type": ActionType.SELECTION_CHANGE,
+            "added_indices": added_indices.copy(),
+            "removed_indices": removed_indices.copy(),
+        }
+        mw.unified_undo_stack.append(undo_action)
+        if len(mw.unified_undo_stack) > MAX_STACK_LEVELS:
+            mw.unified_undo_stack.pop(0)
+
+        current_selection: Set[int] = mw.selected_streamline_indices
+        if current_selection is None:
+            current_selection = set()
+            mw.selected_streamline_indices = current_selection
+
+        # Exit inversion mode if active, for the same reason as in
+        # ``_undo_selection_action``: the redo delta must be applied to a
+        # clean, non-inverted selection baseline.
+        if mw._inversion_active:
+            current_selection.clear()
+            current_selection.update(mw._inversion_keeper_indices)
+            mw._inversion_active = False
+            mw._inversion_keeper_indices = set()
+            if mw.vtk_panel:
+                mw.vtk_panel.clear_invert_contour()
+
+        # Re-apply the original delta with single C-level set operations.
+        current_selection.update(added_indices)
+        current_selection.difference_update(removed_indices)
+
+        n_changed = len(added_indices) + len(removed_indices)
+        total = len(current_selection)
+
+        if mw.vtk_panel:
+            mw.vtk_panel.update_highlight()
+            mw.vtk_panel.update_status(
+                f"Redone: Selection change ({n_changed:,} streamline(s)). "
+                f"Total selected: {total:,}"
+            )
+
     def save_roi_state_for_undo(self, roi_name: str) -> None:
         """
         Saves the current ROI state to the unified undo stack before modification.
@@ -444,7 +646,7 @@ class StateManager:
             mw.unified_undo_stack.pop(0)
 
     def perform_clear_selection(self) -> None:
-        """Clears the current streamline selection."""
+        """Clear the current streamline selection and exit inversion mode."""
         mw = self.mw
 
         if mw.vtk_panel:
@@ -452,7 +654,12 @@ class StateManager:
 
         if mw.selected_streamline_indices:
             mw.selected_streamline_indices = set()
+
+            # Exit inversion mode and remove the cyan keeper contour.
+            mw._inversion_active = False
+            mw._inversion_keeper_indices = set()
             if mw.vtk_panel:
+                mw.vtk_panel.clear_invert_contour()
                 mw.vtk_panel.update_highlight()
                 mw.vtk_panel.update_status("Selection cleared.")
         elif mw.vtk_panel:
@@ -491,24 +698,35 @@ class StateManager:
         mw.vtk_panel.update_status("Camera reset (Front Coronal).")
 
     def perform_delete_selection(self) -> None:
-        """Deletes the currently selected streamlines."""
+        """Delete the currently selected streamlines and exit inversion mode."""
         mw = self.mw
 
         if not mw.selected_streamline_indices:
             return
 
-        # Save to unified undo stack
+        # Save to unified undo stack.
         to_delete = mw.selected_streamline_indices.copy()
         self.save_streamline_deletion_for_undo(to_delete)
 
-        # Update MANUAL state
+        # Update MANUAL state.
         mw.manual_visible_indices.difference_update(to_delete)
 
         mw.selected_streamline_indices = set()
+
+        # Exit inversion mode and remove the cyan keeper contour.
+        mw._inversion_active = False
+        mw._inversion_keeper_indices = set()
+        if mw.vtk_panel:
+            mw.vtk_panel.clear_invert_contour()
+
         mw.roi_manager.apply_logic_filters()
+
+        # Recalculate stride so the now-smaller visible set is rendered at the correct density.
+        mw._auto_calculate_skip_level()
+
         mw._update_action_states()
 
-        # Hide selection sphere after deletion
+        # Hide selection sphere after deletion.
         if mw.vtk_panel:
             mw.vtk_panel.update_radius_actor(visible=False)
             mw.vtk_panel.update_status(f"Deleted {len(to_delete)} streamline(s).")

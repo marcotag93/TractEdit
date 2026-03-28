@@ -66,7 +66,7 @@ def create_streamline_actor(
                 linewidth=linewidth,
                 lod=use_lod,
             )
-    except Exception as e:
+    except (RuntimeError, ValueError, AttributeError) as e:
         logger.error(f"Error creating streamline actor: {e}")
         return None
 
@@ -108,7 +108,7 @@ def create_highlight_actor(
             mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(-1, -10)
 
         return highlight_actor
-    except Exception as e:
+    except (RuntimeError, ValueError, AttributeError) as e:
         logger.error(f"Error creating highlight actor: {e}")
         return None
 
@@ -150,7 +150,7 @@ def create_roi_highlight_actor(
             mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(-2, -20)
 
         return roi_actor
-    except Exception as e:
+    except (RuntimeError, ValueError, AttributeError) as e:
         logger.error(f"Error creating ROI highlight actor: {e}")
         return None
 
@@ -188,7 +188,7 @@ def create_slicer_actor(
             opacity=opacity,
             interpolation=interpolation,
         )
-    except Exception as e:
+    except (RuntimeError, ValueError, AttributeError) as e:
         logger.error(f"Error creating slicer actor: {e}")
         return None
 
@@ -235,7 +235,7 @@ def create_odf_actor(
             odf_actor.display_extent(*extent)
 
         return odf_actor
-    except Exception as e:
+    except (RuntimeError, ValueError, AttributeError) as e:
         logger.error(f"Error creating ODF actor: {e}")
         return None
 

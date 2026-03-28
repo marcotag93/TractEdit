@@ -27,11 +27,12 @@ def sample_streamlines():
         ArraySequence: Three streamlines with varying point counts.
     """
     streamlines = [
-        np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [2.0, 2.0, 2.0]],
-                 dtype=np.float32),
+        np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [2.0, 2.0, 2.0]], dtype=np.float32),
         np.array([[5.0, 5.0, 5.0], [6.0, 6.0, 6.0]], dtype=np.float32),
-        np.array([[10.0, 0.0, 0.0], [10.0, 1.0, 0.0], [10.0, 2.0, 0.0],
-                  [10.0, 3.0, 0.0]], dtype=np.float32),
+        np.array(
+            [[10.0, 0.0, 0.0], [10.0, 1.0, 0.0], [10.0, 2.0, 0.0], [10.0, 3.0, 0.0]],
+            dtype=np.float32,
+        ),
     ]
     return ArraySequence(streamlines)
 
@@ -81,7 +82,7 @@ def temp_nifti_file():
     img = nib.Nifti1Image(data, affine)
 
     # Write to temporary file
-    with tempfile.NamedTemporaryFile(suffix='.nii.gz', delete=False) as f:
+    with tempfile.NamedTemporaryFile(suffix=".nii.gz", delete=False) as f:
         temp_path = f.name
 
     nib.save(img, temp_path)
@@ -103,15 +104,18 @@ def temp_nifti_ras():
     """
     data = np.arange(8).reshape(2, 2, 2).astype(np.float32)
     # Positive X direction in affine (RAS orientation)
-    affine = np.array([
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0]
-    ], dtype=np.float32)
+    affine = np.array(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
     img = nib.Nifti1Image(data, affine)
 
-    with tempfile.NamedTemporaryFile(suffix='.nii.gz', delete=False) as f:
+    with tempfile.NamedTemporaryFile(suffix=".nii.gz", delete=False) as f:
         temp_path = f.name
 
     nib.save(img, temp_path)
@@ -132,15 +136,18 @@ def temp_nifti_las():
     """
     data = np.arange(8).reshape(2, 2, 2).astype(np.float32)
     # Negative X direction in affine (LAS orientation)
-    affine = np.array([
-        [-1.0, 0.0, 0.0, 1.0],
-        [0.0, 1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0]
-    ], dtype=np.float32)
+    affine = np.array(
+        [
+            [-1.0, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
     img = nib.Nifti1Image(data, affine)
 
-    with tempfile.NamedTemporaryFile(suffix='.nii.gz', delete=False) as f:
+    with tempfile.NamedTemporaryFile(suffix=".nii.gz", delete=False) as f:
         temp_path = f.name
 
     nib.save(img, temp_path)
@@ -193,4 +200,4 @@ def pytest_configure(config):
     """Register custom markers."""
     config.addinivalue_line("markers", "slow: marks tests as slow")
     config.addinivalue_line("markers", "gui: marks tests as requiring GUI")
-    config.addinivalue_line("markers", "numba: marks tests using Numba JIT")
+    config.addinivalue_line("markers", "numba: marks tests using AOT-compiled kernels")

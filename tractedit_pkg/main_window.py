@@ -14,7 +14,7 @@ file I/O, and the VTK panel.
 
 import os
 import numpy as np
-from typing import Optional, List, Set, Dict, Any
+from typing import Optional, List, Set, Dict, Any, Tuple
 import nibabel as nib
 import logging
 
@@ -67,12 +67,14 @@ from .utils import (
     get_formatted_datetime,
     get_asset_path,
     format_tuple,
+    signals_blocked,
     MAX_STACK_LEVELS,
     DEFAULT_SELECTION_RADIUS,
     MIN_SELECTION_RADIUS,
     RADIUS_INCREMENT,
     SLIDER_PRECISION,
     ROI_COLORS,
+    TARGET_RENDER_COUNT,
 )
 from .visualization import VTKPanel
 from .ui import (
@@ -129,12 +131,28 @@ class MainWindow(QMainWindow):
         self.selected_streamline_indices: Set[int] = (
             set()
         )  # Indices of selected streamlines
+
+        # Inversion-mode state — reset whenever the selection is cleared,
+        # deleted, or a new sphere selection starts.
+        self._inversion_active: bool = False
+        self._inversion_keeper_indices: Set[int] = set()
+
         self.selection_radius_3d: float = (
             DEFAULT_SELECTION_RADIUS  # Radius for sphere selection
         )
         self.render_stride: int = 1  # 1 = Show all, 100 = Show 1%
+        self._skip_user_disabled: bool = False  # User explicitly turned off skip
         self.bundle_opacity: float = 1.0  # Default to 1.0
         self.image_opacity: float = 1.0
+
+        # Dirty tracking for actor rebuild optimization
+        self._visibility_version: int = 0
+        self._last_visibility_version: int = -1
+        self._last_render_stride: int = 1
+        self._last_color_mode: Optional[ColorMode] = None
+        self._last_active_scalar: Optional[str] = None
+        self._last_tube_mode: bool = False
+        self._last_bundle_opacity: float = 1.0
         self.roi_opacities: Dict[str, float] = {}
 
         # Background thread references (for cleanup)
@@ -179,6 +197,8 @@ class MainWindow(QMainWindow):
         self.odf_sh_order: int = 0
         self.odf_sphere = None
         self.odf_basis_matrix = None
+        self.odf_tunnel_sphere = None       # Lower-res sphere for tunnel display
+        self.odf_tunnel_basis = None         # SH basis for tunnel display sphere
         self.odf_tunnel_is_visible: bool = False
         self.MAX_ODF_STREAMLINES = 26000  # Safety limit for Tunnel View
 
@@ -214,18 +234,123 @@ class MainWindow(QMainWindow):
             set()
         )  # Tracks manual deletions separate from filters
 
-        # Caching intersections to avoid re-calculating on every click
-        self.roi_intersection_cache: Dict[str, Set[int]] = {}
-
-        # Set of indices specifically highlighted in RED (ROI Selection)
-        self.roi_highlight_indices: Set[int] = set()
-
         # Manual ROI Drawing State
         self.is_drawing_mode: bool = False
         self.is_eraser_mode: bool = False  # Eraser mode for ROI
         self.current_drawing_roi: Optional[str] = None
         self.manual_roi_counter: int = 0
         self.draw_brush_size: int = 1  # Number of voxels (1 = single voxel)
+
+        # Drawing Mode State (sphere / rectangle)
+        self.is_sphere_mode: bool = False
+        self.is_rectangle_mode: bool = False
+
+        # Parcellation Overlay & Region State
+        self._parcellation_overlay_visible: bool = False
+        self._parcellation_overlay_cached: bool = False
+        self.parcellation_overlay_actor: Optional[Any] = None
+        self.parcellation_connected_labels: Set[int] = set()
+        self.parcellation_region_visibility: Dict[int, bool] = {}
+        self.parcellation_main_labels: Set[int] = set()
+        self.parcellation_label_colors: Dict[int, Tuple[float, ...]] = {}
+        self.parcellation_region_actors: Dict[int, Any] = {}
+        self.parcellation_region_states: Dict[int, Dict[str, bool]] = {}
+
+        # Parcellation filter data (also reset in _clear_parcellation)
+        self.parcellation_region_intersection_cache: Dict[str, Set[int]] = {}
+        self.parcellation_start_labels: Optional[np.ndarray] = None
+        self.parcellation_end_labels: Optional[np.ndarray] = None
+        self.parcellation_visible_indices: Optional[Set[int]] = None
+
+        # Pending / Cache
+        self._pending_expanded_items: Set[str] = set()
+
+        # Actions — File menu
+        self.load_file_action: Optional[QAction] = None
+        self.replace_bundle_action: Optional[QAction] = None
+        self.load_bg_image_action: Optional[QAction] = None
+        self.load_odf_action: Optional[QAction] = None
+        self.view_odf_tunnel_action: Optional[QAction] = None
+        self.load_parcellation_action: Optional[QAction] = None
+        self.view_parcellation_action: Optional[QAction] = None
+        self.close_bundle_action: Optional[QAction] = None
+        self.clear_bg_image_action: Optional[QAction] = None
+        self.load_roi_action: Optional[QAction] = None
+        self.new_roi_action: Optional[QAction] = None
+        self.draw_mode_action: Optional[QAction] = None
+        self.erase_mode_action: Optional[QAction] = None
+        self.sphere_mode_action: Optional[QAction] = None
+        self.rectangle_mode_action: Optional[QAction] = None
+        self.clear_all_rois_action: Optional[QAction] = None
+        self.clear_all_data_action: Optional[QAction] = None
+        self.save_file_action: Optional[QAction] = None
+        self.screenshot_action: Optional[QAction] = None
+        self.export_html_action: Optional[QAction] = None
+        self.save_density_map_action: Optional[QAction] = None
+        self.exit_action: Optional[QAction] = None
+
+        # Actions — Edit menu
+        self.undo_action: Optional[QAction] = None
+        self.redo_action: Optional[QAction] = None
+
+        # Actions — View / Geometry
+        self.geo_lines_action: Optional[QAction] = None
+        self.geo_tubes_action: Optional[QAction] = None
+        self.geometry_action_group: Optional[QActionGroup] = None
+
+        # Actions — View / Coloring
+        self.color_default_action: Optional[QAction] = None
+        self.color_orientation_action: Optional[QAction] = None
+        self.color_scalar_action: Optional[QAction] = None
+        self.coloring_action_group: Optional[QActionGroup] = None
+
+        # Actions — Commands menu
+        self.calc_centroid_action: Optional[QAction] = None
+        self.calc_medoid_action: Optional[QAction] = None
+        self.compute_connectivity_action: Optional[QAction] = None
+        self.clear_select_action: Optional[QAction] = None
+        self.delete_select_action: Optional[QAction] = None
+        self.reset_camera_action: Optional[QAction] = None
+        self.increase_radius_action: Optional[QAction] = None
+        self.decrease_radius_action: Optional[QAction] = None
+        self.hide_sphere_action: Optional[QAction] = None
+
+        # Actions — Settings / Theme
+        self.theme_light_action: Optional[QAction] = None
+        self.theme_dark_action: Optional[QAction] = None
+        self.theme_system_action: Optional[QAction] = None
+        self.theme_action_group: Optional[QActionGroup] = None
+        self.auto_fill_action: Optional[QAction] = None
+
+        # Actions — Help / Data panel
+        self.about_action: Optional[QAction] = None
+        self.toggle_data_panel_action: Optional[QAction] = None
+
+        # Toolbar widgets
+        self.main_toolbar: Optional[QToolBar] = None
+        self.skip_checkbox: Optional[QCheckBox] = None
+        self.skip_spinbox: Optional[QSpinBox] = None
+        self.opacity_label: Optional[QLabel] = None
+        self.opacity_slider: Optional[QSlider] = None
+        self.brush_label: Optional[QLabel] = None
+        self.brush_size_label: Optional[QLabel] = None
+        self.brush_size_slider: Optional[QSlider] = None
+        self.draw_mode_button: Optional[QToolButton] = None
+        self.erase_mode_button: Optional[QToolButton] = None
+        self.sphere_mode_button: Optional[QToolButton] = None
+        self.rectangle_mode_button: Optional[QToolButton] = None
+        self.sphere_radius_container: Optional[QWidget] = None
+        self.sphere_radius_spinbox: Optional[QDoubleSpinBox] = None
+        self.scalar_reset_button: Optional[QAction] = None
+
+        # Status bar widgets
+        self.status_bar: Optional[QStatusBar] = None
+        self.ras_label: Optional[QLabel] = None
+        self.ras_coordinate_input: Optional[QLineEdit] = None
+
+        # Central widget / VTK panel
+        self.central_widget: Optional[QWidget] = None
+        self.vtk_panel: Optional[Any] = None  # VTKPanel (imported lazily)
 
         # Window Properties
         self.setWindowTitle("TractEdit GUI - Interactive Editor")
@@ -268,6 +393,7 @@ class MainWindow(QMainWindow):
         # Load persisted settings
         self._load_settings()
 
+    @pyqtSlot(int)
     def _on_brush_size_changed(self, value: int) -> None:
         """Updates the brush size when the slider value changes."""
         self.draw_brush_size = value
@@ -277,6 +403,7 @@ class MainWindow(QMainWindow):
                 f"Brush size set to {value} voxel{'s' if value > 1 else ''}"
             )
 
+    @pyqtSlot(float)
     def _on_sphere_radius_preview(self, value: float) -> None:
         """
         Shows a yellow circle preview when the radius spinbox value changes.
@@ -322,6 +449,7 @@ class MainWindow(QMainWindow):
             center_display, value, stored_view_type, scene
         )
 
+    @pyqtSlot()
     def _on_sphere_radius_changed(self) -> None:
         """
         Updates the sphere radius when editing is finished.
@@ -333,7 +461,7 @@ class MainWindow(QMainWindow):
             return
 
         # Get value from spinbox since editingFinished doesn't pass it
-        if not hasattr(self, "sphere_radius_spinbox"):
+        if self.sphere_radius_spinbox is None:
             return
         value = self.sphere_radius_spinbox.value()
 
@@ -361,8 +489,7 @@ class MainWindow(QMainWindow):
         stored_view_type = roi_params.get("view_type", "axial")
 
         # Save undo state
-        if hasattr(self, "_save_roi_state_for_undo"):
-            self._save_roi_state_for_undo(roi_name)
+        self._save_roi_state_for_undo(roi_name)
 
         # Get ROI layer data
         roi_layer = self.roi_layers[roi_name]
@@ -376,18 +503,11 @@ class MainWindow(QMainWindow):
 
         # Convert center from world to voxel coordinates
         center_world = center_3d.copy()
-        # Undo radiological X-flip: stored center was flipped for 3D display
         if stored_view_type in ["axial", "coronal"]:
             center_world[0] = -center_world[0]
 
         p_h = np.append(center_world, 1.0)
         center_vox = np.dot(roi_inv_affine, p_h)[:3]
-
-        # Compensate for radiological display X-flip when rasterizing to voxel space
-        if stored_view_type in ["axial", "coronal"]:
-            center_vox[0] = (shape[0] - 1) - center_vox[0]
-        elif stored_view_type == "sagittal":
-            center_vox[0] = (shape[0] - 1) - center_vox[0] - 1
 
         # Calculate radius in voxels (approximate using affine scaling)
         voxel_sizes = np.abs(np.diag(roi_affine)[:3])
@@ -426,26 +546,22 @@ class MainWindow(QMainWindow):
             if old_sphere:
                 try:
                     self.vtk_panel.scene.rm(old_sphere)
-                except Exception:
-                    pass
+                except (ValueError, RuntimeError):
+                    logger.debug("Failed to remove old sphere actor from scene.")
                 self.vtk_panel.roi_slice_actors[roi_name]["sphere_3d"] = None
 
         # Remove yellow circle preview
         if self.vtk_panel.preview_line_actor:
-            try:
-                # Try removing from all 2D scenes
-                for scene in [
-                    self.vtk_panel.axial_scene,
-                    self.vtk_panel.coronal_scene,
-                    self.vtk_panel.sagittal_scene,
-                ]:
-                    if scene:
-                        try:
-                            scene.rm(self.vtk_panel.preview_line_actor)
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+            for scene in [
+                self.vtk_panel.axial_scene,
+                self.vtk_panel.coronal_scene,
+                self.vtk_panel.sagittal_scene,
+            ]:
+                if scene:
+                    try:
+                        scene.rm(self.vtk_panel.preview_line_actor)
+                    except (ValueError, RuntimeError):
+                        logger.debug("Failed to remove preview actor from scene.")
             self.vtk_panel.preview_line_actor = None
 
         # Refresh ROI visualization (2D slices and 3D)
@@ -457,18 +573,23 @@ class MainWindow(QMainWindow):
         self.vtk_panel.update_status(f"Sphere radius set to {value:.1f} mm")
         self.vtk_panel._render_all()
 
+    @pyqtSlot(bool)
     def _on_skip_toggled(self, checked: bool) -> None:
         """Enables/Disables the skip feature and resets view if turned off."""
         self.skip_spinbox.setEnabled(checked)
 
         if checked:
+            # User re-enabled skip — clear the override so auto-calc works
+            self._skip_user_disabled = False
             self._on_skip_changed()
         else:
-            # If disabled, force reset to 0% skip (Show All)
+            # User explicitly disabled skip — remember the override
+            self._skip_user_disabled = True
             self.render_stride = 1
             if self.vtk_panel:
                 self.vtk_panel.update_main_streamlines_actor()
 
+    @pyqtSlot()
     def _on_skip_changed(self) -> None:
         """Calculates stride from skip percentage and updates VTK."""
         # Safety: Do not update if the feature is toggled off
@@ -486,60 +607,65 @@ class MainWindow(QMainWindow):
 
     def _auto_calculate_skip_level(self) -> None:
         """
-        Automatically sets the skip percentage based on the number of streamlines.
+        Automatically sets the skip percentage based on visible streamlines.
         Target: Render approximately 20,000 streamlines for optimal performance.
+        Uses visible_indices count so the stride adapts after deletions,
+        undo/redo, and ROI filter changes.
+
+        Respects user override: if the user explicitly unchecked the skip
+        checkbox, auto-calculation will not re-enable it until new data
+        is loaded or the user manually re-enables skip.
         """
         if not self.tractogram_data:
             return
 
-        total_fibers = len(self.tractogram_data)
-        TARGET_RENDER_COUNT = 20000  # Target render
+        # Respect user's explicit decision to disable skip
+        if self._skip_user_disabled:
+            return
+
+        visible_count = len(self.visible_indices)
 
         # Block signals to prevent VTK updates while adjusting widgets
-        self.skip_checkbox.blockSignals(True)
-        self.skip_spinbox.blockSignals(True)
+        with signals_blocked(self.skip_checkbox, self.skip_spinbox):
+            if visible_count > TARGET_RENDER_COUNT:
+                # Calculate how many we want to KEEP (ratio)
+                keep_ratio = TARGET_RENDER_COUNT / visible_count
 
-        if total_fibers > TARGET_RENDER_COUNT:
-            # Calculate how many we want to KEEP (ratio)
-            keep_ratio = TARGET_RENDER_COUNT / total_fibers
+                # Convert to percentage to SKIP
+                # Example: 100k fibers. Target 20k. Keep 0.2. Skip 0.8 (80%)
+                skip_percent = int((1.0 - keep_ratio) * 100)
 
-            # Convert to percentage to SKIP
-            # Example: 100k fibers. Target 20k. Keep 0.2. Skip 0.8 (80%)
-            skip_percent = int((1.0 - keep_ratio) * 100)
+                # Clamp between 0 and 99
+                skip_percent = max(0, min(99, skip_percent))
 
-            # Clamp between 0 and 99
-            skip_percent = max(0, min(99, skip_percent))
+                self.skip_checkbox.setChecked(True)
+                self.skip_spinbox.setEnabled(True)
+                self.skip_spinbox.setValue(skip_percent)
 
-            self.skip_checkbox.setChecked(True)
-            self.skip_spinbox.setEnabled(True)
-            self.skip_spinbox.setValue(skip_percent)
+                # Update internal stride variable manually
+                self.render_stride = max(1, int(100 / (100 - skip_percent)))
 
-            # Update internal stride variable manually
-            self.render_stride = max(1, int(100 / (100 - skip_percent)))
-
-            if self.vtk_panel:
-                self.vtk_panel.update_status(
-                    f"Auto-Skip: {skip_percent}% skipped for performance."
-                )
-        else:
-            # Bundle is small enough, show all
-            self.skip_checkbox.setChecked(False)
-            self.skip_spinbox.setEnabled(False)
-            self.skip_spinbox.setValue(0)
-            self.render_stride = 1
-
-        # Unblock signals
-        self.skip_checkbox.blockSignals(False)
-        self.skip_spinbox.blockSignals(False)
+                if self.vtk_panel:
+                    self.vtk_panel.update_status(
+                        f"Auto-Skip: {skip_percent}% skipped for performance."
+                    )
+            else:
+                # Bundle is small enough, show all
+                self.skip_checkbox.setChecked(False)
+                self.skip_spinbox.setEnabled(False)
+                self.skip_spinbox.setValue(0)
+                self.render_stride = 1
 
         # Trigger Visual Update
         if self.vtk_panel:
             self.vtk_panel.update_main_streamlines_actor()
 
+    @pyqtSlot()
     def _on_data_item_selected(self) -> None:
         """Updates opacity slider. Delegates to DataPanelManager."""
         self.data_panel_manager.on_data_item_selected()
 
+    @pyqtSlot(int)
     def _on_opacity_slider_changed(self, value: int) -> None:
         """Updates opacity. Delegates to DataPanelManager."""
         self.data_panel_manager.on_opacity_slider_changed(value)
@@ -553,10 +679,12 @@ class MainWindow(QMainWindow):
         """Updates action states. Delegates to ActionsManager."""
         self.actions_manager.update_action_states()
 
+    @pyqtSlot()
     def _trigger_calculate_centroid(self) -> None:
         """Wrapper to calculate and save centroid."""
         file_io.calculate_and_save_statistic(self, "centroid")
 
+    @pyqtSlot()
     def _trigger_calculate_medoid(self) -> None:
         """Wrapper to calculate and save medoid."""
         file_io.calculate_and_save_statistic(self, "medoid")
@@ -574,22 +702,27 @@ class MainWindow(QMainWindow):
             )
             self.vtk_panel.update_main_streamlines_actor()
 
+    @pyqtSlot()
     def _trigger_new_roi(self) -> None:
         """Creates a new ROI. Delegates to DrawingModesManager."""
         self.drawing_modes_manager.trigger_new_roi()
 
+    @pyqtSlot(bool)
     def _toggle_draw_mode(self, checked: bool) -> None:
         """Toggles draw mode. Delegates to DrawingModesManager."""
         self.drawing_modes_manager.toggle_draw_mode(checked)
 
+    @pyqtSlot(bool)
     def _toggle_erase_mode(self, checked: bool) -> None:
         """Toggles erase mode. Delegates to DrawingModesManager."""
         self.drawing_modes_manager.toggle_erase_mode(checked)
 
+    @pyqtSlot(bool)
     def _toggle_sphere_mode(self, checked: bool) -> None:
         """Toggles sphere mode. Delegates to DrawingModesManager."""
         self.drawing_modes_manager.toggle_sphere_mode(checked)
 
+    @pyqtSlot(bool)
     def _toggle_rectangle_mode(self, checked: bool) -> None:
         """Toggles rectangle mode. Delegates to DrawingModesManager."""
         self.drawing_modes_manager.toggle_rectangle_mode(checked)
@@ -598,6 +731,7 @@ class MainWindow(QMainWindow):
         """Resets all drawing modes. Delegates to DrawingModesManager."""
         self.drawing_modes_manager.reset_all_drawing_modes()
 
+    @pyqtSlot()
     def _trigger_load_odf(self) -> None:
         """Loads a NIfTI file as ODF coefficients."""
         file_path, _ = QFileDialog.getOpenFileName(
@@ -644,24 +778,36 @@ class MainWindow(QMainWindow):
                 self.odf_sphere.vertices, sh_order, basis_type="tournier07"
             )
 
+            # Lower-resolution sphere for lightweight tunnel rendering
+            # (subdivisions=2 → 162 vertices vs 642, ~4x fewer polygons)
+            self.odf_tunnel_sphere = odf_utils.generate_symmetric_sphere(
+                radius=1.0, subdivisions=2
+            )
+            self.odf_tunnel_basis = odf_utils.compute_sh_basis(
+                self.odf_tunnel_sphere.vertices, sh_order, basis_type="tournier07"
+            )
+
             self.vtk_panel.update_status(
                 f"ODF Loaded (Order {sh_order}). Ready for Tunnel View."
             )
             self._update_action_states()
             self._update_data_panel_display()
 
-        except Exception as e:
+        except (OSError, ValueError, TypeError) as e:
             logger.error(f"Error loading ODF: {e}", exc_info=True)
             QMessageBox.critical(self, "Load Error", f"Could not load ODF file:\n{e}")
 
+    @pyqtSlot()
     def _trigger_load_parcellation(self) -> None:
         """Loads a FreeSurfer parcellation file. Delegates to ConnectivityManager."""
         self.connectivity_manager.load_parcellation()
 
+    @pyqtSlot()
     def _trigger_compute_connectivity(self) -> None:
         """Computes and exports connectivity matrix. Delegates to ConnectivityManager."""
         self.connectivity_manager.compute_and_export()
 
+    @pyqtSlot(bool)
     def _toggle_parcellation_overlay(self, checked: bool) -> None:
         """Toggles the visibility of the 3D parcellation overlay."""
         if not checked:
@@ -672,10 +818,7 @@ class MainWindow(QMainWindow):
 
         # Show the overlay (just visibility, no creation/computation)
         # If actors exist, show them; otherwise do nothing
-        if (
-            hasattr(self, "parcellation_region_actors")
-            and self.parcellation_region_actors
-        ):
+        if self.parcellation_region_actors:
             self.connectivity_manager._show_parcellation_actors()
             self._sync_parcellation_toggle_state(True)
         else:
@@ -689,48 +832,45 @@ class MainWindow(QMainWindow):
     def _sync_parcellation_toggle_state(self, checked: bool) -> None:
         """Syncs the parcellation toggle state between menu and data panel."""
         # Update menu action
-        if hasattr(self, "view_parcellation_action"):
-            self.view_parcellation_action.blockSignals(True)
-            self.view_parcellation_action.setChecked(checked)
-            self.view_parcellation_action.blockSignals(False)
+        if self.view_parcellation_action is not None:
+            with signals_blocked(self.view_parcellation_action):
+                self.view_parcellation_action.setChecked(checked)
 
-        # Update data panel checkbox (parcellation is now nested under header)
+        # Update data panel checkbox (parcellation is now nested under header) - ##TODO - to refactor 
         if self.data_tree_widget:
-            self.data_tree_widget.blockSignals(True)
-            # Search through top-level headers and their children
-            for i in range(self.data_tree_widget.topLevelItemCount()):
-                header = self.data_tree_widget.topLevelItem(i)
-                # Check if this is the FreeSurfer Parcellation header
-                if header.text(0) == "FreeSurfer Parcellation":
-                    # Look for the actual file item (first child with parcellation type)
-                    for j in range(header.childCount()):
-                        child = header.child(j)
-                        item_data = child.data(0, Qt.ItemDataRole.UserRole)
-                        if (
-                            item_data
-                            and isinstance(item_data, dict)
-                            and item_data.get("type") == "parcellation"
-                        ):
-                            child.setCheckState(
-                                0,
-                                (
-                                    Qt.CheckState.Checked
-                                    if checked
-                                    else Qt.CheckState.Unchecked
-                                ),
+            with signals_blocked(self.data_tree_widget):
+                # Search through top-level headers and their children
+                for i in range(self.data_tree_widget.topLevelItemCount()):
+                    header = self.data_tree_widget.topLevelItem(i)
+                    # Check if this is the FreeSurfer Parcellation header
+                    if header.text(0) == "FreeSurfer Parcellation":
+                        # Look for the actual file item
+                        for j in range(header.childCount()):
+                            child = header.child(j)
+                            item_data = child.data(
+                                0, Qt.ItemDataRole.UserRole
                             )
-                            break
-                    break
-            self.data_tree_widget.blockSignals(False)
+                            if (
+                                item_data
+                                and isinstance(item_data, dict)
+                                and item_data.get("type") == "parcellation"
+                            ):
+                                child.setCheckState(
+                                    0,
+                                    (
+                                        Qt.CheckState.Checked
+                                        if checked
+                                        else Qt.CheckState.Unchecked
+                                    ),
+                                )
+                                break
+                        break
 
     def _toggle_parcellation_region(
         self, label: int, visible: bool, batch_mode: bool = False
     ) -> None:
         """Toggles visibility of an individual parcellation region."""
         # Update visibility state
-        if not hasattr(self, "parcellation_region_visibility"):
-            self.parcellation_region_visibility = {}
-
         self.parcellation_region_visibility[label] = visible
 
         # Delegate to connectivity manager
@@ -762,8 +902,7 @@ class MainWindow(QMainWindow):
     def _clear_parcellation(self) -> None:
         """Clears all parcellation data and overlay."""
         # Remove overlay from scene
-        if hasattr(self, "connectivity_manager"):
-            self.connectivity_manager.remove_parcellation_overlay()
+        self.connectivity_manager.remove_parcellation_overlay()
 
         # Clear parcellation data
         self.parcellation_data = None
@@ -783,13 +922,14 @@ class MainWindow(QMainWindow):
         self.parcellation_visible_indices = None
 
         # Update menu action state
-        if hasattr(self, "view_parcellation_action"):
+        if self.view_parcellation_action is not None:
             self.view_parcellation_action.setChecked(False)
 
         # Update UI
         self._update_action_states()
         self._update_data_panel_display()
 
+    @pyqtSlot(bool)
     def _toggle_odf_tunnel(self, checked: bool) -> None:
         """Computes the mask and updates the VTK actor with progress indication."""
         if not checked:
@@ -852,9 +992,11 @@ class MainWindow(QMainWindow):
             self.vtk_panel.update_progress_bar(2, TOTAL_STEPS, visible=True)
             QApplication.processEvents()
 
-            # Project to Amplitudes (SF)
+            # Project to Amplitudes (SF) using lightweight tunnel sphere
+            tunnel_sphere = self.odf_tunnel_sphere
+            tunnel_basis = self.odf_tunnel_basis
             amplitudes_shape = self.odf_data.shape[:3] + (
-                self.odf_sphere.vertices.shape[0],
+                tunnel_sphere.vertices.shape[0],
             )
             odf_amplitudes = np.zeros(amplitudes_shape, dtype=np.float32)
 
@@ -865,7 +1007,7 @@ class MainWindow(QMainWindow):
 
             if len(mask_indices[0]) > 0:
                 valid_coeffs = masked_coeffs[mask_indices]
-                valid_amps = np.dot(valid_coeffs, self.odf_basis_matrix.T)
+                valid_amps = np.dot(valid_coeffs, tunnel_basis.T)
                 odf_amplitudes[mask_indices] = valid_amps
 
                 # Determine min/max for x, y, z to constrain the actor
@@ -881,7 +1023,7 @@ class MainWindow(QMainWindow):
 
             # Update VTK with Extent
             self.vtk_panel.update_odf_actor(
-                odf_amplitudes, self.odf_sphere, self.odf_affine, extent=extent
+                odf_amplitudes, tunnel_sphere, self.odf_affine, extent=extent
             )
 
             # Update Progress -> 100% and Hide
@@ -892,7 +1034,7 @@ class MainWindow(QMainWindow):
             self.odf_tunnel_is_visible = True
             self._update_data_panel_display()
 
-        except Exception as e:
+        except (RuntimeError, ValueError, IndexError, TypeError) as e:
             logger.error(f"Error computing Tunnel View: {e}", exc_info=True)
             self.vtk_panel.update_status("Error generating Tunnel View.")
             self.view_odf_tunnel_action.setChecked(False)
@@ -915,9 +1057,8 @@ class MainWindow(QMainWindow):
             self.odf_tunnel_is_visible = visible
 
             # Sync the menu action state
-            self.view_odf_tunnel_action.blockSignals(True)
-            self.view_odf_tunnel_action.setChecked(visible)
-            self.view_odf_tunnel_action.blockSignals(False)
+            with signals_blocked(self.view_odf_tunnel_action):
+                self.view_odf_tunnel_action.setChecked(visible)
 
             if self.vtk_panel.render_window:
                 self.vtk_panel.render_window.Render()
@@ -925,9 +1066,10 @@ class MainWindow(QMainWindow):
             status = "shown" if visible else "hidden"
             self.vtk_panel.update_status(f"ODF Tunnel {status}")
 
-        except Exception as e:
+        except (ValueError, RuntimeError) as e:
             logger.error(f"Error toggling ODF tunnel visibility: {e}", exc_info=True)
 
+    @pyqtSlot()
     def _remove_odf_data(self) -> None:
         """
         Removes the ODF data and tunnel actor from the scene.
@@ -946,13 +1088,14 @@ class MainWindow(QMainWindow):
             self.odf_sh_order = 0
             self.odf_sphere = None
             self.odf_basis_matrix = None
+            self.odf_tunnel_sphere = None
+            self.odf_tunnel_basis = None
             self.odf_tunnel_is_visible = False
 
             # Update the menu action state
-            self.view_odf_tunnel_action.blockSignals(True)
-            self.view_odf_tunnel_action.setChecked(False)
-            self.view_odf_tunnel_action.setEnabled(False)
-            self.view_odf_tunnel_action.blockSignals(False)
+            with signals_blocked(self.view_odf_tunnel_action):
+                self.view_odf_tunnel_action.setChecked(False)
+                self.view_odf_tunnel_action.setEnabled(False)
 
             # Update the data panel
             self._update_data_panel_display()
@@ -961,7 +1104,7 @@ class MainWindow(QMainWindow):
             if self.vtk_panel:
                 self.vtk_panel.update_status("ODF data removed")
 
-        except Exception as e:
+        except (ValueError, RuntimeError, AttributeError) as e:
             logger.error(f"Error removing ODF data: {e}", exc_info=True)
 
     def _update_bundle_info_display(self) -> None:
@@ -1071,12 +1214,14 @@ class MainWindow(QMainWindow):
         self._data_panel_update_pending = True
         self._data_panel_debounce_timer.start(100)  # 100ms debounce delay
 
+    @pyqtSlot()
     def _perform_data_panel_update(self) -> None:
         """
         Performs the actual data panel update (debounced).
 
         This is called by the debounce timer after the delay expires.
         Blocks signals during rebuild to prevent cascading itemChanged events.
+        Delegates tree construction to focused sub-methods for maintainability.
         """
         if not self._data_panel_update_pending:
             return
@@ -1088,387 +1233,380 @@ class MainWindow(QMainWindow):
 
         # Block signals during rebuild to prevent cascading callbacks
         self.data_tree_widget.blockSignals(True)
-
-        # Save expansion state before clearing
-        expanded_items = set()
-        for i in range(self.data_tree_widget.topLevelItemCount()):
-            item = self.data_tree_widget.topLevelItem(i)
-            self._collect_expanded_items(item, "", expanded_items)
-
-        self.data_tree_widget.clear()
-
-        # Store expanded_items for restoration after building tree
-        self._pending_expanded_items = expanded_items
-
-        # ===== TRACTOGRAM SECTION =====
-        if self.tractogram_data is not None:
-            tractogram_header = QTreeWidgetItem(self.data_tree_widget, ["Tractogram"])
-            tractogram_header.setIcon(
-                0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
-            )
-
-            bundle_name = (
-                os.path.basename(self.original_trk_path)
-                if self.original_trk_path
-                else "Loaded Bundle"
-            )
-
-            bundle_item = QTreeWidgetItem(tractogram_header, [bundle_name])
-            bundle_item.setFlags(bundle_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            bundle_state = (
-                Qt.CheckState.Checked
-                if self.bundle_is_visible
-                else Qt.CheckState.Unchecked
-            )
-            bundle_item.setCheckState(0, bundle_state)
-            bundle_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "bundle"})
-
-            count = len(self.visible_indices)
-            ext = (
-                self.original_file_extension.upper()
-                if self.original_file_extension
-                else "TRK"
-            )
-            dims = "N/A"
-            if self.original_trk_header and "dimensions" in self.original_trk_header:
-                dims = format_tuple(self.original_trk_header["dimensions"], precision=0)
-
-            tooltip_text = f"Type: {ext}\nCount: {count}\nDimensions: {dims}"
-            bundle_item.setToolTip(0, tooltip_text)
-
-            if self.scalar_data_per_point:
-                scalars_root = QTreeWidgetItem(bundle_item, ["Scalars"])
-                scalars_root.setIcon(
-                    0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
-                )
-                for scalar_name in self.scalar_data_per_point.keys():
-                    scalar_item = QTreeWidgetItem(scalars_root, [scalar_name])
-                    if scalar_name == self.active_scalar_name:
-                        font = scalar_item.font(0)
-                        font.setBold(True)
-                        scalar_item.setFont(0, font)
-
-            bundle_item.setExpanded(True)
-            tractogram_header.setExpanded(True)
-
-        # ===== ANATOMICAL IMAGE SECTION =====
-        if self.anatomical_image_data is not None:
-            image_header = QTreeWidgetItem(self.data_tree_widget, ["Anatomical Image"])
-            image_header.setIcon(
-                0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
-            )
-
-            image_name = (
-                os.path.basename(self.anatomical_image_path)
-                if self.anatomical_image_path
-                else "Loaded Image"
-            )
-
-            image_item = QTreeWidgetItem(image_header, [image_name])
-            image_item.setFlags(image_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            image_state = (
-                Qt.CheckState.Checked
-                if self.image_is_visible
-                else Qt.CheckState.Unchecked
-            )
-            image_item.setCheckState(0, image_state)
-            image_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "image"})
-            shape_str = format_tuple(self.anatomical_image_data.shape, precision=0)
-            image_item.setToolTip(
-                0, f"Path: {self.anatomical_image_path}\nShape: {shape_str}"
-            )
-            image_header.setExpanded(True)
-
-        # ===== ROI LAYERS SECTION =====
-        if self.roi_layers:
-            roi_root_item = QTreeWidgetItem(self.data_tree_widget, ["ROI Layers"])
-            roi_root_item.setIcon(
-                0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
-            )
-
-            for path, roi_info in self.roi_layers.items():
-                # Use display_name if available (set by rename), otherwise path basename
-                roi_name = roi_info.get("display_name", os.path.basename(path))
-
-                state_str = ""
-                if path in self.roi_states:
-                    if self.roi_states[path].get("select"):
-                        state_str = " [SELECT]"
-                    elif self.roi_states[path].get("include"):
-                        state_str = " [INCLUDE]"
-                    elif self.roi_states[path].get("exclude"):
-                        state_str = " [EXCLUDE]"
-
-                display_text = f"{roi_name}{state_str}"
-                roi_item = QTreeWidgetItem(roi_root_item, [display_text])
-
-                # Color Indicator
-                roi_color = roi_info.get("color", (1.0, 0.0, 0.0))  # Default Red
-                pixmap = QPixmap(16, 16)
-                pixmap.fill(Qt.GlobalColor.transparent)
-                painter = QPainter(pixmap)
-                painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-                # Convert float (0-1) to int (0-255)
-                c_r = int(roi_color[0] * 255)
-                c_g = int(roi_color[1] * 255)
-                c_b = int(roi_color[2] * 255)
-                color = QColor(c_r, c_g, c_b)
-
-                painter.setBrush(QBrush(color))
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.drawEllipse(2, 2, 12, 12)
-                painter.end()
-
-                roi_item.setIcon(0, QIcon(pixmap))
-
-                roi_item.setFlags(roi_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                is_visible = self.roi_visibility.get(path, True)
-                roi_state = (
-                    Qt.CheckState.Checked if is_visible else Qt.CheckState.Unchecked
-                )
-                roi_item.setCheckState(0, roi_state)
-                roi_item.setData(
-                    0, Qt.ItemDataRole.UserRole, {"type": "roi", "path": path}
-                )
-
-                shape_str = format_tuple(roi_info["data"].shape, precision=0)
-                roi_item.setToolTip(0, f"Path: {path}\nShape: {shape_str}")
-
-            roi_root_item.setExpanded(True)
-
-        # ===== ODF TUNNEL SECTION =====
-        if self.odf_data is not None:
-            odf_header = QTreeWidgetItem(self.data_tree_widget, ["ODF Data"])
-            odf_header.setIcon(
-                0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
-            )
-
-            odf_name = (
-                os.path.basename(self.odf_path) if self.odf_path else "Loaded ODF"
-            )
-
-            # Main ODF file item (not checkable, just informational)
-            odf_file_item = QTreeWidgetItem(odf_header, [odf_name])
-            odf_file_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "odf_data"})
-            shape_str = format_tuple(self.odf_data.shape, precision=0)
-            odf_file_item.setToolTip(
-                0,
-                f"Path: {self.odf_path}\n"
-                f"Shape: {shape_str}\n"
-                f"SH Order: {self.odf_sh_order}",
-            )
-
-            # ODF Tunnel View item (checkable for visibility toggle)
-            # Only show if tunnel has been computed (actor exists)
-            if self.vtk_panel and self.vtk_panel.odf_actor is not None:
-                tunnel_item = QTreeWidgetItem(odf_header, ["ODF Tunnel View"])
-                tunnel_item.setFlags(
-                    tunnel_item.flags() | Qt.ItemFlag.ItemIsUserCheckable
-                )
-                tunnel_state = (
-                    Qt.CheckState.Checked
-                    if self.odf_tunnel_is_visible
-                    else Qt.CheckState.Unchecked
-                )
-                tunnel_item.setCheckState(0, tunnel_state)
-                tunnel_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "odf_tunnel"})
-                tunnel_item.setToolTip(
-                    0,
-                    "Toggle visibility of the ODF Tunnel View.\n"
-                    "Right-click to remove.",
-                )
-
-            odf_header.setExpanded(True)
-
-        # ===== FREESURFER PARCELLATION SECTION =====
-        if self.parcellation_data is not None:
-            parcellation_header = QTreeWidgetItem(
-                self.data_tree_widget, ["FreeSurfer Parcellation"]
-            )
-            parcellation_header.setIcon(
-                0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
-            )
-
-            parc_name = (
-                os.path.basename(self.parcellation_path)
-                if self.parcellation_path
-                else "Loaded Parcellation"
-            )
-
-            parc_item = QTreeWidgetItem(parcellation_header, [parc_name])
-            parc_item.setFlags(parc_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-
-            # Get parcellation visibility state
-            parc_visible = getattr(self, "_parcellation_overlay_visible", False)
-            parc_state = (
-                Qt.CheckState.Checked if parc_visible else Qt.CheckState.Unchecked
-            )
-            parc_item.setCheckState(0, parc_state)
-            parc_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "parcellation"})
-
-            # Get shape info
-            shape_str = format_tuple(self.parcellation_data.shape, precision=0)
-            n_labels = len(np.unique(self.parcellation_data)) - 1  # Exclude 0
-            parc_item.setToolTip(
-                0,
-                f"Path: {self.parcellation_path}\nShape: {shape_str}\nTotal Labels: {n_labels}",
-            )
-
-            # Connected Regions submenu - organized by hemisphere
-            connected_labels = getattr(self, "parcellation_connected_labels", set())
-            if connected_labels:
-                connected_item = QTreeWidgetItem(
-                    parc_item, [f"Connected Regions ({len(connected_labels)})"]
-                )
-                connected_item.setIcon(
-                    0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
-                )
-
-                # Initialize region visibility dict if not exists
-                if not hasattr(self, "parcellation_region_visibility"):
-                    self.parcellation_region_visibility = {}
-
-                # Get set of labels with pre-created actors (main labels)
-                main_labels = getattr(self, "parcellation_main_labels", set())
-
-                # Classify regions by hemisphere
-                left_regions = []
-                right_regions = []
-                other_regions = []
-
-                for label in connected_labels:
-                    label_name = self.parcellation_labels.get(
-                        int(label), f"Region_{label}"
-                    )
-                    hemisphere = self._classify_region_hemisphere(label_name)
-                    if hemisphere == "left":
-                        left_regions.append((label, label_name))
-                    elif hemisphere == "right":
-                        right_regions.append((label, label_name))
-                    else:
-                        other_regions.append((label, label_name))
-
-                # Sort each list by label name
-                left_regions.sort(key=lambda x: x[1].lower())
-                right_regions.sort(key=lambda x: x[1].lower())
-                other_regions.sort(key=lambda x: x[1].lower())
-
-                # Helper function to add region items to a parent
-                def add_region_items(parent_item, regions, limit=100):
-                    # Get region filter states
-                    parc_states = getattr(self, "parcellation_region_states", {})
-
-                    for i, (label, label_name) in enumerate(regions[:limit]):
-                        # Build display name with filter mode tag
-                        display_name = label_name
-                        state = parc_states.get(int(label), {})
-                        if state.get("include"):
-                            display_name = f"{label_name} [INC]"
-                        elif state.get("exclude"):
-                            display_name = f"{label_name} [EXC]"
-
-                        region_item = QTreeWidgetItem(parent_item, [display_name])
-
-                        # Add checkbox for region visibility
-                        region_item.setFlags(
-                            region_item.flags() | Qt.ItemFlag.ItemIsUserCheckable
-                        )
-
-                        # Main labels (with actors) default to visible
-                        # Other connected labels default to not visible
-                        has_actor = int(label) in main_labels
-                        default_visible = has_actor
-
-                        # Get stored visibility state, or use default
-                        region_visible = self.parcellation_region_visibility.get(
-                            int(label), default_visible
-                        )
-                        region_state = (
-                            Qt.CheckState.Checked
-                            if region_visible
-                            else Qt.CheckState.Unchecked
-                        )
-                        region_item.setCheckState(0, region_state)
-
-                        region_item.setData(
-                            0,
-                            Qt.ItemDataRole.UserRole,
-                            {"type": "parcellation_region", "label": int(label)},
-                        )
-
-                        # Show tooltip with additional info
-                        actor_status = (
-                            "Active (has actor)" if has_actor else "On-demand"
-                        )
-                        region_item.setToolTip(
-                            0,
-                            f"Label ID: {label}\nStatus: {actor_status}\nToggle to show/hide",
-                        )
-
-                    # Show ellipsis if truncated
-                    if len(regions) > limit:
-                        more_item = QTreeWidgetItem(
-                            parent_item,
-                            [f"... and {len(regions) - limit} more regions"],
-                        )
-                        more_item.setDisabled(True)
-
-                # Create Left Hemisphere folder if has items
-                if left_regions:
-                    left_folder = QTreeWidgetItem(
-                        connected_item, [f"Left Hemisphere ({len(left_regions)})"]
-                    )
-                    left_folder.setIcon(
-                        0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
-                    )
-                    add_region_items(left_folder, left_regions)
-                    left_folder.setExpanded(False)
-
-                # Create Right Hemisphere folder if has items
-                if right_regions:
-                    right_folder = QTreeWidgetItem(
-                        connected_item, [f"Right Hemisphere ({len(right_regions)})"]
-                    )
-                    right_folder.setIcon(
-                        0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
-                    )
-                    add_region_items(right_folder, right_regions)
-                    right_folder.setExpanded(False)
-
-                # Create Bilateral/Other folder if has items
-                if other_regions:
-                    other_folder = QTreeWidgetItem(
-                        connected_item, [f"Bilateral/Other ({len(other_regions)})"]
-                    )
-                    other_folder.setIcon(
-                        0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
-                    )
-                    add_region_items(other_folder, other_regions)
-                    other_folder.setExpanded(False)
-
-                connected_item.setExpanded(False)  # Keep collapsed by default
-
-            parc_item.setExpanded(True)
-            parcellation_header.setExpanded(True)
-
-        self.data_tree_widget.resizeColumnToContents(0)
-
-        # Restore expansion state
-        if hasattr(self, "_pending_expanded_items") and self._pending_expanded_items:
+        try:
+            # Save expansion state before clearing
+            expanded_items = set()
             for i in range(self.data_tree_widget.topLevelItemCount()):
                 item = self.data_tree_widget.topLevelItem(i)
-                self._restore_expanded_items(item, "", self._pending_expanded_items)
-            self._pending_expanded_items = set()
+                self._collect_expanded_items(item, "", expanded_items)
 
-        # Unblock signals now that rebuild is complete
-        self.data_tree_widget.blockSignals(False)
+            self.data_tree_widget.clear()
+            self._pending_expanded_items = expanded_items
+
+            # Build each section of the data panel tree
+            self._build_tractogram_tree_item()
+            self._build_image_tree_item()
+            self._build_roi_tree_items()
+            self._build_odf_tree_item()
+            self._build_parcellation_tree_item()
+
+            self.data_tree_widget.resizeColumnToContents(0)
+
+            # Restore expansion state
+            if self._pending_expanded_items:
+                for i in range(self.data_tree_widget.topLevelItemCount()):
+                    item = self.data_tree_widget.topLevelItem(i)
+                    self._restore_expanded_items(
+                        item, "", self._pending_expanded_items
+                    )
+                self._pending_expanded_items = set()
+        finally:
+            self.data_tree_widget.blockSignals(False)
 
         # Force visual update to ensure checkbox states are immediately reflected
-        # This fixes the issue where checkboxes appear unchecked after data load
-        # even though the visibility flags are True
         if self.data_tree_widget.viewport():
             self.data_tree_widget.viewport().update()
+
+    def _build_tractogram_tree_item(self) -> None:
+        """Builds the Tractogram section of the data panel tree."""
+        if self.tractogram_data is None:
+            return
+
+        tractogram_header = QTreeWidgetItem(self.data_tree_widget, ["Tractogram"])
+        tractogram_header.setIcon(
+            0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
+        )
+
+        bundle_name = (
+            os.path.basename(self.original_trk_path)
+            if self.original_trk_path
+            else "Loaded Bundle"
+        )
+
+        bundle_item = QTreeWidgetItem(tractogram_header, [bundle_name])
+        bundle_item.setFlags(bundle_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        bundle_state = (
+            Qt.CheckState.Checked
+            if self.bundle_is_visible
+            else Qt.CheckState.Unchecked
+        )
+        bundle_item.setCheckState(0, bundle_state)
+        bundle_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "bundle"})
+
+        count = len(self.visible_indices)
+        ext = (
+            self.original_file_extension.upper()
+            if self.original_file_extension
+            else "TRK"
+        )
+        dims = "N/A"
+        if self.original_trk_header and "dimensions" in self.original_trk_header:
+            dims = format_tuple(self.original_trk_header["dimensions"], precision=0)
+
+        tooltip_text = f"Type: {ext}\nCount: {count}\nDimensions: {dims}"
+        bundle_item.setToolTip(0, tooltip_text)
+
+        if self.scalar_data_per_point:
+            scalars_root = QTreeWidgetItem(bundle_item, ["Scalars"])
+            scalars_root.setIcon(
+                0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
+            )
+            for scalar_name in self.scalar_data_per_point.keys():
+                scalar_item = QTreeWidgetItem(scalars_root, [scalar_name])
+                if scalar_name == self.active_scalar_name:
+                    font = scalar_item.font(0)
+                    font.setBold(True)
+                    scalar_item.setFont(0, font)
+
+        bundle_item.setExpanded(True)
+        tractogram_header.setExpanded(True)
+
+    def _build_image_tree_item(self) -> None:
+        """Builds the Anatomical Image section of the data panel tree."""
+        if self.anatomical_image_data is None:
+            return
+
+        image_header = QTreeWidgetItem(self.data_tree_widget, ["Anatomical Image"])
+        image_header.setIcon(
+            0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
+        )
+
+        image_name = (
+            os.path.basename(self.anatomical_image_path)
+            if self.anatomical_image_path
+            else "Loaded Image"
+        )
+
+        image_item = QTreeWidgetItem(image_header, [image_name])
+        image_item.setFlags(image_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        image_state = (
+            Qt.CheckState.Checked
+            if self.image_is_visible
+            else Qt.CheckState.Unchecked
+        )
+        image_item.setCheckState(0, image_state)
+        image_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "image"})
+        shape_str = format_tuple(self.anatomical_image_data.shape, precision=0)
+        image_item.setToolTip(
+            0, f"Path: {self.anatomical_image_path}\nShape: {shape_str}"
+        )
+        image_header.setExpanded(True)
+
+    def _build_roi_tree_items(self) -> None:
+        """Builds the ROI Layers section of the data panel tree."""
+        if not self.roi_layers:
+            return
+
+        roi_root_item = QTreeWidgetItem(self.data_tree_widget, ["ROI Layers"])
+        roi_root_item.setIcon(
+            0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
+        )
+
+        for path, roi_info in self.roi_layers.items():
+            roi_name = roi_info.get("display_name", os.path.basename(path))
+
+            state_str = ""
+            if path in self.roi_states:
+                if self.roi_states[path].get("select"):
+                    state_str = " [SELECT]"
+                elif self.roi_states[path].get("include"):
+                    state_str = " [INCLUDE]"
+                elif self.roi_states[path].get("exclude"):
+                    state_str = " [EXCLUDE]"
+
+            display_text = f"{roi_name}{state_str}"
+            roi_item = QTreeWidgetItem(roi_root_item, [display_text])
+
+            # Color indicator
+            roi_color = roi_info.get("color", (1.0, 0.0, 0.0))
+            pixmap = QPixmap(16, 16)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+            c_r = int(roi_color[0] * 255)
+            c_g = int(roi_color[1] * 255)
+            c_b = int(roi_color[2] * 255)
+            color = QColor(c_r, c_g, c_b)
+
+            painter.setBrush(QBrush(color))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(2, 2, 12, 12)
+            painter.end()
+
+            roi_item.setIcon(0, QIcon(pixmap))
+
+            roi_item.setFlags(roi_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            is_visible = self.roi_visibility.get(path, True)
+            roi_state = (
+                Qt.CheckState.Checked if is_visible else Qt.CheckState.Unchecked
+            )
+            roi_item.setCheckState(0, roi_state)
+            roi_item.setData(
+                0, Qt.ItemDataRole.UserRole, {"type": "roi", "path": path}
+            )
+
+            shape_str = format_tuple(roi_info["data"].shape, precision=0)
+            roi_item.setToolTip(0, f"Path: {path}\nShape: {shape_str}")
+
+        roi_root_item.setExpanded(True)
+
+    def _build_odf_tree_item(self) -> None:
+        """Builds the ODF Data section of the data panel tree."""
+        if self.odf_data is None:
+            return
+
+        odf_header = QTreeWidgetItem(self.data_tree_widget, ["ODF Data"])
+        odf_header.setIcon(
+            0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
+        )
+
+        odf_name = (
+            os.path.basename(self.odf_path) if self.odf_path else "Loaded ODF"
+        )
+
+        odf_file_item = QTreeWidgetItem(odf_header, [odf_name])
+        odf_file_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "odf_data"})
+        shape_str = format_tuple(self.odf_data.shape, precision=0)
+        odf_file_item.setToolTip(
+            0,
+            f"Path: {self.odf_path}\n"
+            f"Shape: {shape_str}\n"
+            f"SH Order: {self.odf_sh_order}",
+        )
+
+        # ODF Tunnel View item (checkable for visibility toggle)
+        if self.vtk_panel and self.vtk_panel.odf_actor is not None:
+            tunnel_item = QTreeWidgetItem(odf_header, ["ODF Tunnel View"])
+            tunnel_item.setFlags(
+                tunnel_item.flags() | Qt.ItemFlag.ItemIsUserCheckable
+            )
+            tunnel_state = (
+                Qt.CheckState.Checked
+                if self.odf_tunnel_is_visible
+                else Qt.CheckState.Unchecked
+            )
+            tunnel_item.setCheckState(0, tunnel_state)
+            tunnel_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "odf_tunnel"})
+            tunnel_item.setToolTip(
+                0,
+                "Toggle visibility of the ODF Tunnel View.\n"
+                "Right-click to remove.",
+            )
+
+        odf_header.setExpanded(True)
+
+    def _build_parcellation_tree_item(self) -> None:
+        """Builds the FreeSurfer Parcellation section of the data panel tree."""
+        if self.parcellation_data is None:
+            return
+
+        parcellation_header = QTreeWidgetItem(
+            self.data_tree_widget, ["FreeSurfer Parcellation"]
+        )
+        parcellation_header.setIcon(
+            0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
+        )
+
+        parc_name = (
+            os.path.basename(self.parcellation_path)
+            if self.parcellation_path
+            else "Loaded Parcellation"
+        )
+
+        parc_item = QTreeWidgetItem(parcellation_header, [parc_name])
+        parc_item.setFlags(parc_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+
+        parc_visible = self._parcellation_overlay_visible
+        parc_state = (
+            Qt.CheckState.Checked if parc_visible else Qt.CheckState.Unchecked
+        )
+        parc_item.setCheckState(0, parc_state)
+        parc_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "parcellation"})
+
+        shape_str = format_tuple(self.parcellation_data.shape, precision=0)
+        n_labels = len(np.unique(self.parcellation_data)) - 1  # Exclude 0
+        parc_item.setToolTip(
+            0,
+            f"Path: {self.parcellation_path}\n"
+            f"Shape: {shape_str}\n"
+            f"Total Labels: {n_labels}",
+        )
+
+        # Connected Regions submenu — organized by hemisphere
+        connected_labels = self.parcellation_connected_labels
+        if connected_labels:
+            self._build_connected_regions_tree(parc_item, connected_labels)
+
+        parc_item.setExpanded(True)
+        parcellation_header.setExpanded(True)
+
+    def _build_connected_regions_tree(
+        self,
+        parent_item: QTreeWidgetItem,
+        connected_labels: Set[int],
+    ) -> None:
+        """Builds the Connected Regions sub-tree under a parcellation item."""
+        connected_item = QTreeWidgetItem(
+            parent_item, [f"Connected Regions ({len(connected_labels)})"]
+        )
+        connected_item.setIcon(
+            0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
+        )
+
+        main_labels = self.parcellation_main_labels
+
+        # Classify regions by hemisphere
+        left_regions: List[Tuple[int, str]] = []
+        right_regions: List[Tuple[int, str]] = []
+        other_regions: List[Tuple[int, str]] = []
+
+        for label in connected_labels:
+            label_name = self.parcellation_labels.get(int(label), f"Region_{label}")
+            hemisphere = self._classify_region_hemisphere(label_name)
+            if hemisphere == "left":
+                left_regions.append((label, label_name))
+            elif hemisphere == "right":
+                right_regions.append((label, label_name))
+            else:
+                other_regions.append((label, label_name))
+
+        left_regions.sort(key=lambda x: x[1].lower())
+        right_regions.sort(key=lambda x: x[1].lower())
+        other_regions.sort(key=lambda x: x[1].lower())
+
+        # Build hemisphere folders
+        hemisphere_data = [
+            ("Left Hemisphere", left_regions),
+            ("Right Hemisphere", right_regions),
+            ("Bilateral/Other", other_regions),
+        ]
+        for folder_name, regions in hemisphere_data:
+            if not regions:
+                continue
+            folder = QTreeWidgetItem(
+                connected_item, [f"{folder_name} ({len(regions)})"]
+            )
+            folder.setIcon(
+                0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
+            )
+            self._add_region_items(folder, regions, main_labels)
+            folder.setExpanded(False)
+
+        connected_item.setExpanded(False)
+
+    def _add_region_items(
+        self,
+        parent_item: QTreeWidgetItem,
+        regions: List[Tuple[int, str]],
+        main_labels: Set[int],
+        limit: int = 100,
+    ) -> None:
+        """Adds individual region items to a hemisphere folder."""
+        parc_states = self.parcellation_region_states
+
+        for label, label_name in regions[:limit]:
+            display_name = label_name
+            state = parc_states.get(int(label), {})
+            if state.get("include"):
+                display_name = f"{label_name} [INC]"
+            elif state.get("exclude"):
+                display_name = f"{label_name} [EXC]"
+
+            region_item = QTreeWidgetItem(parent_item, [display_name])
+            region_item.setFlags(
+                region_item.flags() | Qt.ItemFlag.ItemIsUserCheckable
+            )
+
+            has_actor = int(label) in main_labels
+            region_visible = self.parcellation_region_visibility.get(
+                int(label), has_actor
+            )
+            region_state = (
+                Qt.CheckState.Checked
+                if region_visible
+                else Qt.CheckState.Unchecked
+            )
+            region_item.setCheckState(0, region_state)
+
+            region_item.setData(
+                0,
+                Qt.ItemDataRole.UserRole,
+                {"type": "parcellation_region", "label": int(label)},
+            )
+
+            actor_status = "Active (has actor)" if has_actor else "On-demand"
+            region_item.setToolTip(
+                0,
+                f"Label ID: {label}\nStatus: {actor_status}\nToggle to show/hide",
+            )
+
+        if len(regions) > limit:
+            more_item = QTreeWidgetItem(
+                parent_item,
+                [f"... and {len(regions) - limit} more regions"],
+            )
+            more_item.setDisabled(True)
 
     def _collect_expanded_items(
         self, item: QTreeWidgetItem, path: str, expanded_set: set
@@ -1499,10 +1637,12 @@ class MainWindow(QMainWindow):
             self._restore_expanded_items(item.child(i), current_path, expanded_set)
 
     # Undo/Redo Core Logic
+    @pyqtSlot()
     def _perform_undo(self) -> None:
         """Performs undo. Delegates to StateManager."""
         self.state_manager.perform_undo()
 
+    @pyqtSlot()
     def _perform_redo(self) -> None:
         """Performs redo. Delegates to StateManager."""
         self.state_manager.perform_redo()
@@ -1511,35 +1651,33 @@ class MainWindow(QMainWindow):
         """Saves ROI state for undo. Delegates to StateManager."""
         self.state_manager.save_roi_state_for_undo(roi_name)
 
-    def _perform_roi_undo(self) -> None:
-        """Performs ROI undo. Delegates to StateManager."""
-        self.state_manager.perform_roi_undo()
-
-    def _perform_roi_redo(self) -> None:
-        """Performs ROI redo. Delegates to StateManager."""
-        self.state_manager.perform_roi_redo()
-
     # Command Actions Logic
+    @pyqtSlot()
     def _perform_clear_selection(self) -> None:
         """Clears selection. Delegates to StateManager."""
         self.state_manager.perform_clear_selection()
 
+    @pyqtSlot()
     def _perform_reset_camera(self) -> None:
         """Resets camera. Delegates to StateManager."""
         self.state_manager.perform_reset_camera()
 
+    @pyqtSlot()
     def _perform_delete_selection(self) -> None:
         """Deletes selection. Delegates to StateManager."""
         self.state_manager.perform_delete_selection()
 
+    @pyqtSlot()
     def _increase_radius(self) -> None:
         """Increases radius. Delegates to StateManager."""
         self.state_manager.increase_radius()
 
+    @pyqtSlot()
     def _decrease_radius(self) -> None:
         """Decreases radius. Delegates to StateManager."""
         self.state_manager.decrease_radius()
 
+    @pyqtSlot()
     def _hide_sphere(self) -> None:
         """Hides sphere. Delegates to StateManager."""
         self.state_manager.hide_sphere()
@@ -1589,19 +1727,14 @@ class MainWindow(QMainWindow):
             self.tractogram_data = None
             self.streamline_bboxes = None
             self.visible_indices = set()
+            self._visibility_version += 1
             self.original_trk_header = None
             self.original_trk_affine = None
             self.original_trk_path = None
             self.original_file_extension = None
 
             # Close TRX memmap file reference (releases temp directory)
-            if self.trx_file_reference is not None:
-                try:
-                    if hasattr(self.trx_file_reference, "close"):
-                        self.trx_file_reference.close()
-                except Exception:
-                    pass
-                self.trx_file_reference = None
+            self._close_trx_file()
 
             self.scalar_data_per_point = None
             self.active_scalar_name = None
@@ -1611,11 +1744,12 @@ class MainWindow(QMainWindow):
             self.odf_sh_order = 0
             self.odf_sphere = None
             self.odf_basis_matrix = None
+            self.odf_tunnel_sphere = None
+            self.odf_tunnel_basis = None
             self.odf_tunnel_is_visible = False
-            self.view_odf_tunnel_action.blockSignals(True)  # Prevent triggering logic
-            self.view_odf_tunnel_action.setChecked(False)
-            self.view_odf_tunnel_action.setEnabled(False)
-            self.view_odf_tunnel_action.blockSignals(False)
+            with signals_blocked(self.view_odf_tunnel_action):
+                self.view_odf_tunnel_action.setChecked(False)
+                self.view_odf_tunnel_action.setEnabled(False)
             self.unified_undo_stack = []
             self.unified_redo_stack = []
             self.current_color_mode = ColorMode.ORIENTATION
@@ -1640,9 +1774,15 @@ class MainWindow(QMainWindow):
                     else "Bundle closed (Image also cleared)."
                 )
                 self.vtk_panel.update_status(status_msg)
+                interactor = (
+                    self.vtk_panel.render_window.GetInteractor()
+                    if self.vtk_panel.render_window
+                    else None
+                )
                 if (
                     self.vtk_panel.render_window
-                    and self.vtk_panel.render_window.GetInteractor().GetInitialized()
+                    and interactor is not None
+                    and interactor.GetInitialized()
                 ):
                     self.vtk_panel.render_window.Render()
 
@@ -1677,25 +1817,10 @@ class MainWindow(QMainWindow):
                     # Clear existing ROIs/Image if any
                     self._trigger_clear_anatomical_image(notify=False)
 
-                    img_data, img_affine, img_path, mmap_img = (
-                        file_io.load_anatomical_image(self, file_path=anat_path)
+                    self._load_initial_anat_threaded(
+                        anat_path, bundle_path, roi_paths, roi_in, radius
                     )
-
-                    if img_data is not None and img_affine is not None:
-                        self.anatomical_image_data = img_data
-                        self.anatomical_image_affine = img_affine
-                        self.anatomical_image_path = img_path
-                        self.anatomical_mmap_image = mmap_img
-                        self.image_is_visible = True
-
-                        if self.vtk_panel:
-                            self.vtk_panel.update_anatomical_slices()
-                            if self.vtk_panel.scene:
-                                self.vtk_panel.scene.reset_camera()
-                                self.vtk_panel.scene.reset_clipping_range()
-
-                        self._update_bundle_info_display()
-                        self._update_action_states()
+                    return  # Remaining loads are chained via on_finished
                 else:
                     logger.error(f"Anatomical image path not found: {anat_path}")
 
@@ -1740,9 +1865,15 @@ class MainWindow(QMainWindow):
                                 )
                                 continue
 
-                            anatomical_img = nib.load(self.anatomical_image_path)
-                            roi_img = nib.load(roi_path)
+                            from .file_io import _align_if_oblique
 
+                            anatomical_img = nib.load(self.anatomical_image_path)
+                            anatomical_img = _align_if_oblique(
+                                anatomical_img, self.anatomical_image_path, None
+                            )
+
+                            roi_img = nib.load(roi_path)
+                            roi_img = _align_if_oblique(roi_img, roi_path, None)
                             # Ensure proper coordinate system alignment
                             current_ornt = nib.io_orientation(roi_img.affine)
                             target_ornt = nib.io_orientation(anatomical_img.affine)
@@ -1788,8 +1919,13 @@ class MainWindow(QMainWindow):
                                     f"Aligned and added {os.path.basename(roi_path)}."
                                 )
 
-                        except Exception as e:
+                        except (OSError, ValueError, TypeError) as e:
                             logger.error(f"Error processing ROI {roi_path}: {e}")
+                            QMessageBox.warning(
+                                self,
+                                "ROI Load Error",
+                                f"Failed to load ROI: {os.path.basename(roi_path)}\n{e}",
+                            )
                             continue
 
                     self._update_action_states()
@@ -1811,6 +1947,18 @@ class MainWindow(QMainWindow):
 
                 for i, coords in enumerate(roi_in):
                     r_val = radius_list[i]
+
+                    # Validate coordinates and radius
+                    center_world = np.array(coords)
+                    if not np.all(np.isfinite(center_world)):
+                        logger.error(
+                            f"Invalid ROI coordinates (non-finite values): {coords}"
+                        )
+                        continue
+                    if not np.isfinite(r_val) or r_val <= 0:
+                        logger.error(f"Invalid ROI radius: {r_val}")
+                        continue
+
                     logger.info(
                         f"Creating Sphere ROI {i+1}/{len(roi_in)} at {coords} with radius {r_val}"
                     )
@@ -1821,9 +1969,6 @@ class MainWindow(QMainWindow):
                     # Get the newly created ROI name
                     roi_name = self.current_drawing_roi
                     if roi_name:
-                        # Draw Sphere
-                        center_world = np.array(coords)
-
                         # We need to manually trigger the sphere drawing logic in VTKPanel
                         roi_layer = self.roi_layers[roi_name]
                         roi_data = roi_layer["data"]
@@ -1894,7 +2039,120 @@ class MainWindow(QMainWindow):
                 self, "Startup Error", f"Error loading initial files:\n{e}"
             )
 
+    def _load_initial_anat_threaded(
+        self,
+        anat_path: str,
+        bundle_path: Optional[str] = None,
+        roi_paths: Optional[List[str]] = None,
+        roi_in: Optional[List[List[float]]] = None,
+        radius: Optional[List[float]] = None,
+    ) -> None:
+        """Loads an anatomical image on a background thread with a progress dialog.
+
+        Once the image finishes loading, any remaining CLI arguments (bundle,
+        ROIs, sphere ROIs) are loaded via ``load_initial_files``.
+
+        Args:
+            anat_path: Path to the anatomical NIfTI image.
+            bundle_path: Optional path to a bundle file to load afterwards.
+            roi_paths: Optional ROI paths to load afterwards.
+            roi_in: Optional sphere ROI coordinates to create afterwards.
+            radius: Optional radii for sphere ROIs.
+        """
+        # Setup progress dialog
+        progress = QProgressDialog("Initializing...", "Cancel", 0, 100, self)
+        progress.setWindowTitle("Loading Image")
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setMinimumWidth(350)
+        progress.setStyleSheet(self.theme_manager.get_progress_dialog_style())
+        progress.setValue(0)
+        progress.show()
+
+        # Create and configure the loader thread
+        loader_thread = file_io.AnatomicalImageLoaderThread(anat_path)
+
+        def on_progress(val, msg):
+            progress.setValue(val)
+            progress.setLabelText(msg)
+
+        def on_error(msg):
+            progress.cancel()
+            logger.error(f"Error loading initial anatomical image: {msg}")
+            QMessageBox.critical(
+                self, "Load Error", f"Error loading image:\n{msg}"
+            )
+            if self.vtk_panel:
+                self.vtk_panel.update_status("Error loading image.")
+            # Continue loading remaining files without anatomical image
+            self.load_initial_files(
+                bundle_path=bundle_path,
+                roi_paths=roi_paths,
+                roi_in=roi_in,
+                radius=radius,
+            )
+
+        def on_finished(data):
+            try:
+                progress.setLabelText("Creating slicer actors...")
+                progress.setValue(95)
+                QApplication.processEvents()
+
+                self.anatomical_image_data = data["data"]
+                self.anatomical_image_affine = data["affine"]
+                self.anatomical_image_path = data["path"]
+                self.anatomical_mmap_image = data.get("mmap_image")
+                self.image_is_visible = True
+
+                if self.vtk_panel:
+                    self.vtk_panel.update_anatomical_slices()
+                    QApplication.processEvents()
+                    if self.vtk_panel.scene:
+                        self.vtk_panel.scene.reset_camera()
+                        self.vtk_panel.scene.reset_clipping_range()
+                    if self.vtk_panel.render_window:
+                        self.vtk_panel.render_window.Render()
+                    self.vtk_panel.update_status(
+                        f"Loaded: {os.path.basename(data['path'])}"
+                    )
+
+                self._update_bundle_info_display()
+                self._update_action_states()
+
+                progress.close()
+
+            except (RuntimeError, ValueError, AttributeError, KeyError) as e:
+                logger.error(
+                    f"Error finalizing initial image load: {e}", exc_info=True
+                )
+                progress.close()
+                QMessageBox.critical(
+                    self, "Load Error", f"Error finalizing load:\n{e}"
+                )
+
+            # Continue loading remaining CLI arguments
+            self.load_initial_files(
+                bundle_path=bundle_path,
+                roi_paths=roi_paths,
+                roi_in=roi_in,
+                radius=radius,
+            )
+
+        # Connect signals (QueuedConnection ensures VTK calls run on main thread)
+        loader_thread.progress.connect(on_progress)
+        loader_thread.error.connect(on_error)
+        loader_thread.finished.connect(
+            on_finished, type=Qt.ConnectionType.QueuedConnection
+        )
+        progress.canceled.connect(loader_thread.terminate)
+
+        # Keep reference to prevent garbage collection
+        self._image_loader_thread = loader_thread
+
+        loader_thread.start()
+
     # Action Trigger Wrappers
+    @pyqtSlot()
     def _trigger_clear_anatomical_image(self, notify: bool = True) -> None:
         """Clears the currently loaded anatomical image."""
         if self.anatomical_image_data is None:
@@ -1920,6 +2178,7 @@ class MainWindow(QMainWindow):
         self._update_bundle_info_display()
         self._update_action_states()
 
+    @pyqtSlot()
     def _trigger_load_streamlines(self) -> None:
         """Wrapper to call the streamline load function from file_io."""
         self.scalar_range_initialized = False
@@ -1929,12 +2188,15 @@ class MainWindow(QMainWindow):
 
         file_io.load_streamlines_file(self)
         if self.tractogram_data:
-            self._auto_calculate_skip_level()  # Automatic skip level based on count
             self.manual_visible_indices = set(range(len(self.tractogram_data)))
-            # Clear caches on new load
+            self.visible_indices = self.manual_visible_indices
+            self._visibility_version += 1
+            # Clear caches and user override on new load
+            self._skip_user_disabled = False
             self.roi_states = {}
             self.roi_intersection_cache = {}
             self.roi_highlight_indices = set()
+            self._auto_calculate_skip_level()  # Automatic skip level based on count
 
         # Update scalar range if scalar mode is already active
         if self.current_color_mode == ColorMode.SCALAR and self.active_scalar_name:
@@ -1943,6 +2205,7 @@ class MainWindow(QMainWindow):
             if self.scalar_toolbar:
                 self.scalar_toolbar.setVisible(True)
 
+    @pyqtSlot()
     def _trigger_replace_bundle(self) -> None:
         """Wrapper to call load_streamlines_file with keep_image=True."""
         self.scalar_range_initialized = False
@@ -1952,10 +2215,12 @@ class MainWindow(QMainWindow):
 
         file_io.load_streamlines_file(self, keep_image=True)
 
+    @pyqtSlot()
     def _trigger_save_streamlines(self) -> None:
         """Wrapper to call the streamline save function from file_io."""
         file_io.save_streamlines_file(self)
 
+    @pyqtSlot()
     def _trigger_save_density_map(self) -> None:
         """
         Calculates and saves a Track Density Imaging (TDI) map of the currently
@@ -1986,8 +2251,8 @@ class MainWindow(QMainWindow):
                         int(d) for d in self.original_trk_header["dimensions"][:3]
                     )
                     affine = self.original_trk_header["voxel_to_rasmm"]
-            except Exception:
-                pass
+            except (KeyError, ValueError, TypeError):
+                logger.debug("Failed to parse TRK header for density map grid.")
 
         # Priority C: Compute Bounding Box (Fallback)
         # If no reference is found, we create a 1mm isotropic grid around the bundle
@@ -2029,7 +2294,7 @@ class MainWindow(QMainWindow):
                 affine[:3, :3] = np.diag(voxel_size)
                 affine[:3, 3] = min_coord
 
-            except Exception as e:
+            except (ValueError, IndexError, TypeError) as e:
                 logger.error(f"Error computing bounds: {e}")
                 self.vtk_panel.update_status("Error computing density bounds.")
                 return
@@ -2102,8 +2367,8 @@ class MainWindow(QMainWindow):
                     ref_img = nib.load(self.anatomical_image_path)
                     nifti_img.header.set_zooms(ref_img.header.get_zooms()[:3])
                     nifti_img.header.set_xyzt_units(*ref_img.header.get_xyzt_units())
-                except Exception:
-                    pass
+                except (OSError, ValueError, KeyError):
+                    logger.debug("Failed to copy header info from anatomical image.")
 
             nib.save(nifti_img, file_path)
 
@@ -2111,13 +2376,14 @@ class MainWindow(QMainWindow):
                 f"Saved density map: {os.path.basename(file_path)}"
             )
 
-        except Exception as e:
+        except (OSError, ValueError, TypeError) as e:
             logger.error(f"Error saving density map: {e}", exc_info=True)
             QMessageBox.critical(self, "Error", f"Could not save density map:\n{e}")
             self.vtk_panel.update_status("Error saving density map.")
         finally:
             self.vtk_panel.update_progress_bar(0, 0, visible=False)
 
+    @pyqtSlot()
     def _trigger_screenshot(self) -> None:
         """Wrapper to call the screenshot function in vtk_panel."""
         if not (self.tractogram_data or self.anatomical_image_data):
@@ -2132,13 +2398,14 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(
                     self, "Error", "Screenshot function not available in VTK panel."
                 )
-            except Exception as e:
+            except (RuntimeError, ValueError, OSError) as e:
                 QMessageBox.critical(
                     self, "Screenshot Error", f"Could not take screenshot:\n{e}"
                 )
         else:
             QMessageBox.warning(self, "Screenshot Error", "VTK panel not initialized.")
 
+    @pyqtSlot()
     def _trigger_export_html(self) -> None:
         """Exports the current visualization to an interactive HTML file."""
         if not (self.tractogram_data or self.anatomical_image_data):
@@ -2188,7 +2455,7 @@ class MainWindow(QMainWindow):
                     "Failed to export HTML. Check console for details.",
                 )
 
-        except Exception as e:
+        except (OSError, RuntimeError, ValueError) as e:
             logger.error(f"HTML export error: {e}", exc_info=True)
             if self.vtk_panel:
                 self.vtk_panel.update_status("HTML export error.")
@@ -2197,6 +2464,7 @@ class MainWindow(QMainWindow):
             )
 
     # Background Image Methods
+    @pyqtSlot()
     def _trigger_load_anatomical_image(self) -> None:
         """Triggers loading of an anatomical image using a background thread."""
         # Save path before clearing for file dialog start directory
@@ -2304,15 +2572,17 @@ class MainWindow(QMainWindow):
                 # Close progress dialog after ALL work is complete
                 progress.close()
 
-            except Exception as e:
+            except (RuntimeError, ValueError, AttributeError, KeyError) as e:
                 logger.error(f"Error in on_finished: {e}", exc_info=True)
                 progress.close()  # Ensure progress is closed on error
                 QMessageBox.critical(self, "Load Error", f"Error finalizing load:\n{e}")
 
-        # Connect Signals
+        # Connect Signals (QueuedConnection ensures VTK calls run on main thread)
         loader_thread.progress.connect(on_progress)
         loader_thread.error.connect(on_error)
-        loader_thread.finished.connect(on_finished)
+        loader_thread.finished.connect(
+            on_finished, type=Qt.ConnectionType.QueuedConnection
+        )
         progress.canceled.connect(loader_thread.terminate)
 
         # Keep reference to prevent garbage collection
@@ -2322,6 +2592,7 @@ class MainWindow(QMainWindow):
         loader_thread.start()
 
     # ROI Image Methods
+    @pyqtSlot()
     def _trigger_load_roi(self) -> None:
         """
         Triggers loading of ROI image layer(s),
@@ -2371,10 +2642,16 @@ class MainWindow(QMainWindow):
 
             try:
                 # Load the main anatomical image object from its stored path
+                from .file_io import _align_if_oblique
+
                 anatomical_img = nib.load(self.anatomical_image_path)
+                anatomical_img = _align_if_oblique(
+                    anatomical_img, self.anatomical_image_path, None
+                )
 
                 # Load the ROI image object again to perform reorientation operations
                 roi_img = nib.load(roi_path)
+                roi_img = _align_if_oblique(roi_img, roi_path, None)
 
                 # Ensure proper coordinate system alignment
                 current_ornt = nib.io_orientation(roi_img.affine)
@@ -2446,41 +2723,23 @@ class MainWindow(QMainWindow):
         if self.vtk_panel:
             self.vtk_panel.update_status("ROI loading complete.")
 
+    @pyqtSlot()
     def _trigger_clear_all_rois(self, notify: bool = True) -> None:
         """Clears all loaded ROI image layers and resets logic filters."""
         if not self.roi_layers:
             return
 
-        # Check if any ROI had active filters before clearing
-        # If so, auto-enable skip to prevent rendering millions of streamlines
-        had_active_filters = any(
-            state.get("include", False) or state.get("exclude", False)
-            for state in self.roi_states.values()
-        )
-
-        if had_active_filters:
-            if self.tractogram_data is not None and len(self.tractogram_data) > 20000:
-                if (
-                    hasattr(self, "skip_checkbox")
-                    and not self.skip_checkbox.isChecked()
-                ):
-                    self._auto_calculate_skip_level()
-
-        # Reset all drawing modes (fixes crosshair navigation bug)
         self._reset_all_drawing_modes()
 
-        # Clear Data Containers
         self.roi_layers.clear()
         self.roi_visibility.clear()
 
-        # Clear Logic States and Caches
         self.roi_states.clear()
         self.roi_intersection_cache.clear()
         self.roi_highlight_indices.clear()
 
-        # Re-calculate Visuals
         self._update_roi_visual_selection()
-        self._apply_logic_filters()
+        self.roi_manager._apply_filters_with_skip_protection()
 
         if self.vtk_panel:
             self.vtk_panel.clear_all_roi_layers()
@@ -2491,6 +2750,7 @@ class MainWindow(QMainWindow):
         self._update_bundle_info_display()
         self._update_action_states()
 
+    @pyqtSlot()
     def _trigger_clear_all_data(self) -> None:
         """Clears all loaded data (streamlines, anatomical image, ROIs, parcellation) without confirmation."""
         has_data = (
@@ -2502,13 +2762,6 @@ class MainWindow(QMainWindow):
 
         if not has_data:
             return
-
-        # IMPORTANT: Auto-enable skip BEFORE clearing filters to prevent
-        # rendering millions of streamlines when filters are removed.
-        # This fixes the freeze/crash when Clear All is pressed with skip off.
-        if self.tractogram_data is not None and len(self.tractogram_data) > 20000:
-            if hasattr(self, "skip_checkbox") and not self.skip_checkbox.isChecked():
-                self._auto_calculate_skip_level()
 
         # Clear ROIs first
         if self.roi_layers:
@@ -2538,6 +2791,7 @@ class MainWindow(QMainWindow):
         """Handles item changes. Delegates to DataPanelManager."""
         self.data_panel_manager.on_data_panel_item_changed(item, column)
 
+    @pyqtSlot("QPoint")
     def _on_data_panel_context_menu(self, position) -> None:
         """Shows context menu. Delegates to DataPanelManager."""
         self.data_panel_manager.on_data_panel_context_menu(position)
@@ -2546,6 +2800,7 @@ class MainWindow(QMainWindow):
         """Sets ROI logic mode. Delegates to ROIManager."""
         self.roi_manager.set_roi_logic_mode(roi_path, mode)
 
+    @pyqtSlot(bool)
     def _toggle_image_visibility(self, visible: bool) -> None:
         """Toggles the visibility of the anatomical image slices."""
         if self.image_is_visible == visible:
@@ -2598,6 +2853,7 @@ class MainWindow(QMainWindow):
         """Removes ROI layer. Delegates to ROIManager."""
         self.roi_manager.remove_roi_layer_action(path)
 
+    @pyqtSlot(bool)
     def _toggle_bundle_visibility(self, visible: bool) -> None:
         """Toggles the visibility of the streamline bundle actors."""
         if self.bundle_is_visible == visible:
@@ -2625,6 +2881,7 @@ class MainWindow(QMainWindow):
 
         self.vtk_panel.update_status(f"Bundle visibility set to {visible}")
 
+    @pyqtSlot(str, bool)
     def _toggle_roi_visibility(self, path: str, visible: bool) -> None:
         """Toggles the visibility of a specific ROI layer."""
         if self.roi_visibility.get(path, True) == visible:
@@ -2661,18 +2918,22 @@ class MainWindow(QMainWindow):
         """Delegates to ScalarManager."""
         self.scalar_manager.update_scalar_range_widgets()
 
+    @pyqtSlot(int)
     def _slider_value_changed(self, slider_val: int) -> None:
         """Delegates to ScalarManager."""
         self.scalar_manager.slider_value_changed(slider_val)
 
+    @pyqtSlot()
     def _spinbox_value_changed(self) -> None:
         """Delegates to ScalarManager."""
         self.scalar_manager.spinbox_value_changed()
 
+    @pyqtSlot()
     def _reset_scalar_range(self) -> None:
         """Delegates to ScalarManager."""
         self.scalar_manager.reset_scalar_range()
 
+    @pyqtSlot()
     def _trigger_vtk_update(self) -> None:
         """Delegates to ScalarManager."""
         self.scalar_manager.trigger_vtk_update()
@@ -2740,6 +3001,16 @@ class MainWindow(QMainWindow):
                 logger.info("Exiting application (Unix workaround)...")
                 os._exit(0)
 
+    def _close_trx_file(self) -> None:
+        """Close the TRX memory-mapped file reference and release resources."""
+        if self.trx_file_reference is not None:
+            try:
+                if hasattr(self.trx_file_reference, "close"):
+                    self.trx_file_reference.close()
+            except OSError:
+                logger.debug("Failed to close TRX file reference.")
+            self.trx_file_reference = None
+
     def _cleanup_resources(self) -> None:
         """Cleans up non-VTK resources before application exit."""
         # Terminate any running background threads
@@ -2751,25 +3022,19 @@ class MainWindow(QMainWindow):
                         logger.info(f"Terminating {thread_attr}...")
                         thread.terminate()
                         thread.wait(1000)  # Wait up to 1 second
-                except Exception as e:
+                except (RuntimeError, AttributeError) as e:
                     logger.warning(f"Error terminating {thread_attr}: {e}")
 
         # Clear memory-mapped image cache
         if self.anatomical_mmap_image is not None:
             try:
                 self.anatomical_mmap_image.clear_cache()
-            except Exception:
-                pass
+            except (AttributeError, OSError):
+                logger.debug("Failed to clear memory-mapped image cache.")
             self.anatomical_mmap_image = None
 
         # Close TRX memmap file reference (releases temp directory)
-        if self.trx_file_reference is not None:
-            try:
-                if hasattr(self.trx_file_reference, "close"):
-                    self.trx_file_reference.close()
-            except Exception:
-                pass
-            self.trx_file_reference = None
+        self._close_trx_file()
 
         # Clear large data arrays to help garbage collection
         self.tractogram_data = None
@@ -2780,7 +3045,7 @@ class MainWindow(QMainWindow):
 
     def _cleanup_vtk(self) -> None:
         """Safely cleans up VTK resources for all 4 views."""
-        if not hasattr(self, "vtk_panel") or not self.vtk_panel:
+        if not self.vtk_panel:
             return
 
         panel = self.vtk_panel
@@ -2791,8 +3056,8 @@ class MainWindow(QMainWindow):
                 panel.orientation_widget.SetEnabled(0)
                 panel.orientation_widget.SetInteractor(None)
                 panel.orientation_widget = None
-            except Exception:
-                pass
+            except RuntimeError:
+                logger.debug("Failed to release orientation widget.")
 
         # Clear all scenes
         scenes_to_clear = [
@@ -2805,8 +3070,8 @@ class MainWindow(QMainWindow):
             if scene:
                 try:
                     scene.clear()
-                except Exception:
-                    pass
+                except RuntimeError:
+                    logger.debug("Failed to clear VTK scene during cleanup.")
 
         # Remove all observers and terminate all interactors
         interactors = [
@@ -2821,8 +3086,8 @@ class MainWindow(QMainWindow):
                     interactor.RemoveAllObservers()
                     if interactor.GetInitialized():
                         interactor.TerminateApp()
-                except Exception:
-                    pass
+                except RuntimeError:
+                    logger.debug("Failed to clean up VTK interactor.")
 
         # Close QVTKRenderWindowInteractor widgets
         qt_vtk_widgets = [
@@ -2838,8 +3103,8 @@ class MainWindow(QMainWindow):
                     if rw:
                         rw.Finalize()
                     widget.close()
-                except Exception:
-                    pass
+                except RuntimeError:
+                    logger.debug("Failed to finalize VTK render window.")
 
         # Set references to None to help garbage collection
         panel.scene = None
@@ -2860,24 +3125,28 @@ class MainWindow(QMainWindow):
         panel.sagittal_vtk_widget = None
 
     # Theme switching methods
+    @pyqtSlot()
     def _set_theme_light(self) -> None:
         """Sets the application to light theme."""
         self.theme_manager.set_theme(ThemeMode.LIGHT)
         if self.vtk_panel:
             self.vtk_panel.update_status("Theme changed to Light")
 
+    @pyqtSlot()
     def _set_theme_dark(self) -> None:
         """Sets the application to dark theme."""
         self.theme_manager.set_theme(ThemeMode.DARK)
         if self.vtk_panel:
             self.vtk_panel.update_status("Theme changed to Dark")
 
+    @pyqtSlot()
     def _set_theme_system(self) -> None:
         """Sets the application to follow system theme."""
         self.theme_manager.set_theme(ThemeMode.SYSTEM)
         if self.vtk_panel:
             self.vtk_panel.update_status("Theme changed to System")
 
+    @pyqtSlot(bool)
     def _toggle_auto_fill(self, checked: bool) -> None:
         """Toggles the ROI auto-fill setting."""
         self.auto_fill_voxels = checked
@@ -2894,7 +3163,7 @@ class MainWindow(QMainWindow):
         )
 
         # Sync UI action if it exists
-        if hasattr(self, "auto_fill_action"):
+        if self.auto_fill_action is not None:
             self.auto_fill_action.setChecked(self.auto_fill_voxels)
 
     def _save_settings(self) -> None:
@@ -2902,6 +3171,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("drawing/auto_fill", self.auto_fill_voxels)
 
     # Help-About dialog
+    @pyqtSlot()
     def _show_about_dialog(self) -> None:
         """Displays the About tractedit information box with the application logo."""
         msg_box = QMessageBox(self)
@@ -2920,10 +3190,12 @@ class MainWindow(QMainWindow):
                     Qt.TransformationMode.SmoothTransformation,
                 )
                 msg_box.setIconPixmap(scaled_pixmap)
-        except Exception as e:
+        except (OSError, ValueError, RuntimeError) as e:
             logger.warning(f"Could not load logo for About dialog: {e}")
 
-        about_text = """<b>TractEdit version 3.3.0</b><br><br>
+        from tractedit_pkg import __version__ as _app_version
+
+        about_text = f"""<b>TractEdit version {_app_version}</b><br><br>
         Author: Marco Tagliaferri, PhD Candidate in Neuroscience<br>
         Center for Mind/Brain Sciences (CIMeC)
         University of Trento, Italy

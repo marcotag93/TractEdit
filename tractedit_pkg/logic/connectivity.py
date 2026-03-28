@@ -8,7 +8,7 @@ and FreeSurfer parcellation/segmentation volumes.
 
 Features:
 - Load FreeSurfer parcellation files (aparc+aseg, etc.)
-- Compute endpoint-based connectivity matrices with Numba optimization
+- Compute endpoint-based connectivity matrices with AOT-compiled optimization
 - Export matrices as CSV (with region names) or NPY format + PNG matrix image
 - Parse FreeSurfer color LUT for region names
 """
@@ -24,8 +24,9 @@ import time
 import logging
 from typing import TYPE_CHECKING, Optional, Dict, Tuple, List, Any
 
+from ..utils import signals_blocked
+
 import numpy as np
-from numba import njit, prange
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -180,103 +181,14 @@ FREESURFER_BUILTIN_LABELS = {
 
 
 # ============================================================================
-# Numba Optimized Functions
+# AOT-compiled functions (imported from pre-compiled extension)
 # ============================================================================
 
 
-@njit(parallel=True, cache=True)
-def _compute_endpoint_labels(
-    start_points: np.ndarray,
-    end_points: np.ndarray,
-    inv_affine_3x3: np.ndarray,
-    inv_affine_offset: np.ndarray,
-    parcellation: np.ndarray,
-    dims: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Numba-optimized computation of endpoint labels.
-
-    Uses parallel loop over streamlines for maximum performance.
-
-    Args:
-        start_points: (N, 3) array of streamline start points in world coords.
-        end_points: (N, 3) array of streamline end points in world coords.
-        inv_affine_3x3: (3, 3) rotation/scale part of inverse affine.
-        inv_affine_offset: (3,) translation part of inverse affine.
-        parcellation: 3D label volume (int array).
-        dims: (3,) volume dimensions.
-
-    Returns:
-        Tuple of (start_labels, end_labels), each (N,) int32 array.
-    """
-    n_streamlines = start_points.shape[0]
-    start_labels = np.zeros(n_streamlines, dtype=np.int32)
-    end_labels = np.zeros(n_streamlines, dtype=np.int32)
-
-    for i in prange(n_streamlines):
-        # Transform start point to voxel coordinates
-        sx = (
-            inv_affine_3x3[0, 0] * start_points[i, 0]
-            + inv_affine_3x3[0, 1] * start_points[i, 1]
-            + inv_affine_3x3[0, 2] * start_points[i, 2]
-            + inv_affine_offset[0]
-        )
-        sy = (
-            inv_affine_3x3[1, 0] * start_points[i, 0]
-            + inv_affine_3x3[1, 1] * start_points[i, 1]
-            + inv_affine_3x3[1, 2] * start_points[i, 2]
-            + inv_affine_offset[1]
-        )
-        sz = (
-            inv_affine_3x3[2, 0] * start_points[i, 0]
-            + inv_affine_3x3[2, 1] * start_points[i, 1]
-            + inv_affine_3x3[2, 2] * start_points[i, 2]
-            + inv_affine_offset[2]
-        )
-
-        # Round to nearest voxel
-        vx_s = int(np.round(sx))
-        vy_s = int(np.round(sy))
-        vz_s = int(np.round(sz))
-
-        # Check bounds and get label
-        if 0 <= vx_s < dims[0] and 0 <= vy_s < dims[1] and 0 <= vz_s < dims[2]:
-            start_labels[i] = parcellation[vx_s, vy_s, vz_s]
-        else:
-            start_labels[i] = 0  # Unknown/outside
-
-        # Transform end point to voxel coordinates
-        ex = (
-            inv_affine_3x3[0, 0] * end_points[i, 0]
-            + inv_affine_3x3[0, 1] * end_points[i, 1]
-            + inv_affine_3x3[0, 2] * end_points[i, 2]
-            + inv_affine_offset[0]
-        )
-        ey = (
-            inv_affine_3x3[1, 0] * end_points[i, 0]
-            + inv_affine_3x3[1, 1] * end_points[i, 1]
-            + inv_affine_3x3[1, 2] * end_points[i, 2]
-            + inv_affine_offset[1]
-        )
-        ez = (
-            inv_affine_3x3[2, 0] * end_points[i, 0]
-            + inv_affine_3x3[2, 1] * end_points[i, 1]
-            + inv_affine_3x3[2, 2] * end_points[i, 2]
-            + inv_affine_offset[2]
-        )
-
-        # Round to nearest voxel
-        vx_e = int(np.round(ex))
-        vy_e = int(np.round(ey))
-        vz_e = int(np.round(ez))
-
-        # Check bounds and get label
-        if 0 <= vx_e < dims[0] and 0 <= vy_e < dims[1] and 0 <= vz_e < dims[2]:
-            end_labels[i] = parcellation[vx_e, vy_e, vz_e]
-        else:
-            end_labels[i] = 0  # Unknown/outside
-
-    return start_labels, end_labels
+# _compute_endpoint_labels — AOT chunk + ThreadPool wrapper
+from tractedit_pkg._numba_aot._parallel_wrappers import (
+    compute_endpoint_labels as _compute_endpoint_labels,
+)
 
 
 # ============================================================================
@@ -332,7 +244,7 @@ def parse_freesurfer_lut(lut_path: Optional[str] = None) -> Dict[int, str]:
                 f"Loaded {len(label_names)} labels from FreeSurfer LUT: {lut_file}"
             )
             return label_names
-        except Exception as e:
+        except (OSError, ValueError) as e:
             logger.warning(f"Failed to parse FreeSurfer LUT ({lut_file}): {e}")
             # Fall through to use built-in labels
 
@@ -431,7 +343,7 @@ def _create_connectivity_visualization(
         logger.info(f"Saved connectivity visualization to {output_path}")
         return True
 
-    except Exception as e:
+    except (OSError, ValueError, TypeError) as e:
         logger.warning(f"Failed to create connectivity visualization: {e}")
         return False
 
@@ -459,6 +371,25 @@ class ConnectivityManager:
             main_window: Reference to the parent MainWindow instance.
         """
         self.mw = main_window
+
+    def _invert_parcellation_affine(self) -> Optional[np.ndarray]:
+        """
+        Safely computes the inverse of the parcellation affine matrix.
+
+        Returns:
+            The inverse affine matrix, or None if the matrix is singular.
+        """
+        try:
+            return np.linalg.inv(self.mw.parcellation_affine)
+        except np.linalg.LinAlgError:
+            logger.error("Parcellation affine matrix is singular, cannot compute inverse.")
+            QMessageBox.critical(
+                self.mw,
+                "Error",
+                "Invalid parcellation affine matrix (singular). "
+                "The parcellation file may be corrupted.",
+            )
+            return None
 
     def load_parcellation(self, file_path: Optional[str] = None) -> bool:
         """
@@ -529,7 +460,7 @@ class ConnectivityManager:
             logger.info(f"Loaded parcellation: {file_path} with {n_regions} regions")
             return True
 
-        except Exception as e:
+        except (OSError, ValueError) as e:
             logger.error(f"Error loading parcellation: {e}", exc_info=True)
             QMessageBox.critical(
                 mw, "Load Error", f"Could not load parcellation file:\n{e}"
@@ -587,7 +518,7 @@ class ConnectivityManager:
             logger.info(f"Saved parcellation region {label} to {save_path}")
             return True
 
-        except Exception as e:
+        except (OSError, ValueError) as e:
             logger.error(f"Error saving region: {e}", exc_info=True)
             QMessageBox.critical(mw, "Save Error", f"Failed to save region:\n{e}")
             return False
@@ -634,8 +565,8 @@ class ConnectivityManager:
         if hasattr(mw, "view_parcellation_action"):
             mw.view_parcellation_action.setChecked(False)
 
-        # Re-apply logic filters (removes any parcellation-based filtering)
-        mw.roi_manager.apply_logic_filters()
+        # Re-apply logic filters with skip protection against RAM exhaustion
+        mw.roi_manager._apply_filters_with_skip_protection()
 
         # Update UI
         mw._update_action_states()
@@ -644,6 +575,7 @@ class ConnectivityManager:
         mw.vtk_panel.update_status("Parcellation removed and cache cleared.")
         logger.info("Parcellation removed and cache cleared")
 
+    ##TODO - add circular connectome 
     def compute_connectivity_matrix(self) -> Optional[Dict[str, Any]]:
         """
         Computes the structural connectivity matrix from visible streamlines.
@@ -709,7 +641,7 @@ class ConnectivityManager:
                     start_points[i] = sl[0]
                     end_points[i] = sl[-1]
 
-            progress.setLabelText("Computing endpoint labels with Numba...")
+            progress.setLabelText("Computing endpoint labels (AOT-compiled)...")
             progress.setValue(30)
             QApplication.processEvents()
 
@@ -717,7 +649,9 @@ class ConnectivityManager:
                 return None
 
             # Compute inverse affine
-            inv_affine = np.linalg.inv(mw.parcellation_affine)
+            inv_affine = self._invert_parcellation_affine()
+            if inv_affine is None:
+                return None
             inv_affine_3x3 = inv_affine[:3, :3].astype(np.float64)
             inv_affine_offset = inv_affine[:3, 3].astype(np.float64)
             dims = np.array(mw.parcellation_data.shape, dtype=np.int64)
@@ -806,7 +740,7 @@ class ConnectivityManager:
 
             return result
 
-        except Exception as e:
+        except (ValueError, IndexError, TypeError) as e:
             logger.error(f"Error computing connectivity matrix: {e}", exc_info=True)
             QMessageBox.critical(
                 mw, "Computation Error", f"Failed to compute connectivity matrix:\n{e}"
@@ -903,7 +837,7 @@ class ConnectivityManager:
 
             return True
 
-        except Exception as e:
+        except (OSError, ValueError, TypeError) as e:
             logger.error(f"Error exporting connectivity matrix: {e}", exc_info=True)
             QMessageBox.critical(
                 mw, "Export Error", f"Failed to save connectivity matrix:\n{e}"
@@ -991,8 +925,10 @@ class ConnectivityManager:
                     start_points[i] = sl[0]
                     end_points[i] = sl[-1]
 
-            # Numba optimized label extraction
-            inv_affine = np.linalg.inv(mw.parcellation_affine)
+            # AOT-compiled label extraction
+            inv_affine = self._invert_parcellation_affine()
+            if inv_affine is None:
+                return False
             inv_affine_3x3 = inv_affine[:3, :3].astype(np.float64)
             inv_affine_offset = inv_affine[:3, 3].astype(np.float64)
             dims = np.array(mw.parcellation_data.shape, dtype=np.int64)
@@ -1113,7 +1049,7 @@ class ConnectivityManager:
                         opacity=0.85,  # High opacity for intersected regions
                     )
                     mw.parcellation_region_actors[int(label)] = region_actor
-                except Exception as e:
+                except (ValueError, RuntimeError) as e:
                     logger.warning(f"Failed to create contour for label {label}: {e}")
 
             # Store set of labels with pre-created actors (main labels)
@@ -1178,12 +1114,12 @@ class ConnectivityManager:
                 from PyQt6.QtCore import QTimer
 
                 QTimer.singleShot(100, lambda: self._finalize_render(mw))
-            except Exception:
-                pass
+            except RuntimeError:
+                logger.debug("VTK render or timer setup failed during overlay creation.")
 
             return True
 
-        except Exception as e:
+        except (ValueError, IndexError, TypeError, RuntimeError) as e:
             mw.vtk_panel.update_progress_bar(0, 0, visible=False)
             logger.error(f"Error creating parcellation overlay: {e}", exc_info=True)
             QMessageBox.critical(
@@ -1202,8 +1138,8 @@ class ConnectivityManager:
             if mw.vtk_panel and mw.vtk_panel.render_window:
                 mw.vtk_panel.render_window.Render()
                 QApplication.processEvents()
-        except Exception:
-            pass
+        except RuntimeError:
+            logger.debug("VTK render failed during finalize_render.")
 
     def _safe_cleanup_actors(self) -> None:
         """
@@ -1219,8 +1155,8 @@ class ConnectivityManager:
         if hasattr(mw, "parcellation_overlay_actor") and mw.parcellation_overlay_actor:
             try:
                 mw.vtk_panel.scene.rm(mw.parcellation_overlay_actor)
-            except Exception:
-                pass
+            except (ValueError, RuntimeError):
+                logger.debug("Failed to remove parcellation overlay actor.")
             mw.parcellation_overlay_actor = None
 
         # Remove all region actors from scene
@@ -1228,8 +1164,8 @@ class ConnectivityManager:
             for actor in list(mw.parcellation_region_actors.values()):
                 try:
                     mw.vtk_panel.scene.rm(actor)
-                except Exception:
-                    pass
+                except (ValueError, RuntimeError):
+                    logger.debug("Failed to remove parcellation region actor.")
             mw.parcellation_region_actors = {}
 
         # Reset cache flags
@@ -1239,8 +1175,8 @@ class ConnectivityManager:
         # Force VTK garbage collection
         try:
             mw.vtk_panel.render_window.Render()
-        except Exception:
-            pass
+        except RuntimeError:
+            logger.debug("VTK render failed during actor cleanup.")
 
     def _show_parcellation_actors(self) -> None:
         """Shows cached parcellation actors (adds them back to scene)."""
@@ -1251,8 +1187,8 @@ class ConnectivityManager:
         if hasattr(mw, "parcellation_overlay_actor") and mw.parcellation_overlay_actor:
             try:
                 mw.vtk_panel.scene.add(mw.parcellation_overlay_actor)
-            except Exception:
-                pass
+            except (ValueError, RuntimeError):
+                logger.debug("Failed to add parcellation overlay actor to scene.")
 
         # Only add region actors that are marked as visible
         if hasattr(mw, "parcellation_region_actors"):
@@ -1262,8 +1198,8 @@ class ConnectivityManager:
                 if region_visibility.get(label, True):
                     try:
                         mw.vtk_panel.scene.add(actor)
-                    except Exception:
-                        pass
+                    except (ValueError, RuntimeError):
+                        logger.debug("Failed to add region %s actor to scene.", label)
 
         mw.vtk_panel.render_window.Render()
         mw._parcellation_overlay_visible = True
@@ -1277,15 +1213,15 @@ class ConnectivityManager:
         if hasattr(mw, "parcellation_overlay_actor") and mw.parcellation_overlay_actor:
             try:
                 mw.vtk_panel.scene.rm(mw.parcellation_overlay_actor)
-            except Exception:
-                pass
+            except (ValueError, RuntimeError):
+                logger.debug("Failed to remove parcellation overlay from scene.")
 
         if hasattr(mw, "parcellation_region_actors"):
             for actor in mw.parcellation_region_actors.values():
                 try:
                     mw.vtk_panel.scene.rm(actor)
-                except Exception:
-                    pass
+                except (ValueError, RuntimeError):
+                    logger.debug("Failed to remove parcellation region actor.")
 
         mw.vtk_panel.render_window.Render()
         mw._parcellation_overlay_visible = False
@@ -1338,7 +1274,7 @@ class ConnectivityManager:
             visible: True to show, False to hide.
             batch_mode: If True, skip render and status update (for bulk operations).
         """
-        ##TODO - this needs to be refactored a bit
+        ##TODO - to refactor
 
         mw = self.mw
 
@@ -1386,7 +1322,7 @@ class ConnectivityManager:
                 # Only render if not in batch mode (batch will render once at end)
                 if not batch_mode:
                     mw.vtk_panel.render_window.Render()
-            except Exception as e:
+            except (RuntimeError, ValueError) as e:
                 logger.warning(f"Failed to toggle region {label} visibility: {e}")
 
         # Only update status if not in batch mode and overlay is visible
@@ -1467,7 +1403,7 @@ class ConnectivityManager:
             logger.info(f"Created on-demand actor for region {label}")
             return True
 
-        except Exception as e:
+        except (ValueError, RuntimeError) as e:
             logger.error(f"Error creating on-demand actor for region {label}: {e}")
             return False
 
@@ -1527,7 +1463,7 @@ class ConnectivityManager:
 
             return True
 
-        except Exception as e:
+        except (ValueError, IndexError, TypeError) as e:
             logger.error(f"Error computing region intersection for {label}: {e}")
             return False
 
@@ -1574,8 +1510,10 @@ class ConnectivityManager:
                     start_points[i] = sl[0]
                     end_points[i] = sl[-1]
 
-            # Numba optimized label extraction
-            inv_affine = np.linalg.inv(mw.parcellation_affine)
+            # AOT-compiled label extraction
+            inv_affine = self._invert_parcellation_affine()
+            if inv_affine is None:
+                return False
             inv_affine_3x3 = inv_affine[:3, :3].astype(np.float64)
             inv_affine_offset = inv_affine[:3, 3].astype(np.float64)
             dims = np.array(mw.parcellation_data.shape, dtype=np.int64)
@@ -1625,7 +1563,7 @@ class ConnectivityManager:
             )
             return True
 
-        except Exception as e:
+        except (ValueError, IndexError, TypeError, RuntimeError) as e:
             logger.error(f"Error recalculating intersections: {e}", exc_info=True)
             mw.vtk_panel.update_status(f"Error recalculating intersections: {e}")
             return False
@@ -1709,14 +1647,13 @@ class ConnectivityManager:
 
             mw.vtk_panel.update_status(f"{region_name}: set as EXCLUDE")
 
-        # Apply filters
-        mw.roi_manager.apply_logic_filters()
+        # Apply filters with skip protection against RAM exhaustion
+        mw.roi_manager._apply_filters_with_skip_protection()
 
         # Update data panel with signals blocked to prevent cascading callbacks
         if mw.data_tree_widget:
-            mw.data_tree_widget.blockSignals(True)
-            mw._update_data_panel_display()
-            mw.data_tree_widget.blockSignals(False)
+            with signals_blocked(mw.data_tree_widget):
+                mw._update_data_panel_display()
 
 
 def _hue_to_rgb(hue: float) -> np.ndarray:

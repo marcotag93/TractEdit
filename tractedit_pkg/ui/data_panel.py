@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtGui import QAction, QActionGroup
 
-from ..utils import ColorMode
+from ..utils import ColorMode, signals_blocked
 
 if TYPE_CHECKING:
     from ..main_window import MainWindow
@@ -159,7 +159,8 @@ class DataPanelManager:
                 mw.scalar_range_initialized = True
 
                 if mw.current_color_mode != ColorMode.SCALAR:
-                    mw.color_scalar_action.setChecked(True)
+                    with signals_blocked(mw.color_scalar_action):
+                        mw.color_scalar_action.setChecked(True)
                     mw._set_color_mode(ColorMode.SCALAR)
                 else:
                     if mw.vtk_panel:
@@ -177,37 +178,35 @@ class DataPanelManager:
         itype = item_data.get("type")
         val = 1.0
 
-        mw.opacity_slider.blockSignals(True)  # Prevent feedback
+        with signals_blocked(mw.opacity_slider):
+            if itype == "bundle":
+                val = mw.bundle_opacity
+                mw.opacity_slider.setEnabled(True)
+            elif itype == "image":
+                val = mw.image_opacity
+                mw.opacity_slider.setEnabled(True)
+            elif itype == "roi":
+                path = item_data.get("path")
+                val = mw.roi_opacities.get(path, 0.5)
+                mw.opacity_slider.setEnabled(True)
 
-        if itype == "bundle":
-            val = mw.bundle_opacity
-            mw.opacity_slider.setEnabled(True)
-        elif itype == "image":
-            val = mw.image_opacity
-            mw.opacity_slider.setEnabled(True)
-        elif itype == "roi":
-            path = item_data.get("path")
-            val = mw.roi_opacities.get(path, 0.5)
-            mw.opacity_slider.setEnabled(True)
+                # Set as current drawing ROI
+                mw.current_drawing_roi = path
+                if mw.vtk_panel:
+                    status_msg = f"Selected ROI: {path}"
+                    if mw.is_drawing_mode:
+                        status_msg += " (Drawing Enabled)"
+                    elif getattr(mw, "is_eraser_mode", False):
+                        status_msg += " (Eraser Enabled)"
+                    elif getattr(mw, "is_sphere_mode", False):
+                        status_msg += " (Sphere Mode Enabled)"
+                    elif getattr(mw, "is_rectangle_mode", False):
+                        status_msg += " (Rectangle Mode Enabled)"
+                    mw.vtk_panel.update_status(status_msg)
+            else:
+                mw.opacity_slider.setEnabled(False)
 
-            # Set as current drawing ROI
-            mw.current_drawing_roi = path
-            if mw.vtk_panel:
-                status_msg = f"Selected ROI: {path}"
-                if mw.is_drawing_mode:
-                    status_msg += " (Drawing Enabled)"
-                elif getattr(mw, "is_eraser_mode", False):
-                    status_msg += " (Eraser Enabled)"
-                elif getattr(mw, "is_sphere_mode", False):
-                    status_msg += " (Sphere Mode Enabled)"
-                elif getattr(mw, "is_rectangle_mode", False):
-                    status_msg += " (Rectangle Mode Enabled)"
-                mw.vtk_panel.update_status(status_msg)
-        else:
-            mw.opacity_slider.setEnabled(False)
-
-        mw.opacity_slider.setValue(int(val * 100))
-        mw.opacity_slider.blockSignals(False)
+            mw.opacity_slider.setValue(int(val * 100))
 
     def on_opacity_slider_changed(self, value: int) -> None:
         """Updates the opacity of the selected item."""
@@ -294,7 +293,7 @@ class DataPanelManager:
                 # Toggle ODF tunnel visibility without recomputing
                 mw._toggle_odf_tunnel_visibility(is_checked)
 
-        except Exception as e:
+        except (RuntimeError, ValueError, AttributeError, KeyError) as e:
             logger.error(f"Error handling item visibility change: {e}", exc_info=True)
         finally:
             # Unblock signals
@@ -654,14 +653,13 @@ class DataPanelManager:
         if mw.vtk_panel:
             try:
                 mw.vtk_panel.render_window.Render()
-            except Exception:
-                pass
+            except RuntimeError:
+                logger.debug("VTK render call failed.")
 
         # Update data panel with signals blocked to prevent callback loops
         if mw.data_tree_widget:
-            mw.data_tree_widget.blockSignals(True)
-            mw._update_data_panel_display()
-            mw.data_tree_widget.blockSignals(False)
+            with signals_blocked(mw.data_tree_widget):
+                mw._update_data_panel_display()
 
         status = "shown" if visible else "hidden"
         mw.vtk_panel.update_status(f"All {count} regions {status}")
@@ -710,14 +708,13 @@ class DataPanelManager:
         if mw.vtk_panel:
             try:
                 mw.vtk_panel.render_window.Render()
-            except Exception:
-                pass
+            except RuntimeError:
+                logger.debug("VTK render call failed.")
 
         # Update data panel with signals blocked to prevent callback loops
         if mw.data_tree_widget:
-            mw.data_tree_widget.blockSignals(True)
-            mw._update_data_panel_display()
-            mw.data_tree_widget.blockSignals(False)
+            with signals_blocked(mw.data_tree_widget):
+                mw._update_data_panel_display()
 
         hemisphere_name = {
             "left": "Left Hemisphere",
@@ -731,17 +728,14 @@ class DataPanelManager:
         """Clears all parcellation region include/exclude filters."""
         mw = self.mw
 
-        # Clear all region filter states
         mw.parcellation_region_states = {}
 
-        # Re-apply logic filters
-        mw.roi_manager.apply_logic_filters()
+        mw.roi_manager._apply_filters_with_skip_protection()
 
         # Update data panel with signals blocked
         if mw.data_tree_widget:
-            mw.data_tree_widget.blockSignals(True)
-            mw._update_data_panel_display()
-            mw.data_tree_widget.blockSignals(False)
+            with signals_blocked(mw.data_tree_widget):
+                mw._update_data_panel_display()
 
         mw.vtk_panel.update_status("All region filters cleared")
 
@@ -763,9 +757,8 @@ class DataPanelManager:
             mw.odf_tunnel_is_visible = False
 
             # Sync the menu action state
-            mw.view_odf_tunnel_action.blockSignals(True)
-            mw.view_odf_tunnel_action.setChecked(False)
-            mw.view_odf_tunnel_action.blockSignals(False)
+            with signals_blocked(mw.view_odf_tunnel_action):
+                mw.view_odf_tunnel_action.setChecked(False)
 
             # Update the data panel
             mw._update_data_panel_display()
@@ -773,7 +766,7 @@ class DataPanelManager:
             if mw.vtk_panel:
                 mw.vtk_panel.update_status("ODF Tunnel View removed")
 
-        except Exception as e:
+        except (ValueError, RuntimeError, AttributeError) as e:
             logger.error(f"Error removing ODF tunnel view: {e}", exc_info=True)
 
     def update_data_panel_display(self) -> None:

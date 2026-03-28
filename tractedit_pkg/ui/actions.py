@@ -520,18 +520,20 @@ class ActionsManager:
 
         # Selection Group
         shortcuts_menu.addSection("Selection Tools")
-        add_shortcut_item("s  :  Select/Deselect at cursor")
+        add_shortcut_item("s  :  Add streamlines at cursor to selection")
+        add_shortcut_item("Shift + s  :  Remove streamlines at cursor from selection")
         add_shortcut_item("i  :  Invert selection")
         add_shortcut_item("d  :  Delete selection")
         add_shortcut_item("c  :  Clear selection")
         add_shortcut_item("+ / =  :  Increase sphere radius")
-        add_shortcut_item("-  :  Decrease sphereradius")
+        add_shortcut_item("-  :  Decrease sphere radius")
 
         # Navigation Group
         shortcuts_menu.addSection("Slice Navigation")
         add_shortcut_item("↑ / ↓  :  Axial (Z-axis)")
         add_shortcut_item("← / →  :  Sagittal (X-axis)")
         add_shortcut_item("Ctrl + ↑ / ↓  :  Coronal (Y-axis)")
+        add_shortcut_item("Shift + Scroll  :  Slice nav on hovered 2D panel")
 
         # ROI Drawing Group
         shortcuts_menu.addSection("ROI Drawing")

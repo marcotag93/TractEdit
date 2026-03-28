@@ -21,6 +21,8 @@ import vtk
 from fury import actor, window
 from PyQt6.QtCore import Qt
 
+from ..utils import signals_blocked
+
 if TYPE_CHECKING:
     from .vtk_panel import VTKPanel
 
@@ -145,7 +147,7 @@ class DrawingManager:
             ):
                 self._update_sphere_realtime(roi_name, view_type)
 
-        except Exception as e:
+        except (ValueError, IndexError, RuntimeError, AttributeError) as e:
             logger.error(f"Error during drawing: {e}", exc_info=True)
 
     def _handle_sphere_mode(
@@ -307,7 +309,7 @@ class DrawingManager:
             return
 
         # Throttled intersection update
-        # ##TODO this probably can be handled better, will be refactored later
+        # ##TODO to refactor, also a bit laggy during preview
         self._sphere_update_counter += 1
         if self._sphere_update_counter >= 15:
             self._sphere_update_counter = 0
@@ -344,8 +346,8 @@ class DrawingManager:
                     if s:
                         try:
                             s.rm(self.panel.preview_line_actor)
-                        except Exception:
-                            pass
+                        except (ValueError, RuntimeError):
+                            logger.debug("Failed to remove preview actor from scene.")
                 self.panel.preview_line_actor = None
 
             # Create new preview actor
@@ -369,7 +371,7 @@ class DrawingManager:
                 scene.add(self.panel.preview_line_actor)
                 scene.GetRenderWindow().Render()
 
-        except Exception as e:
+        except (ValueError, IndexError, RuntimeError, AttributeError) as e:
             logger.error(f"Error updating preview: {e}", exc_info=True)
 
     def _create_circle_preview(self) -> vtk.vtkPolyData:
@@ -440,8 +442,8 @@ class DrawingManager:
                     if s:
                         try:
                             s.rm(self.panel.preview_line_actor)
-                        except Exception:
-                            pass
+                        except (ValueError, RuntimeError):
+                            logger.debug("Failed to remove preview actor from scene.")
                 self.panel.preview_line_actor = None
 
             # Create new preview actor
@@ -461,7 +463,7 @@ class DrawingManager:
             scene.add(self.panel.preview_line_actor)
             scene.GetRenderWindow().Render()
 
-        except Exception as e:
+        except (ValueError, IndexError, RuntimeError, AttributeError) as e:
             logger.error(f"Error showing radius preview: {e}", exc_info=True)
 
     def _create_rectangle_preview(self) -> vtk.vtkPolyData:
@@ -658,7 +660,7 @@ class DrawingManager:
             self._cleanup_preview()
             self.panel._render_all()
 
-        except Exception as e:
+        except (ValueError, IndexError, RuntimeError, KeyError, AttributeError) as e:
             logger.error(f"Error finishing drawing: {e}", exc_info=True)
             self.panel.drawing_preview_points = []
 
@@ -677,10 +679,8 @@ class DrawingManager:
         homog_points = np.hstack([points_world, np.ones((len(points_world), 1))])
 
         if not roi_actors or actor_key not in roi_actors:
-            # Fallback to affine
+            # Fallback to affine (RAS+ data — inv_affine gives correct voxel indices)
             vox_points_float = np.dot(roi_inv_affine, homog_points.T).T[:, :3]
-            # Apply X-flip for radiological display convention
-            vox_points_float[:, 0] = (shape[0] - 1) - vox_points_float[:, 0]
         else:
             actor_obj = roi_actors[actor_key]
             matrix = actor_obj.GetMatrix()
@@ -709,8 +709,8 @@ class DrawingManager:
                             input_conn = producer.GetInputConnection(0, 0)
                             if input_conn:
                                 image_data = input_conn.GetProducer().GetOutput()
-                except Exception:
-                    pass
+                except (AttributeError, RuntimeError):
+                    logger.debug("Failed to traverse VTK pipeline for image data.")
 
             if image_data and isinstance(image_data, vtk.vtkImageData):
                 spacing = image_data.GetSpacing()
@@ -718,10 +718,6 @@ class DrawingManager:
                 vox_points_float = (model_points - np.array(origin)) / np.array(spacing)
             else:
                 vox_points_float = model_points
-
-            # Compensate for radiological display X-flip
-            if view_type in ["axial", "coronal", "sagittal"]:
-                vox_points_float[:, 0] = (shape[0] - 1) - vox_points_float[:, 0]
 
             # Compensate for sagittal +1 display offset
             # (see vtk_panel.py add_roi_layer line ~2039 and slice navigation line ~1504)
@@ -1011,8 +1007,8 @@ class DrawingManager:
             ]:
                 try:
                     s.rm(self.panel.preview_line_actor)
-                except Exception:
-                    pass
+                except (ValueError, RuntimeError):
+                    logger.debug("Failed to remove preview actor from scene.")
             self.panel.preview_line_actor = None
 
         self.panel.drawing_preview_points = []
@@ -1033,8 +1029,7 @@ class DrawingManager:
         current_radius = roi_params["radius"]
         stored_view_type = roi_params.get("view_type", "axial")
 
-        # Undo radiological X-flip: stored center was flipped for 3D display,
-        # restore to world coordinates for rasterization
+        # Restore to world coordinates for rasterization
         if stored_view_type in ["axial", "coronal"]:
             center_world[0] = -center_world[0]
 
@@ -1075,9 +1070,8 @@ class DrawingManager:
         # Sync the radius spinbox if it exists
         mw = self.panel.main_window
         if hasattr(mw, "sphere_radius_spinbox"):
-            mw.sphere_radius_spinbox.blockSignals(True)
-            mw.sphere_radius_spinbox.setValue(new_radius)
-            mw.sphere_radius_spinbox.blockSignals(False)
+            with signals_blocked(mw.sphere_radius_spinbox):
+                mw.sphere_radius_spinbox.setValue(new_radius)
 
         # Remove any existing 3D preview sphere
         if roi_name in self.panel.roi_slice_actors:
@@ -1085,8 +1079,8 @@ class DrawingManager:
             if old_sphere:
                 try:
                     self.panel.scene.rm(old_sphere)
-                except Exception:
-                    pass
+                except (ValueError, RuntimeError):
+                    logger.debug("Failed to remove old sphere actor from scene.")
                 self.panel.roi_slice_actors[roi_name]["sphere_3d"] = None
 
         # Refresh ROI visualization properly with color
@@ -1151,8 +1145,8 @@ class DrawingManager:
                             input_conn = producer.GetInputConnection(0, 0)
                             if input_conn:
                                 image_data = input_conn.GetProducer().GetOutput()
-                except Exception:
-                    pass
+                except (AttributeError, RuntimeError):
+                    logger.debug("Failed to traverse VTK pipeline for image data.")
 
             if image_data and isinstance(image_data, vtk.vtkImageData):
                 spacing = image_data.GetSpacing()
@@ -1176,11 +1170,6 @@ class DrawingManager:
             edge_w = center_w + np.array([radius_w, 0, 0])
             p_h_e = np.append(edge_w, 1.0)
             edge_vox = np.dot(roi_inv_affine, p_h_e)[:3]
-
-        # Compensate for radiological display X-flip when rasterizing to voxel space
-        if view_type in ["axial", "coronal", "sagittal"]:
-            center_vox[0] = (shape[0] - 1) - center_vox[0]
-            edge_vox[0] = (shape[0] - 1) - edge_vox[0]
 
         radius_v = np.linalg.norm(center_vox - edge_vox)
 
@@ -1250,8 +1239,8 @@ class DrawingManager:
         if existing_sphere is not None:
             try:
                 self.panel.scene.rm(existing_sphere)
-            except Exception:
-                pass
+            except (ValueError, RuntimeError):
+                logger.debug("Failed to remove existing sphere actor from scene.")
             self.panel.roi_slice_actors[roi_name]["sphere_3d"] = None
             self.panel.roi_slice_actors[roi_name]["sphere_source"] = None
 
@@ -1354,8 +1343,8 @@ class DrawingManager:
         if existing_rect is not None:
             try:
                 self.panel.scene.rm(existing_rect)
-            except Exception:
-                pass
+            except (ValueError, RuntimeError):
+                logger.debug("Failed to remove existing rectangle actor from scene.")
             self.panel.roi_slice_actors[roi_name]["rectangle_3d"] = None
             self.panel.roi_slice_actors[roi_name]["rectangle_points"] = None
 

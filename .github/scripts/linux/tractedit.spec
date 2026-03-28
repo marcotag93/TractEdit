@@ -46,10 +46,19 @@ for root, dirs, files in os.walk(fury_path):
                 dest = os.path.join('fury', rel_path)
             fury_stubs.append((src, dest))
 
+# Collect the AOT-compiled numerical extension (.so on Linux)
+import glob as _glob
+_aot_dir = str(project_root / 'tractedit_pkg' / '_numba_aot')
+_aot_binaries = []
+for _ext in _glob.glob(os.path.join(_aot_dir, 'tractedit_numba.*')):
+    if _ext.endswith('.py') or _ext.endswith('.pyc'):
+        continue
+    _aot_binaries.append((_ext, 'tractedit_pkg/_numba_aot'))
+
 a = Analysis(
     [str(project_root / 'main.py')],
     pathex=[str(project_root)],
-    binaries=[],
+    binaries=_aot_binaries,
     datas=[
         # Include all assets
         (str(project_root / 'tractedit_pkg' / 'assets'), 'tractedit_pkg/assets'),
@@ -108,9 +117,11 @@ a = Analysis(
         'numpy._distributor_init',
         'scipy',
         'nibabel',
-        'numba',
         'fury',
         'trx',
+        # AOT-compiled numerical extension
+        'tractedit_pkg._numba_aot',
+        'tractedit_pkg._numba_aot.tractedit_numba',
     ],
     hookspath=[],
     hooksconfig={},
@@ -136,6 +147,8 @@ a = Analysis(
         'keras',
         'sklearn',
         'skimage',
+        # Numba is build-time only (AOT extension is pre-compiled)
+        'numba',
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

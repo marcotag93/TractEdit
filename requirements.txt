@@ -1,0 +1,12 @@
+# TractEdit pinned runtime dependencies (Python 3.11)
+# Install with: pip install -r requirements.txt && pip install --no-deps .
+
+PyQt6==6.7.0
+PyQt6-Qt6==6.7.3
+vtk==9.2.6
+fury==0.12.0
+nibabel==5.3.3
+numpy==2.3.5
+scipy==1.16.3
+pytz==2025.2
+trx-python==0.3

@@ -18,27 +18,11 @@ if __name__ == "__main__":
     multiprocessing.freeze_support()
 
 # ============================================================================
-# Numba Configuration
+# BLAS Thread Configuration
 # ============================================================================
-try:
-    # OS cache directory
-    if sys.platform == "win32":
-        # Windows: %LOCALAPPDATA%
-        base_cache = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
-    elif sys.platform == "darwin":
-        # macOS: ~/Library/Caches
-        base_cache = os.path.expanduser("~/Library/Caches")
-    else:
-        # Linux/Unix: ~/.cache or $XDG_CACHE_HOME
-        base_cache = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
-
-    # Use standard cache/tractedit/numba for persistent JIT cache
-    _cache_dir = os.path.join(base_cache, "tractedit", "numba")
-    os.makedirs(_cache_dir, exist_ok=True)
-    os.environ["NUMBA_CACHE_DIR"] = _cache_dir
-except Exception as _e:
-    print(f"Warning: Failed to set Numba cache directory: {_e}", file=sys.stderr)
-
+# Prevent BLAS/LAPACK libraries from spawning their own threads, which can
+# conflict with the AOT ThreadPoolExecutor-based parallelism used by
+# TractEdit's compiled kernels.
 if sys.platform == "darwin":  # macOS
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -136,6 +120,63 @@ class LoadingSplash(QSplashScreen):
 # ============================================================================
 
 
+def _read_vtk_streamlines(input_path: str) -> "list":
+    """
+    Reads streamlines from a VTK (.vtk) or VTP (.vtp) polydata file.
+
+    Uses VTK 9.x's CSR cell-array API (GetOffsetsArray / GetConnectivityArray)
+    together with numpy vectorised operations.
+
+    Args:
+        input_path: Absolute path to the .vtk or .vtp file.
+
+    Returns:
+        List of (N, 3) float32 numpy arrays, one per streamline.
+
+    Raises:
+        ValueError: If the file contains no valid streamline data.
+    """
+    import numpy as np
+    import vtk
+    from vtk.util import numpy_support
+
+    ext = os.path.splitext(input_path)[1].lower()
+    if ext == ".vtk":
+        reader = vtk.vtkPolyDataReader()
+    else:
+        reader = vtk.vtkXMLPolyDataReader()
+
+    reader.SetFileName(input_path)
+    reader.Update()
+    polydata = reader.GetOutput()
+
+    vtk_points = polydata.GetPoints()
+    if vtk_points is None:
+        raise ValueError(f"No point data found in {input_path}")
+
+    points = numpy_support.vtk_to_numpy(vtk_points.GetData()).astype(
+        np.float32, copy=False
+    )
+
+    vtk_lines = polydata.GetLines()
+    if vtk_lines is None or vtk_lines.GetNumberOfCells() == 0:
+        raise ValueError(f"No line cells (streamlines) found in {input_path}")
+
+    # VTK 9.x exposes the cell array as two parallel CSR arrays:
+    #   offsets_arr  : (N+1,) cumulative start positions [0, len_0, len_0+len_1, ...]
+    #   connectivity : (total_pts,) flat list of all point IDs in cell order
+    offsets_arr = numpy_support.vtk_to_numpy(vtk_lines.GetOffsetsArray())
+    connectivity_arr = numpy_support.vtk_to_numpy(vtk_lines.GetConnectivityArray())
+
+    flat_coords = points[connectivity_arr].astype(np.float32, copy=False)
+
+    # np.split with the interior offset positions yields per-streamline views
+    # with no additional data copy.
+    streamlines = np.split(flat_coords, offsets_arr[1:-1])
+
+    return streamlines
+
+
 def _run_headless_conversion(input_path: str, output_path: str) -> None:
     """
     Performs headless format conversion without initializing the GUI.
@@ -224,30 +265,7 @@ def _run_headless_conversion(input_path: str, output_path: str) -> None:
                 header = {"dimensions": trx_file.header["DIMENSIONS"]}
 
         elif input_ext in (".vtk", ".vtp"):
-            import vtk
-            from vtk.util import numpy_support
-
-            if input_ext == ".vtk":
-                reader = vtk.vtkPolyDataReader()
-            else:
-                reader = vtk.vtkXMLPolyDataReader()
-
-            reader.SetFileName(input_path)
-            reader.Update()
-            polydata = reader.GetOutput()
-
-            lines = polydata.GetLines()
-            points = numpy_support.vtk_to_numpy(polydata.GetPoints().GetData())
-
-            streamlines = []
-            lines.InitTraversal()
-            id_list = vtk.vtkIdList()
-            while lines.GetNextCell(id_list):
-                n_pts = id_list.GetNumberOfIds()
-                sl = np.zeros((n_pts, 3))
-                for i in range(n_pts):
-                    sl[i] = points[id_list.GetId(i)]
-                streamlines.append(sl)
+            streamlines = _read_vtk_streamlines(input_path)
             affine = np.eye(4)
 
         if not streamlines:
@@ -318,7 +336,6 @@ def _run_headless_conversion(input_path: str, output_path: str) -> None:
 
         elif output_ext in (".vtk", ".vtp"):
             import vtk
-            from vtk.util import numpy_support
 
             # Create VTK polydata
             vtk_points = vtk.vtkPoints()
@@ -435,30 +452,7 @@ def _run_headless_density_map(
                 shape = tuple(int(d) for d in trx_file.header["DIMENSIONS"][:3])
 
         elif input_ext in (".vtk", ".vtp"):
-            import vtk
-            from vtk.util import numpy_support
-
-            if input_ext == ".vtk":
-                reader = vtk.vtkPolyDataReader()
-            else:
-                reader = vtk.vtkXMLPolyDataReader()
-
-            reader.SetFileName(input_path)
-            reader.Update()
-            polydata = reader.GetOutput()
-
-            lines = polydata.GetLines()
-            points = numpy_support.vtk_to_numpy(polydata.GetPoints().GetData())
-
-            streamlines = []
-            lines.InitTraversal()
-            id_list = vtk.vtkIdList()
-            while lines.GetNextCell(id_list):
-                n_pts = id_list.GetNumberOfIds()
-                sl = np.zeros((n_pts, 3))
-                for i in range(n_pts):
-                    sl[i] = points[id_list.GetId(i)]
-                streamlines.append(sl)
+            streamlines = _read_vtk_streamlines(input_path)
         else:
             logger.error(f"Error: Unsupported input format: {input_ext}")
             print(f"Error: Unsupported input format: {input_ext}", file=sys.stderr)
@@ -567,7 +561,24 @@ def main() -> None:
 
 
     """
-    # Parse Command Line Arguments
+    # Application version
+    try:
+        from tractedit_pkg import __version__ as _version
+    except Exception:
+        _version = "unknown"
+
+    # Handle --version before argparse to ensure proper multiline output
+    if "--version" in sys.argv or "-V" in sys.argv:
+        _sep = "=" * 60
+        print(_sep)
+        print("TractEdit ")
+        print(f"Version: {_version}")
+        print("Author: Marco Tagliaferri, PhD Candidate ")
+        print("Center for Mind/Brain Sciences (CIMeC), University of Trento, Italy")
+        print("https://github.com/marcotag93/TractEdit")
+        print(_sep)
+        sys.exit(0)
+
     parser = argparse.ArgumentParser(description="TractEdit - GUI")
     parser.add_argument(
         "bundle",
@@ -682,26 +693,114 @@ def main() -> None:
     except Exception as e:
         logger.warning(f"Could not load splash screen assets: {e}")
 
-    # VTK (goes first)
-    if splash:
-        splash.set_progress(10, "Initializing VTK System...")
-    logger.info("Initializing VTK...")
+    # ------------------------------------------------------------------
+    # Parallel Background Import (VTK+FURY / Nibabel+SciPy)
+    # ------------------------------------------------------------------
+    #   Lane 0 — VTK then FURY: FURY imports VTK internally, so they are
+    #             serialized by Python's per-module import lock regardless,
+    #             sharing a single thread
+    #   Lane 1 — Nibabel + TRX + SciPy: independent, running them sequentially in
+    #             one thread halves I/O and GIL contention.
+    # ------------------------------------------------------------------
+    import threading
+    import time
+    import numpy  # noqa: F401  — pre-warm before threads start
 
+    _lane_events: list[threading.Event] = [threading.Event(), threading.Event()]
+    _import_errors: list[Exception | None] = [None, None]
+
+    _LANE_VTK_FURY = 0
+    _LANE_NIB_SCIPY = 1
+
+    def _import_vtk_and_fury() -> None:
+        """Lane 0: VTK then FURY — sequential by dependency (FURY needs VTK)."""
+        try:
+            import vtk  # noqa: F811, F401
+            from vtk.util import numpy_support  # noqa: F401
+            import fury  # noqa: F401
+            from fury import actor, window, colormap  # noqa: F401
+        except Exception as exc:
+            _import_errors[_LANE_VTK_FURY] = exc
+        finally:
+            _lane_events[_LANE_VTK_FURY].set()
+
+    def _import_nibabel_and_scipy() -> None:
+        """Lane 1: Nibabel, TRX, and SciPy — all independent of VTK/FURY."""
+        try:
+            import nibabel  # noqa: F401
+            import nibabel.streamlines  # noqa: F401
+            import nibabel.streamlines.array_sequence  # noqa: F401
+            import nibabel.streamlines.tractogram  # noqa: F401
+            import nibabel.streamlines.trk  # noqa: F401
+            import nibabel.streamlines.tck  # noqa: F401
+            import trx.trx_file_memmap  # noqa: F401
+            from scipy.ndimage import gaussian_filter  # noqa: F401
+            from scipy.ndimage import binary_dilation  # noqa: F401
+            from scipy.special import sph_harm_y  # noqa: F401
+        except Exception as exc:
+            _import_errors[_LANE_NIB_SCIPY] = exc
+        finally:
+            _lane_events[_LANE_NIB_SCIPY].set()
+
+    for _target in [_import_vtk_and_fury, _import_nibabel_and_scipy]:
+        threading.Thread(target=_target, daemon=True).start()
+
+    if splash:
+        splash.set_progress(5, "Loading VTK / FURY / Nibabel...")
+
+    # Wait for Lane 1 (faster) while keeping the splash responsive
+    while not _lane_events[_LANE_NIB_SCIPY].is_set():
+        if splash:
+            QApplication.processEvents()
+        time.sleep(0.05)
+
+    if splash:
+        splash.set_progress(20, "Loading VTK / FURY...")
+
+    # Wait for Lane 0 (VTK + FURY — the long pole)
+    while not _lane_events[_LANE_VTK_FURY].is_set():
+        if splash:
+            QApplication.processEvents()
+        time.sleep(0.05)
+
+    if splash:
+        splash.set_progress(40, "Finalizing imports...")
+
+    logger.info("Background library imports complete.")
+
+    # QVTKRenderWindowInteractor needs both VTK and Qt
     try:
-        import vtk
+        from vtkmodules.qt.QVTKRenderWindowInteractor import (  # noqa: F401
+            QVTKRenderWindowInteractor,
+        )
+    except Exception as exc:
+        logger.warning("QVTKRenderWindowInteractor import failed: %s", exc)
 
-        out_window: vtk.vtkOutputWindow = vtk.vtkOutputWindow()
-        vtk.vtkOutputWindow.SetInstance(out_window)
-        vtk.vtkObject.GlobalWarningDisplayOff()
-        logger.info("VTK initialized successfully.")
-    except ImportError:
-        logger.warning("Warning: VTK not found.")
-    except Exception as e:
-        logger.warning(f"Warning: Error suppressing VTK output: {e}")
+    # Report any lane errors (non-fatal).
+    _lane_labels = ["VTK+FURY", "Nibabel+SciPy"]
+    for idx, err in enumerate(_import_errors):
+        if err is not None:
+            logger.warning(
+                "%s background import failed: %s", _lane_labels[idx], err
+            )
 
-    # Heavy imports
+    # Configure VTK on the main thread
+    if _import_errors[_LANE_VTK_FURY] is None:
+        try:
+            import vtk 
+
+            out_window = vtk.vtkOutputWindow()
+            vtk.vtkOutputWindow.SetInstance(out_window)
+            vtk.vtkObject.GlobalWarningDisplayOff()
+            logger.info("VTK initialized successfully.")
+        except Exception as e:
+            logger.warning("Error suppressing VTK output: %s", e)
+    else:
+        logger.warning("VTK import failed: %s", _import_errors[_LANE_VTK_FURY])
+
+    # Main Window import
     if splash:
-        splash.set_progress(30, "Loading Libraries...")
+        splash.set_progress(50, "Loading application modules...")
     logger.info("Loading main window module...")
 
     try:
@@ -712,54 +811,9 @@ def main() -> None:
         logger.error(f"Error importing necessary modules: {e}")
         sys.exit(1)
 
-    # Pre-compile Numba functions (while splash is visible)
-    if splash:
-        splash.set_progress(50, "Optimizing performance...")
-    logger.info("Warming up Numba JIT functions...")
-
-    try:
-        from tractedit_pkg.file_io import warmup_numba_functions
-
-        warmup_numba_functions()
-        logger.info("Numba warmup complete.")
-    except Exception as e:
-        logger.warning(f"Numba warmup failed (non-critical): {e}")
-
-    # Pre-import heavy libraries to speed up first bundle load
-    if splash:
-        splash.set_progress(60, "Pre-loading streamline libraries...")
-    logger.info("Pre-loading streamline libraries...")
-
-    try:
-        import nibabel.streamlines
-        import nibabel.streamlines.array_sequence
-        import nibabel.streamlines.tractogram
-        import nibabel.streamlines.trk
-        import nibabel.streamlines.tck
-        import trx.trx_file_memmap
-
-        logger.info("Streamline libraries pre-loaded.")
-    except Exception as e:
-        logger.warning(f"Library pre-load failed (non-critical): {e}")
-
-    # Warmup selection numba functions (sphere/box selection)
-    if splash:
-        splash.set_progress(65, "Optimizing selection tools...")
-    logger.info("Warming up selection Numba functions...")
-
-    try:
-        from tractedit_pkg.visualization.selection import (
-            warmup_selection_numba_functions,
-        )
-
-        warmup_selection_numba_functions()
-        logger.info("Selection warmup complete.")
-    except Exception as e:
-        logger.warning(f"Selection warmup failed (non-critical): {e}")
-
     # Main Window
     if splash:
-        splash.set_progress(70, "Building User Interface...")
+        splash.set_progress(75, "Building User Interface...")
     logger.info("Building main window UI...")
 
     main_window: MainWindow = MainWindow()

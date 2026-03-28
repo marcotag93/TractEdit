@@ -45,3 +45,7 @@ Desktop.ini
 *.log
 *.locals
 htmlcov/
+
+# AOT-compiled numerical extensions (built per-platform by CI)
+tractedit_pkg/_numba_aot/tractedit_numba*.pyd
+tractedit_pkg/_numba_aot/tractedit_numba*.so

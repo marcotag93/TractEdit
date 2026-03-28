@@ -76,6 +76,19 @@ class ThemeManager:
         except ValueError:
             self._current_mode = ThemeMode.SYSTEM
 
+    @staticmethod
+    def _calculate_luminance(color: QColor) -> float:
+        """
+        Calculates the perceived luminance of a color using ITU-R BT.601 weights.
+
+        Args:
+            color: The QColor to calculate luminance for.
+
+        Returns:
+            Luminance value between 0 (black) and 255 (white).
+        """
+        return 0.299 * color.red() + 0.587 * color.green() + 0.114 * color.blue()
+
     @property
     def current_mode(self) -> ThemeMode:
         """Returns the current theme mode."""
@@ -98,13 +111,7 @@ class ThemeManager:
             if app:
                 palette = app.palette()
                 bg_color = palette.color(QPalette.ColorRole.Window)
-                # If background luminance is low, it's a dark theme
-                luminance = (
-                    0.299 * bg_color.red()
-                    + 0.587 * bg_color.green()
-                    + 0.114 * bg_color.blue()
-                )
-                return luminance < 128
+                return self._calculate_luminance(bg_color) < 128
             return False
 
     def set_theme(self, mode: ThemeMode) -> None:
@@ -379,13 +386,7 @@ class ThemeManager:
         if app:
             palette = app.palette()
             bg_color = palette.color(QPalette.ColorRole.Window)
-            # Calculate luminance to determine if dark or light
-            luminance = (
-                0.299 * bg_color.red()
-                + 0.587 * bg_color.green()
-                + 0.114 * bg_color.blue()
-            )
-            is_system_dark = luminance < 128
+            is_system_dark = self._calculate_luminance(bg_color) < 128
         else:
             is_system_dark = False
 
@@ -538,8 +539,8 @@ class ThemeManager:
                                 child.setStyleSheet(
                                     f"font-weight: bold; color: {label_color};"
                                 )
-                        except Exception:
-                            pass
+                        except (AttributeError, RuntimeError):
+                            logger.debug("Failed to update sphere radius label style.")
 
         # Update slider style
         if hasattr(mw, "brush_size_slider"):

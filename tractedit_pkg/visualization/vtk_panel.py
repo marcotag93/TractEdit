@@ -46,7 +46,7 @@ from . import coordinates
 
 logger = logging.getLogger(__name__)
 
-
+##TODO - to refactor 
 # ============================================================================
 # VTK Panel Class
 # ============================================================================
@@ -254,7 +254,7 @@ class VTKPanel:
         self.orientation_widget: Optional[vtk.vtkOrientationMarkerWidget] = None
         self.orientation_labels: List[vtk.vtkTextActor] = []
 
-        # --- Crosshair Actors ---
+        # Crosshair Actors 
         self.axial_crosshair_actor: Optional[vtk.vtkActor] = None
         self.coronal_crosshair_actor: Optional[vtk.vtkActor] = None
         self.sagittal_crosshair_actor: Optional[vtk.vtkActor] = None
@@ -294,25 +294,28 @@ class VTKPanel:
         )  # Key: path, Val: {'axial':, 'coronal':, 'sagittal':}
 
         self.roi_highlight_actor: Optional[vtk.vtkActor] = None
+        # Cyan contour rendered on the keeper set during inversion mode.
+        # Color: #05B8CC → VTK (0.020, 0.722, 0.800)
+        self.invert_contour_actor: Optional[vtk.vtkActor] = None
 
         self.scalar_bar_actor: Optional[vtk.vtkScalarBarActor] = None
 
-        # --- Scene Manager (handles camera, crosshairs, UI labels) ---
+        # Scene Manager (handles camera, crosshairs, UI labels)
         self.scene_manager: SceneManager = SceneManager(self)
 
-        # --- Drawing Manager (handles ROI drawing operations) ---
+        # Drawing Manager (handles ROI drawing operations)
         self.drawing_manager: DrawingManager = DrawingManager(self)
 
-        # --- Selection Manager (handles streamline selection) ---
+        # Selection Manager (handles streamline selection) 
         self.selection_manager: SelectionManager = SelectionManager(self)
 
-        # --- Streamlines Manager (handles streamline visualization) ---
+        # Streamlines Manager (handles streamline visualization)
         self.streamlines_manager: StreamlinesManager = StreamlinesManager(self)
 
-        # --- Scale Bar Manager (handles 2D view scale bars) ---
+        # Scale Bar Manager (handles 2D view scale bars)
         self.scale_bar_manager: ScaleBarManager = ScaleBarManager()
 
-        # --- Fast Render Mode State ---
+        # Fast Render Mode State
         # Reduces rendering quality during mouse interactions for smoother UX
         # VTK DesiredUpdateRate: HIGHER = faster rendering (lower quality)
         #                        LOWER = slower rendering (higher quality)
@@ -322,7 +325,7 @@ class VTKPanel:
             30.0  # High = fast/low quality during interaction
         )
 
-        # --- Overlay Progress Bar ---
+        # Overlay Progress Bar 
         self.overlay_progress_bar = QProgressBar(self.vtk_widget)
         self.overlay_progress_bar.setStyleSheet(
             """
@@ -341,7 +344,7 @@ class VTKPanel:
         )
         self.overlay_progress_bar.hide()
 
-        # --- Slice Navigation State ---
+        # Slice Navigation State
         self.current_slice_indices: Dict[str, Optional[int]] = {
             "x": None,
             "y": None,
@@ -363,7 +366,7 @@ class VTKPanel:
 
         self._create_scene_ui()
 
-        # --- Setup Interaction Callbacks ---
+        # Setup Interaction Callbacks 
         self.interactor.AddObserver(
             vtk.vtkCommand.KeyPressEvent, self.key_press_callback, 1.0
         )
@@ -377,9 +380,10 @@ class VTKPanel:
             vtk.vtkCommand.KeyPressEvent, self.key_press_callback, 1.0
         )
 
-        # --- Fast Render Mode Observers (3D view only) ---
-        # VTK events fire opposite to expected: StartInteraction = mouse released,
-        # EndInteraction = mouse pressed. So we swap the handlers.
+        # Fast Render Mode Observers (3D view only)
+        # In this Qt/VTK build the interaction events fire opposite to their names:
+        # StartInteractionEvent = mouse released, EndInteractionEvent = mouse pressed.
+        # Handlers are intentionally swapped to match observed runtime behaviour.
         self.interactor.AddObserver(
             vtk.vtkCommand.StartInteractionEvent,
             lambda obj, event: self._disable_fast_render(),
@@ -389,7 +393,7 @@ class VTKPanel:
             lambda obj, event: self._enable_fast_render(),
         )
 
-        # --- Initialize VTK Widget ---
+        # Initialize VTK Widget 
         self.vtk_widget.Initialize()
         self.vtk_widget.Start()
 
@@ -446,33 +450,70 @@ class VTKPanel:
         """
         self.streamlines_manager.update_roi_highlight_actor()
 
+    def update_invert_contour(self) -> None:
+        """Build the cyan keeper-contour actor for inversion mode.
+
+        Called immediately after the inversion set difference is computed.
+        Delegates to StreamlinesManager, following the same pattern as
+        ``update_roi_highlight_actor()``.
+        """
+        self.streamlines_manager.update_invert_contour()
+
+    def clear_invert_contour(self) -> None:
+        """Remove the cyan keeper-contour actor from the scene.
+
+        Safe to call when no contour actor exists.
+        """
+        if self.invert_contour_actor is not None:
+            try:
+                self.scene.rm(self.invert_contour_actor)
+            except (ValueError, AttributeError):
+                pass
+            self.invert_contour_actor = None
+
+    def clear_highlight(self) -> None:
+        """Remove the yellow selection-highlight actor from the scene.
+
+        Unlike ``update_highlight()``, this method does *not* rebuild the
+        actor — it only removes it.  This is required in the large-inversion
+        code path: the secondary guard inside ``update_highlight()`` returns
+        early (to avoid RAM exhaustion) without removing any pre-existing
+        yellow actor, so a stale highlight would otherwise remain visible.
+        """
+        if self.highlight_actor is not None:
+            try:
+                self.scene.rm(self.highlight_actor)
+            except (ValueError, AttributeError):
+                pass
+            self.highlight_actor = None
+
+    @staticmethod
+    def _is_render_window_ready(render_window) -> bool:
+        """Check whether a VTK render window is initialised and safe to render.
+
+        Guards against ``GetInteractor()`` returning ``None``, which would
+        cause an ``AttributeError`` on the chained ``.GetInitialized()`` call.
+        """
+        if render_window is None:
+            return False
+        interactor = render_window.GetInteractor()
+        return interactor is not None and interactor.GetInitialized()
+
     def _render_all(self) -> None:
         """Renders all four VTK windows if they are initialized."""
         try:
-            if (
-                self.render_window
-                and self.render_window.GetInteractor().GetInitialized()
-            ):
+            if self._is_render_window_ready(self.render_window):
                 self.render_window.Render()
-            if (
-                self.axial_render_window
-                and self.axial_render_window.GetInteractor().GetInitialized()
-            ):
+            if self._is_render_window_ready(self.axial_render_window):
                 self.axial_render_window.Render()
-            if (
-                self.coronal_render_window
-                and self.coronal_render_window.GetInteractor().GetInitialized()
-            ):
+            if self._is_render_window_ready(self.coronal_render_window):
                 self.coronal_render_window.Render()
-            if (
-                self.sagittal_render_window
-                and self.sagittal_render_window.GetInteractor().GetInitialized()
-            ):
+            if self._is_render_window_ready(self.sagittal_render_window):
                 self.sagittal_render_window.Render()
-        except Exception as e:
+        except (RuntimeError, AttributeError) as e:
             logger.warning(f"Warning: Error during _render_all: {e}")
 
-    # --- Fast Render Mode Methods ---
+    # Fast Render Mode Methods 
     def _on_interaction_start(self, obj: vtk.vtkObject, event: str) -> None:
         """Called when user starts rotating/panning/zooming the 3D view."""
         self._enable_fast_render()
@@ -503,20 +544,17 @@ class VTKPanel:
             if prop:
                 prop.SetInterpolationToFlat()
 
-        ## TODO - this might not work well on some configurations (integrated GPUs), or cause visual artifacts.
-        # will be moved to Settings, allowing user to disable it if needed ##
+        ## TODO - move this to Settings, allowing user to disable it if needed 
         # Disable antialiasing
         if self.render_window:
             self.render_window.SetMultiSamples(0)
 
             # In theory, VTK should be able to scale depending on the GPU capabilities (integrated and dedicated), but seems odd.
-            ## TODO - this might not work well on some configurations (integrated GPUs), or cause visual artifacts.
-            # GPU Pre-Warm: Force an immediate render to wake up the GPU
-            # This eliminates the 1-2 second stutter when starting interaction after the GPU has been idle
+            ## TODO - this might not work well on some configurations (integrated GPUs)
             try:
                 self.render_window.Render()
-            except Exception:
-                pass  # Ignore any errors during pre-warm
+            except RuntimeError:
+                logger.debug("VTK render failed during GPU pre-warm.")
 
     def _disable_fast_render(self) -> None:
         """
@@ -543,7 +581,7 @@ class VTKPanel:
             self.render_window.SetMultiSamples(4)
 
         # Force immediate high-quality re-render
-        if self.render_window and self.render_window.GetInteractor().GetInitialized():
+        if self._is_render_window_ready(self.render_window):
             self.render_window.Render()
 
     def update_odf_actor(
@@ -588,6 +626,10 @@ class VTKPanel:
             if extent is not None:
                 self.odf_actor.display_extent(*extent)
 
+            # Mark geometry as static — the ODF tunnel is read-only once
+            # built, so VTK can skip modified-time checks and reuse GPU buffers.
+            self.odf_actor.GetMapper().StaticOn()
+
             self.scene.add(self.odf_actor)
 
             # Optional: Add to 2D scenes if we want them visible there too (heavy on performance and bit messy)
@@ -598,7 +640,7 @@ class VTKPanel:
             self.render_window.Render()
             self.update_status("ODF Glyphs updated.")
 
-        except Exception as e:
+        except (RuntimeError, ValueError, AttributeError) as e:
             logger.error(f"Error creating ODF actor: {e}", exc_info=True)
             self.update_status("Error creating ODF actor.")
 
@@ -634,7 +676,7 @@ class VTKPanel:
             # Just trigger a render - data is already updated in memory
             # The VTK actors will use the updated numpy array reference
             self._render_all()
-        except Exception as e:
+        except (RuntimeError, AttributeError) as e:
             logger.error(f"Error in fast ROI update: {e}", exc_info=True)
 
     def _update_drawing_preview(self, scene: window.Scene) -> None:
@@ -658,8 +700,8 @@ class VTKPanel:
                 for scn in scenes_to_check:
                     try:
                         scn.rm(act)
-                    except Exception:
-                        pass
+                    except (ValueError, RuntimeError):
+                        logger.debug("Failed to remove actor from scene.")
 
     def _adjust_sphere_radius(self, delta: float, view_type: str = "axial") -> None:
         """Adjusts the radius of the last created sphere. Delegates to DrawingManager."""
@@ -704,8 +746,8 @@ class VTKPanel:
                                 real_input = input_conn.GetProducer().GetOutput()
                                 if isinstance(real_input, vtk.vtkImageData):
                                     self._update_vtk_image_scalars(real_input, data)
-                except Exception:
-                    pass
+                except (AttributeError, RuntimeError):
+                    logger.debug("Failed to traverse VTK pipeline for ROI data update.")
 
     def _update_vtk_image_scalars(
         self, image_data: vtk.vtkImageData, numpy_data: np.ndarray
@@ -720,7 +762,6 @@ class VTKPanel:
             numpy_data = np.ascontiguousarray(numpy_data)
 
         # Create VTK array
-        # Note: assuming the numpy array shape matches the image dimensions
         vtk_array = numpy_support.numpy_to_vtk(
             num_array=numpy_data.ravel(), deep=True, array_type=vtk.VTK_UNSIGNED_CHAR
         )
@@ -757,10 +798,7 @@ class VTKPanel:
         self._render_all()
 
         # Explicitly render sagittal window
-        if (
-            self.sagittal_render_window
-            and self.sagittal_render_window.GetInteractor().GetInitialized()
-        ):
+        if self._is_render_window_ready(self.sagittal_render_window):
             self.sagittal_render_window.Render()
 
     def _show_2d_context_menu(
@@ -800,6 +838,33 @@ class VTKPanel:
     def _setup_ortho_cameras(self) -> None:
         """Sets the cameras for the 2D views to be orthogonal."""
         self.scene_manager.setup_ortho_cameras()
+
+    def _initialize_3d_camera(self) -> None:
+        """Position the 3D camera to frame the anatomical image properly.
+
+        Lets VTK compute optimal centering from all slice actor bounds,
+        then overrides the viewing angle to an anterior-facing coronal view.
+        """
+        if not self.scene or not self.coronal_slice_actor:
+            return
+
+        # Let VTK center on the visible geometry (all 3 slice actors)
+        self.scene.reset_camera()
+
+        cam = self.scene.GetActiveCamera()
+        fp = cam.GetFocalPoint()
+
+        # Compute camera distance from the image extent
+        bounds = self.coronal_slice_actor.GetBounds()
+        extent_x = abs(bounds[1] - bounds[0])
+        extent_z = abs(bounds[5] - bounds[4])
+        max_extent = max(extent_x, extent_z)
+
+        # Override to anterior-facing coronal view (looking from +Y toward -Y)
+        cam.SetPosition(fp[0], fp[1] + max_extent * 2.0, fp[2])
+        cam.SetViewUp(0, 0, 1)
+
+        self.scene.reset_clipping_range()
 
     def _update_axial_camera(self, reset_zoom_pan: bool = False) -> None:
         """Updates the axial 2D camera to follow its slice."""
@@ -860,12 +925,9 @@ class VTKPanel:
             full_message = f"Status: {prefix}{message}{status_suffix}"
             self.status_text_actor.SetInput(str(full_message))
 
-            if (
-                self.render_window
-                and self.render_window.GetInteractor().GetInitialized()
-            ):
+            if self._is_render_window_ready(self.render_window):
                 self.render_window.Render()
-        except Exception as e:
+        except (RuntimeError, ValueError, AttributeError) as e:
             logger.error(f"Error updating status text actor:", exc_info=e)
 
     def update_progress_bar(
@@ -923,8 +985,7 @@ class VTKPanel:
         prop = self.radius_actor.GetProperty()
         prop.SetColor(0.2, 0.5, 1.0)
         prop.SetOpacity(0.3)
-        prop.SetRepresentationToWireframe()
-        prop.SetLineWidth(1.0)
+        prop.SetRepresentationToSurface()
         self.scene.add(self.radius_actor)
         self.current_radius_actor_radius = radius
         self.radius_actor.SetVisibility(0)
@@ -994,11 +1055,7 @@ class VTKPanel:
         elif self.radius_actor is not None:
             needs_render = self._update_existing_radius_actor(None, None, visible)
 
-        if (
-            needs_render
-            and self.render_window
-            and self.render_window.GetInteractor().GetInitialized()
-        ):
+        if needs_render and self._is_render_window_ready(self.render_window):
             self.render_window.Render()
 
     # Anatomical Slice Actor Management
@@ -1077,17 +1134,16 @@ class VTKPanel:
         self.clear_anatomical_slices(reset_state=False)
 
         try:
-            # Determine Value Range
-            img_min = np.min(image_data)
-            img_max = np.max(image_data)
-
-            if not np.isfinite(img_min) or not np.isfinite(img_max):
-                logger.warning("Image contains non-finite values. Clamping range.")
-                finite_data = image_data[np.isfinite(image_data)]
-                if finite_data.size > 0:
-                    img_min, img_max = np.min(finite_data), np.max(finite_data)
-                else:
-                    img_min, img_max = 0.0, 1.0
+            # Determine Value Range using percentile-based windowing
+            #   min = 5th percentile
+            #   max = 99th percentile, then expanded by 20%
+            finite_data = image_data[np.isfinite(image_data)]
+            if finite_data.size > 0:
+                img_min = float(np.percentile(finite_data, 5))
+                img_max = float(np.percentile(finite_data, 99))
+                img_max = img_max + (img_max - img_min) / 5.0
+            else:
+                img_min, img_max = 0.0, 1.0
 
             # Ensure range has distinct min/max
             if img_max <= img_min:
@@ -1126,7 +1182,7 @@ class VTKPanel:
             )
             if self.axial_scene:
                 self.axial_scene.add(self.axial_slice_actor_2d)
-                # X-flip: Convert FURY's neurological output to radiological display convention
+                # Radiological convention: mirror X so patient-left appears on screen-right
                 self.axial_slice_actor_2d.SetScale(-1, 1, 1)
 
             # Coronal Slice (Y plane)
@@ -1155,7 +1211,7 @@ class VTKPanel:
             )
             if self.coronal_scene:
                 self.coronal_scene.add(self.coronal_slice_actor_2d)
-                # X-flip: Convert FURY's neurological output to radiological display convention
+                # Radiological convention: mirror X so patient-left appears on screen-right
                 self.coronal_slice_actor_2d.SetScale(-1, 1, 1)
 
             # Sagittal Slice (X plane)
@@ -1193,13 +1249,14 @@ class VTKPanel:
             logger.error(error_msg, exc_info=True)
             QMessageBox.critical(self.main_window, "Slice Actor TypeError", error_msg)
             self.clear_anatomical_slices()
-        except Exception as e:
+        except (RuntimeError, ValueError, AttributeError) as e:
             error_msg = f"Error during anatomical slice actor creation/addition: {e}"
             logger.error(error_msg, exc_info=True)
             QMessageBox.critical(self.main_window, "Slice Actor Error", error_msg)
             self.clear_anatomical_slices()
 
         self._setup_ortho_cameras()
+        self._initialize_3d_camera()
 
         # Initialize scale bars for 2D views
         try:
@@ -1212,7 +1269,7 @@ class VTKPanel:
                 sagittal_camera=self.sagittal_scene.GetActiveCamera(),
             )
             self.scale_bar_manager.update_all()
-        except Exception as e:
+        except (RuntimeError, ValueError, AttributeError) as e:
             logger.warning(f"Failed to initialize scale bars: {e}")
 
         # Final render
@@ -1260,7 +1317,7 @@ class VTKPanel:
                     scene_changed = True
                 except (ValueError, AttributeError):
                     pass
-                except Exception as e:
+                except RuntimeError as e:
                     logger.error(f"Error removing slice actor: {e}", exc_info=True)
 
         # Reset actor references
@@ -1579,7 +1636,7 @@ class VTKPanel:
                                     new_roi_z,
                                 )
 
-                    except Exception as e:
+                    except (RuntimeError, ValueError, KeyError) as e:
                         logger.error(f"Error updating ROI layer {key} slice: {e}")
 
             self._create_or_update_crosshairs()
@@ -1595,7 +1652,7 @@ class VTKPanel:
             # Update status and render
             self._render_all()
 
-        except Exception as e:
+        except (RuntimeError, ValueError, KeyError, AttributeError) as e:
             error_msg = f"Error in set_slice_indices: {e}"
             logger.error(error_msg, exc_info=True)
 
@@ -1635,7 +1692,7 @@ class VTKPanel:
 
             else:
                 self.main_window.update_ras_coordinate_display(None)
-        except Exception as e:
+        except (ValueError, IndexError, np.linalg.LinAlgError, AttributeError) as e:
             logger.error(f"Error updating RAS coordinate display: {e}")
             self.main_window.update_ras_coordinate_display(None)
 
@@ -1687,7 +1744,7 @@ class VTKPanel:
             # Update the status bar and text input
             self._update_slow_slice_components()
 
-        except Exception as e:
+        except (ValueError, IndexError, np.linalg.LinAlgError, TypeError) as e:
             self.update_status(f"Error setting slice from RAS: {e}")
             logger.error(f"Error setting slice from RAS:", exc_info=True)
 
@@ -1726,7 +1783,11 @@ class VTKPanel:
             return
 
         # Get the 3D position of the pick
-        world_pos = picker.GetPickPosition()
+        world_pos = list(picker.GetPickPosition())
+
+        # Reverse the effect of SetScale(-1, 1, 1) applied to 2D radiological actors
+        if interactor in (self.axial_interactor, self.coronal_interactor):
+            world_pos[0] = -world_pos[0]
 
         try:
             # Convert this world coordinate back to a (float) voxel coordinate
@@ -1780,7 +1841,7 @@ class VTKPanel:
             else:
                 self.set_slice_indices(x=new_x, y=new_y, z=new_z)
 
-        except Exception as e:
+        except (ValueError, IndexError, np.linalg.LinAlgError, RuntimeError) as e:
             logger.error(f"Error during 2D window click navigation:", exc_info=True)
             self.update_status("Error navigating with click.")
 
@@ -1815,12 +1876,16 @@ class VTKPanel:
         """
         return self.streamlines_manager.get_streamline_actor_params()
 
-    def update_main_streamlines_actor(self) -> None:
+    def update_main_streamlines_actor(self, force: bool = False) -> None:
         """
         Recreates the main actor using the skipped/strided dataset.
         Delegates to StreamlinesManager.
+
+        Args:
+            force: If True, bypasses the rebuild guard and forces a full
+                   actor rebuild regardless of cached state.
         """
-        self.streamlines_manager.update_main_streamlines_actor()
+        self.streamlines_manager.update_main_streamlines_actor(force=force)
 
     # Interaction Callbacks
     def _handle_save_shortcut(self) -> None:
@@ -1835,7 +1900,7 @@ class VTKPanel:
             self.main_window._trigger_save_streamlines()
         except AttributeError:
             self.update_status("Error: Save function not found.")
-        except Exception as e:
+        except (OSError, RuntimeError, ValueError) as e:
             self.update_status(f"Error during save: {e}")
 
     def _handle_radius_change(self, increase: bool = True) -> None:
@@ -1870,13 +1935,27 @@ class VTKPanel:
             min_point, max_point, check_all
         )
 
-    def _toggle_selection(self, indices_to_toggle: Set[int]) -> None:
-        """Toggles the selection state for given indices. Delegates to SelectionManager."""
-        self.selection_manager.toggle_selection(indices_to_toggle)
+    def _apply_selection(
+        self, indices_in_sphere: Set[int], deselect: bool = False
+    ) -> None:
+        """Apply a sphere selection result to the current selection. Delegates to SelectionManager.
 
-    def _handle_streamline_selection(self) -> None:
-        """Handles the logic for selecting streamlines. Delegates to SelectionManager."""
-        self.selection_manager.handle_streamline_selection()
+        Args:
+            indices_in_sphere: Set of streamline indices found within the sphere.
+            deselect: When ``True``, remove indices from the selection.
+                When ``False`` (default), add them.
+        """
+        self.selection_manager.apply_selection(indices_in_sphere, deselect=deselect)
+
+    def _handle_streamline_selection(self, deselect: bool = False) -> None:
+        """Handle sphere-based streamline selection. Delegates to SelectionManager.
+
+        Args:
+            deselect: When ``True`` (``Shift+S``), remove streamlines found
+                within the sphere from the current selection.  When ``False``
+                (default, ``S``), add them.
+        """
+        self.selection_manager.handle_streamline_selection(deselect=deselect)
 
     def _handle_inverse_selection(self) -> None:
         """Handles the logic for invert selection. Delegates to SelectionManager."""
@@ -1922,19 +2001,21 @@ class VTKPanel:
                 # (key, ctrl, shift) : (axis, direction)
                 ("up", False, False): ("z", 1),  # Axial Up
                 ("down", False, False): ("z", -1),  # Axial Down
-                ("right", False, False): ("x", 1),  # Sagittal Right
-                ("left", False, False): ("x", -1),  # Sagittal Left
                 ("up", True, False): ("y", 1),  # Coronal Up
                 ("down", True, False): ("y", -1),  # Coronal Down
             }
+            # Radiological convention: screen-right = anatomical-left = decreasing voxel X
+            slice_nav_handlers[("right", False, False)] = ("x", -1)
+            slice_nav_handlers[("left", False, False)] = ("x", 1)
             if handler_key in slice_nav_handlers:
                 axis, direction = slice_nav_handlers[handler_key]
                 self.move_slice(axis, direction)
                 return
 
-        # Handle Streamline-dependent keys
+        # Handle streamline-dependent keys.
+        # Note: "s" / "Shift+S" are handled separately below because they
+        # require modifier-aware dispatch (add-only vs deselect-in-sphere).
         streamline_data_handlers = {
-            "s": self._handle_streamline_selection,
             "i": self._handle_inverse_selection,
             "plus": lambda: self._handle_radius_change(increase=True),
             "equal": lambda: self._handle_radius_change(increase=True),
@@ -1954,6 +2035,27 @@ class VTKPanel:
 
         if key in streamline_data_handlers and not ctrl and not shift:
             streamline_data_handlers[key]()
+            # Trigger a render to ensure visual updates are displayed immediately.
+            if self.render_window:
+                self.render_window.Render()
+            # Block VTK's default key processing to prevent side effects
+            # (e.g., 'i' key might toggle internal VTK widget states).
+            interactor.SetKeyCode(chr(0))
+            return
+
+        # Handle S and Shift+S with modifier awareness.
+        #
+        # - S        (no modifier) : add-only — the selection can only grow.
+        # - Shift+S               : deselect-in-sphere — the selection can only shrink.
+        #
+        # Ctrl+S is already intercepted by ``non_data_handlers`` (Save As) and
+        # never reaches this point, so the ``not ctrl`` guard is a safety net only.
+        if key == "s" and not ctrl:
+            self._handle_streamline_selection(deselect=shift)
+            if self.render_window:
+                self.render_window.Render()
+            interactor.SetKeyCode(chr(0))
+            return
 
     # ROI Layer Actor Management
     def add_roi_layer(
@@ -2079,8 +2181,7 @@ class VTKPanel:
             self.coronal_scene.add(cor_2d)
             self.sagittal_scene.add(sag_2d)
 
-            # X-flip for axial/coronal ROI actors to match anatomical actors
-            # Anatomical actors have SetScale(-1, 1, 1) for radiological convention
+            # Radiological convention: match anatomical actors' SetScale(-1, 1, 1)
             ax_2d.SetScale(-1, 1, 1)
             cor_2d.SetScale(-1, 1, 1)
 
@@ -2158,7 +2259,7 @@ class VTKPanel:
                     contour_actor.SetVisibility(vis_flag)
                     self.scene.add(contour_actor)
                     self.roi_slice_actors[key]["contour_3d"] = contour_actor
-                except Exception as e:
+                except (RuntimeError, ValueError, AttributeError) as e:
                     logger.warning(f"Could not create 3D contour for ROI {key}: {e}")
 
             # Apply transformation ONLY to 2D actors
@@ -2177,7 +2278,7 @@ class VTKPanel:
             if render:
                 self._render_all()
 
-        except Exception as e:
+        except (RuntimeError, ValueError, AttributeError, KeyError) as e:
             logger.error(f"Error creating ROI slicer actors:", exc_info=True)
             QMessageBox.critical(
                 self.main_window,
@@ -2203,7 +2304,7 @@ class VTKPanel:
             actor_obj = roi_actors.get(actor_type)
             if actor_obj:
                 current_pos = actor_obj.GetPosition()
-                # X-flip: Convert FURY's neurological output to radiological display convention
+                # Radiological convention: mirror X for axial/coronal 2D actors
                 actor_obj.SetScale(-1, 1, 1)
 
                 # Adjustment for position
@@ -2266,8 +2367,8 @@ class VTKPanel:
                 for scn in scenes_to_check:
                     try:
                         scn.rm(act)
-                    except Exception:
-                        pass
+                    except (ValueError, RuntimeError):
+                        logger.debug("Failed to remove actor from scene.")
 
         del self.roi_slice_actors[key]
         self._render_all()
@@ -2295,8 +2396,8 @@ class VTKPanel:
                     for scn in scenes_to_check:
                         try:
                             scn.rm(act)
-                        except Exception:
-                            pass
+                        except (ValueError, RuntimeError):
+                            logger.debug("Failed to remove actor from scene.")
 
         self.roi_slice_actors.clear()
         self._render_all()
@@ -2470,7 +2571,7 @@ class VTKPanel:
             writer.Write()
             self.update_status(f"Screenshot saved: {os.path.basename(output_path)}")
 
-        except Exception as e:
+        except (RuntimeError, OSError, ValueError, AttributeError) as e:
             error_msg = f"Error taking screenshot:"
             logger.error(error_msg, exc_info=True)
             QMessageBox.critical(self.main_window, "Screenshot Error", error_msg)
@@ -2489,8 +2590,5 @@ class VTKPanel:
             if self.radius_actor:
                 self.radius_actor.SetVisibility(original_radius_actor_visibility)
 
-            if (
-                self.render_window
-                and self.render_window.GetInteractor().GetInitialized()
-            ):
+            if self._is_render_window_ready(self.render_window):
                 self.render_window.Render()

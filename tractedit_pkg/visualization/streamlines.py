@@ -21,7 +21,7 @@ import vtk
 from fury import actor, colormap
 from vtk.util import numpy_support
 
-from ..utils import ColorMode
+from ..utils import ColorMode, MAX_HIGHLIGHT_STREAMLINES
 
 if TYPE_CHECKING:
     from .vtk_panel import VTKPanel
@@ -96,13 +96,26 @@ class StreamlinesManager:
                 self.panel.main_window._update_action_states()
             return
 
+        # SAFETY GUARD: Building a VTK highlight actor allocates a flat point
+        # buffer that scales with |selection| × avg_points_per_streamline.
+        if len(selected_indices) > MAX_HIGHLIGHT_STREAMLINES:
+            logger.warning(
+                "update_highlight skipped: selection size %d exceeds "
+                "MAX_HIGHLIGHT_STREAMLINES=%d. Highlight actor not built.",
+                len(selected_indices),
+                MAX_HIGHLIGHT_STREAMLINES,
+            )
+            if self.panel.main_window:
+                self.panel.main_window._update_action_states()
+            return
+
         # Safely Remove Existing Highlight Actor
         if self.panel.highlight_actor is not None:
             try:
                 self.panel.scene.rm(self.panel.highlight_actor)
             except (ValueError, AttributeError):
                 pass
-            except Exception as e:
+            except (RuntimeError, AttributeError) as e:
                 logger.error(
                     f"  Error removing highlight actor: {e}. Proceeding cautiously."
                 )
@@ -124,72 +137,126 @@ class StreamlinesManager:
                     self.panel.main_window._update_action_states()
                 return
 
-            # Optimized: use ArraySequence internals if available
-            selected_sl_data_list = []
+            # Build highlight actor - use vectorized VTK polydata path when
+            # ArraySequence internals are available (same approach as the main
+            # actor fast path), falling back to FURY actor.line() otherwise.
             has_array_sequence = (
                 hasattr(tractogram, "_data")
                 and hasattr(tractogram, "_offsets")
                 and hasattr(tractogram, "_lengths")
             )
 
-            if has_array_sequence:
-                # FAST PATH: Direct array slicing
-                src_data = tractogram._data
-                src_offsets = tractogram._offsets
-                src_lengths = tractogram._lengths
+            try:
+                if has_array_sequence:
+                    # FAST PATH: Vectorized VTK polydata construction.
+                    # Bypasses FURY's Python-loop actor.line() entirely
+                    src_data = tractogram._data
+                    src_offsets = tractogram._offsets
+                    src_lengths = tractogram._lengths
 
-                for idx in valid_indices_arr:
-                    length = src_lengths[idx]
-                    if length > 0:
-                        start = src_offsets[idx]
-                        end = start + length
-                        sl = src_data[start:end].astype(np.float32, copy=False)
-                        selected_sl_data_list.append(sl)
-            else:
-                # SLOW PATH: Individual indexing
-                for idx in valid_indices_arr:
-                    try:
-                        sl = tractogram[idx]
-                        if sl is not None and len(sl) > 0:
-                            selected_sl_data_list.append(
-                                sl.astype(np.float32, copy=False)
+                    # Gather lengths via vectorized fancy indexing (no loop)
+                    hl_lengths = src_lengths[valid_indices_arr]
+
+                    # Filter out zero-length streamlines
+                    valid_mask = hl_lengths > 0
+                    hl_indices = valid_indices_arr[valid_mask]
+                    hl_lengths = hl_lengths[valid_mask]
+
+                    if len(hl_indices) == 0:
+                        if self.panel.main_window:
+                            self.panel.main_window._update_action_states()
+                        return
+
+                    # Compute cumulative destination offsets (N+1 entries)
+                    dst_offsets_arr = np.empty(len(hl_lengths) + 1, dtype=np.int64)
+                    dst_offsets_arr[0] = 0
+                    np.cumsum(hl_lengths, out=dst_offsets_arr[1:])
+                    total_points = int(dst_offsets_arr[-1])
+
+                    # Allocate flat output buffer and copy only the selected
+                    # streamlines' data via sequential contiguous memcpy.
+                    # This is faster than scatter-gather for typical selection sizes
+                    flat_points = np.empty((total_points, 3), dtype=np.float32)
+                    src_starts = src_offsets[hl_indices].astype(np.int64)
+                    dst_starts = dst_offsets_arr[:-1].astype(np.int64)
+                    sub_lengths = hl_lengths.astype(np.int64)
+                    for i in range(len(hl_indices)):
+                        s = int(src_starts[i])
+                        d = int(dst_starts[i])
+                        n = int(sub_lengths[i])
+                        flat_points[d : d + n] = src_data[s : s + n]
+
+                    # Build VTK polydata (yellow) and actor directly
+                    poly_data = self._build_polydata_direct(
+                        flat_points,
+                        hl_lengths,
+                        dst_offsets_arr,
+                        (1.0, 1.0, 0.0),  # yellow
+                        len(hl_indices),
+                    )
+                    hl_mapper = vtk.vtkPolyDataMapper()
+                    hl_mapper.SetInputData(poly_data)
+                    hl_mapper.ScalarVisibilityOn()
+                    hl_mapper.SetScalarModeToUsePointFieldData()
+                    hl_mapper.SelectColorArray("colors")
+                    hl_mapper.Update()
+                    hl_actor = vtk.vtkActor()
+                    hl_actor.SetMapper(hl_mapper)
+                    hl_actor.GetProperty().SetLineWidth(6)
+                    hl_actor.GetProperty().SetOpacity(1.0)
+                    self.panel.highlight_actor = hl_actor
+
+                else:
+                    # SLOW PATH: FURY fallback for non-ArraySequence data
+                    selected_sl_data_list = []
+                    for idx in valid_indices_arr:
+                        try:
+                            sl = tractogram[idx]
+                            if sl is not None and len(sl) > 0:
+                                selected_sl_data_list.append(
+                                    sl.astype(np.float32, copy=False)
+                                )
+                        except (IndexError, ValueError, TypeError):
+                            logger.debug(
+                                "Failed to extract streamline at index %d.", idx
                             )
-                    except Exception:
-                        pass
 
-            if selected_sl_data_list:  # Check if the list is not empty
-                try:
-                    highlight_linewidth = 6
+                    if not selected_sl_data_list:
+                        if self.panel.main_window:
+                            self.panel.main_window._update_action_states()
+                        return
+
                     self.panel.highlight_actor = actor.line(
-                        selected_sl_data_list,  # Pass the list
+                        selected_sl_data_list,
                         colors=(1, 1, 0),
-                        linewidth=highlight_linewidth,
+                        linewidth=6,
                         opacity=1.0,
                     )
-                    self.panel.scene.add(self.panel.highlight_actor)
 
-                    if (
-                        self.panel.main_window
-                        and not self.panel.main_window.bundle_is_visible
-                    ):
-                        self.panel.highlight_actor.SetVisibility(0)
+                self.panel.scene.add(self.panel.highlight_actor)
 
-                    if self.panel.highlight_actor:
-                        try:
-                            mapper = self.panel.highlight_actor.GetMapper()
-                            if mapper:
-                                mapper.SetResolveCoincidentTopologyToPolygonOffset()
-                                mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(
-                                    -1, -15
-                                )
-                        except Exception as e:
-                            logger.warning(
-                                f"Warning: Could not apply mapper offset to highlight_actor: {e}"
+                if (
+                    self.panel.main_window
+                    and not self.panel.main_window.bundle_is_visible
+                ):
+                    self.panel.highlight_actor.SetVisibility(0)
+
+                if self.panel.highlight_actor:
+                    try:
+                        mapper = self.panel.highlight_actor.GetMapper()
+                        if mapper:
+                            mapper.SetResolveCoincidentTopologyToPolygonOffset()
+                            mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(
+                                -1, -15
                             )
+                    except (RuntimeError, AttributeError) as e:
+                        logger.warning(
+                            f"Warning: Could not apply mapper offset to highlight_actor: {e}"
+                        )
 
-                except Exception as e:
-                    logger.error(f"Error creating highlight actor:", exc_info=True)
-                    self.panel.highlight_actor = None
+            except (RuntimeError, ValueError, AttributeError) as e:
+                logger.error(f"Error creating highlight actor:", exc_info=True)
+                self.panel.highlight_actor = None
 
         # Update UI action states
         if self.panel.main_window:
@@ -259,8 +326,8 @@ class StreamlinesManager:
         if self.panel.roi_highlight_actor:
             try:
                 self.panel.scene.rm(self.panel.roi_highlight_actor)
-            except Exception:
-                pass
+            except (ValueError, RuntimeError):
+                logger.debug("Failed to remove ROI highlight actor from scene.")
             self.panel.roi_highlight_actor = None
 
         if not self.panel.main_window or not self.panel.main_window.tractogram_data:
@@ -307,8 +374,8 @@ class StreamlinesManager:
                     sl = tractogram[idx]
                     if sl is not None and len(sl) > 0:
                         streamlines_list.append(sl.astype(np.float32, copy=False))
-                except Exception:
-                    pass
+                except (IndexError, ValueError, TypeError):
+                    logger.debug("Failed to extract streamline at index %d.", idx)
 
         if not streamlines_list:
             return
@@ -334,8 +401,112 @@ class StreamlinesManager:
 
             self.panel.render_window.Render()
 
-        except Exception as e:
+        except (RuntimeError, ValueError, AttributeError) as e:
             logger.error(f"Error creating ROI highlight actor: {e}")
+
+    def update_invert_contour(self) -> None:
+        """Build or remove the cyan keeper-contour actor for inversion mode.
+
+        Renders the pre-inversion keeper streamlines in cyan (#05B8CC) to give
+        the user spatial feedback about which streamlines will *survive* the
+        deletion.  The keeper set is always small (built with the sphere tool),
+        so the simple per-streamline loop used by ``update_roi_highlight_actor``
+        is perfectly adequate — no vectorised polydata path is needed.
+
+        The actor is only built when ``_inversion_active`` is True and
+        ``_inversion_keeper_indices`` is non-empty; otherwise any existing
+        contour actor is removed and the method returns.
+        """
+        if not self.panel.scene:
+            return
+
+        # Remove any existing contour actor before rebuilding.
+        if self.panel.invert_contour_actor is not None:
+            try:
+                self.panel.scene.rm(self.panel.invert_contour_actor)
+            except (ValueError, AttributeError):
+                pass
+            self.panel.invert_contour_actor = None
+
+        mw = self.panel.main_window
+        if not mw:
+            return
+
+        keeper_indices = mw._inversion_keeper_indices
+        if not keeper_indices or not mw._inversion_active:
+            return
+
+        tractogram = mw.tractogram_data
+        if not tractogram:
+            return
+
+        tractogram_len = len(tractogram)
+        valid_indices_arr = np.array(
+            [idx for idx in keeper_indices if 0 <= idx < tractogram_len],
+            dtype=np.int64,
+        )
+        if len(valid_indices_arr) == 0:
+            return
+
+        # Collect point arrays for each keeper streamline.
+        streamlines_list = []
+        has_array_sequence = (
+            hasattr(tractogram, "_data")
+            and hasattr(tractogram, "_offsets")
+            and hasattr(tractogram, "_lengths")
+        )
+
+        if has_array_sequence:
+            src_data = tractogram._data
+            src_offsets = tractogram._offsets
+            src_lengths = tractogram._lengths
+            for idx in valid_indices_arr:
+                length = src_lengths[idx]
+                if length > 0:
+                    start = src_offsets[idx]
+                    streamlines_list.append(
+                        src_data[start : start + length].astype(np.float32, copy=False)
+                    )
+        else:
+            for idx in valid_indices_arr:
+                try:
+                    sl = tractogram[idx]
+                    if sl is not None and len(sl) > 0:
+                        streamlines_list.append(sl.astype(np.float32, copy=False))
+                except (IndexError, ValueError, TypeError):
+                    logger.debug(
+                        "Failed to extract keeper streamline at index %d.", idx
+                    )
+
+        if not streamlines_list:
+            return
+
+        try:
+            # Cyan #05B8CC → VTK float (0.020, 0.722, 0.800).
+            self.panel.invert_contour_actor = actor.line(
+                streamlines_list,
+                colors=(0.020, 0.722, 0.800),
+                linewidth=8,
+                opacity=1.0,
+                depth_cue=False,
+            )
+            self.panel.scene.add(self.panel.invert_contour_actor)
+
+            # Polygon offset ensures the contour renders on top of the main
+            # bundle and the yellow highlight (same technique as the ROI actor).
+            mapper = self.panel.invert_contour_actor.GetMapper()
+            if mapper:
+                mapper.SetResolveCoincidentTopologyToPolygonOffset()
+                mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(-2, -20)
+
+            # Honour bundle-level visibility toggled by the user.
+            if not mw.bundle_is_visible:
+                self.panel.invert_contour_actor.SetVisibility(0)
+
+            self.panel.render_window.Render()
+        except (RuntimeError, ValueError, AttributeError) as e:
+            logger.error("Error creating invert contour actor: %s", e)
+            self.panel.invert_contour_actor = None
 
     def calculate_scalar_colors(
         self,
@@ -368,7 +539,7 @@ class StreamlinesManager:
             lut.SetTableRange(table_min, table_max)
             lut.SetHueRange(0.667, 0.0)  # Blue to Red (standard)
             lut.Build()
-        except Exception as e:
+        except (RuntimeError, ValueError) as e:
             logger.error(f"Error creating scalar LUT: {e}. Defaulting to grey.")
             return None  # Fallback to grey
 
@@ -396,7 +567,7 @@ class StreamlinesManager:
                         lut.GetColor(sl_scalars[j], rgb_output)
                         sl_colors_rgb[j] = [int(c * 255) for c in rgb_output]
                     has_valid_scalar_for_this_sl = True
-                except Exception:
+                except (TypeError, ValueError, IndexError):
                     has_valid_scalar_for_this_sl = False  # e.g., non-numeric data
 
             if not has_valid_scalar_for_this_sl:
@@ -488,7 +659,7 @@ class StreamlinesManager:
         params: Dict[str, Any] = {
             "colors": (0.8, 0.8, 0.8),
             "opacity": current_opacity,
-            "linewidth": 2,
+            "linewidth": 1,
         }
 
         if not self.panel.main_window or not self.panel.main_window.tractogram_data:
@@ -512,7 +683,7 @@ class StreamlinesManager:
             params["streamlines_list"] = []
             return params
 
-        # FAST PATH: Use ArraySequence internals for batch extraction
+        # FAST PATH: Vectorized batch extraction using AOT kernel
         has_array_sequence = (
             hasattr(tractogram, "_data")
             and hasattr(tractogram, "_offsets")
@@ -524,15 +695,65 @@ class StreamlinesManager:
             src_offsets = tractogram._offsets
             src_lengths = tractogram._lengths
 
-            visible_streamlines_list = []
-            for idx in subset_indices:
-                length = src_lengths[idx]
-                if length > 0:
-                    start = src_offsets[idx]
-                    end = start + length
-                    visible_streamlines_list.append(
-                        src_data[start:end].astype(np.float32, copy=False)
-                    )
+            # Gather lengths for the subset (vectorized fancy indexing)
+            subset_lengths = src_lengths[subset_indices]
+
+            # Filter out zero-length streamlines
+            valid_mask = subset_lengths > 0
+            subset_indices = subset_indices[valid_mask]
+            subset_lengths = subset_lengths[valid_mask]
+
+            if len(subset_indices) == 0:
+                params["streamlines_list"] = []
+                return params
+
+            # Compute destination offsets via cumsum
+            dst_offsets = np.empty(len(subset_lengths) + 1, dtype=np.int64)
+            dst_offsets[0] = 0
+            np.cumsum(subset_lengths, out=dst_offsets[1:])
+            total_points = int(dst_offsets[-1])
+
+            # Gather source offsets for the strided subset
+            src_starts = src_offsets[subset_indices].astype(np.int64)
+            sub_lengths = subset_lengths.astype(np.int64)
+
+            # Build flat float32 output buffer via vectorised scatter-gather.
+            #
+            #    The AOT copy_streamlines_chunk kernel requires float64 arrays,
+            #    which previously forced a full-tractogram dtype conversion
+            #    (np.ascontiguousarray(src_data, dtype=np.float64)) before a
+            #    single point was copied.
+            #
+            #      seg_ids[j]          : which subset-segment point j belongs to
+            #      local_offsets[j]    : offset of point j within that segment
+            #      src_point_indices[j]: absolute row in src_data for point j
+            seg_ids = np.repeat(
+                np.arange(len(sub_lengths), dtype=np.int64), sub_lengths
+            )
+            local_offsets = (
+                np.arange(total_points, dtype=np.int64) - dst_offsets[seg_ids]
+            )
+            src_point_indices = src_starts[seg_ids] + local_offsets
+
+            # Fancy-index the float32 source directly — no full-tractogram
+            # float64 conversion required.
+            flat_points_f32 = np.ascontiguousarray(
+                src_data[src_point_indices], dtype=np.float32
+            )
+
+            # Store flat buffer + metadata for direct VTK construction
+            params["_flat_points"] = flat_points_f32
+            params["_subset_lengths"] = subset_lengths
+            params["_dst_offsets"] = dst_offsets
+            params["_num_streamlines"] = len(subset_indices)
+            params["_subset_indices"] = subset_indices
+
+            # Build list view for backward compatibility with FURY path
+            # (zero-copy slicing into the flat buffer)
+            visible_streamlines_list = [
+                flat_points_f32[dst_offsets[i] : dst_offsets[i + 1]]
+                for i in range(len(subset_indices))
+            ]
         else:
             # SLOW PATH: Fall back to individual indexing
             visible_streamlines_list = [
@@ -543,7 +764,33 @@ class StreamlinesManager:
         current_mode = self.panel.main_window.current_color_mode
 
         if current_mode == ColorMode.ORIENTATION:
-            params["colors"] = colormap.line_colors(visible_streamlines_list)
+            if "_flat_points" in params:
+                # FAST PATH: Vectorized orientation color computation.
+                # Replicates FURY's colormap.line_colors() + orient2rgb()
+                flat_pts = params["_flat_points"]
+                sub_lengths = params["_subset_lengths"]
+                offsets = params["_dst_offsets"]
+
+                # Extract first and last point of each streamline
+                first_idx = offsets[:-1].astype(np.intp)
+                last_idx = (offsets[1:] - 1).astype(np.intp)
+                first_pts = flat_pts[first_idx]  # (N, 3)
+                last_pts = flat_pts[last_idx]  # (N, 3)
+
+                # Vectorized DEC orientation: |normalize(last - first)|
+                directions = last_pts - first_pts  # (N, 3)
+                norms = np.linalg.norm(directions, axis=1, keepdims=True)
+                norms = np.maximum(norms, 1e-8)  # guard against zero-length
+                orient_colors = np.abs(directions / norms)  # (N, 3) float in [0, 1]
+
+                # Expand per-streamline colors to per-point
+                colors_per_point = np.repeat(
+                    orient_colors.astype(np.float32), sub_lengths, axis=0
+                )
+                params["colors"] = colors_per_point
+            else:
+                # SLOW PATH: FURY's list-based orientation coloring
+                params["colors"] = colormap.line_colors(visible_streamlines_list)
             params["opacity"] = current_opacity
 
         elif current_mode == ColorMode.SCALAR:
@@ -622,7 +869,7 @@ class StreamlinesManager:
                     params["lut"] = lut
                     params["opacity"] = current_opacity
 
-                except Exception as e:
+                except (ValueError, IndexError, TypeError, RuntimeError) as e:
                     logger.error(
                         f"Error during vectorized scalar calculation: {e}",
                         exc_info=True,
@@ -632,14 +879,142 @@ class StreamlinesManager:
         params["streamlines_list"] = visible_streamlines_list
         return params
 
-    def update_main_streamlines_actor(self) -> None:
+    def _build_polydata_direct(
+        self,
+        flat_points: np.ndarray,
+        lengths: np.ndarray,
+        dst_offsets: np.ndarray,
+        colors: Any,
+        num_streamlines: int,
+    ) -> "vtk.vtkPolyData":
+        """Build vtkPolyData directly from flat arrays, bypassing FURY.
+
+        Constructs the VTK rendering data structure using fully vectorized
+        numpy operations.
+
+        Args:
+            flat_points: ``(TotalPoints, 3)`` float32 array of all vertices.
+            lengths: ``(N,)`` array of per-streamline point counts.
+            dst_offsets: ``(N+1,)`` cumulative offset array (int64).
+            colors: Per-point colors as ``(TotalPoints, 3)`` float32 or
+                uint8 array, or a uniform RGB tuple ``(r, g, b)`` with
+                values in [0, 1].
+            num_streamlines: Number of streamlines (used for validation).
+
+        Returns:
+            Fully configured ``vtkPolyData`` with points, lines, and
+            per-point color scalars.
+        """
+        total_points = len(flat_points)
+
+        # Points
+        vtk_points = vtk.vtkPoints()
+        vtk_points.SetData(
+            numpy_support.numpy_to_vtk(
+                np.ascontiguousarray(flat_points, dtype=np.float32),
+                deep=True,
+                array_type=vtk.VTK_FLOAT,
+            )
+        )
+
+        # Cell array (fully vectorized) 
+        # Connectivity is identity: [0, 1, 2, ..., total_points - 1]
+        connectivity = np.arange(total_points, dtype=np.int64)
+        offsets = np.ascontiguousarray(dst_offsets, dtype=np.int64)
+
+        vtk_offsets = numpy_support.numpy_to_vtk(
+            offsets, deep=True, array_type=vtk.VTK_ID_TYPE
+        )
+        vtk_conn = numpy_support.numpy_to_vtk(
+            connectivity, deep=True, array_type=vtk.VTK_ID_TYPE
+        )
+
+        cell_array = vtk.vtkCellArray()
+        cell_array.SetData(vtk_offsets, vtk_conn)
+
+        # Assemble PolyData
+        poly_data = vtk.vtkPolyData()
+        poly_data.SetPoints(vtk_points)
+        poly_data.SetLines(cell_array)
+
+        # Colors
+        # Handle three input formats:
+        #   - tuple (r, g, b) float [0,1] → uniform color for all points
+        #   - ndarray float32 [0,1]       → per-point, needs 255× conversion
+        #   - ndarray uint8 [0,255]        → per-point, ready to use
+        if isinstance(colors, tuple):
+            color_arr = np.empty((total_points, 3), dtype=np.uint8)
+            color_arr[:] = [int(c * 255) for c in colors]
+        elif isinstance(colors, np.ndarray) and colors.dtype == np.uint8:
+            color_arr = np.ascontiguousarray(colors)
+        elif isinstance(colors, np.ndarray):
+            color_arr = (np.ascontiguousarray(colors) * 255).astype(np.uint8)
+        else:
+            # Fallback: default grey
+            color_arr = np.full((total_points, 3), 204, dtype=np.uint8)
+
+        vtk_colors = numpy_support.numpy_to_vtk(
+            color_arr, deep=True, array_type=vtk.VTK_UNSIGNED_CHAR
+        )
+        vtk_colors.SetName("colors")
+        poly_data.GetPointData().SetScalars(vtk_colors)
+
+        return poly_data
+
+    def update_main_streamlines_actor(self, force: bool = False) -> None:
         """
         Recreates the main actor using the skipped/strided dataset.
         Handles both Line and Tube visualization.
+
+        Uses a rebuild guard to skip redundant rebuilds when no tracked
+        state has changed (visibility, stride, color mode, scalar,
+        tube mode, opacity).
+
+        Args:
+            force: If True, bypasses the rebuild guard and forces a full
+                   actor rebuild regardless of cached state.
         """
         try:
             if not self.panel.scene:
                 return
+
+            # Rebuild guard: skip if nothing changed
+            if not force and self.panel.main_window:
+                mw = self.panel.main_window
+                current_state = (
+                    mw._visibility_version,
+                    mw.render_stride,
+                    mw.current_color_mode,
+                    mw.active_scalar_name,
+                    getattr(mw, "render_as_tubes", False),
+                    getattr(mw, "bundle_opacity", 1.0),
+                )
+                cached_state = (
+                    mw._last_visibility_version,
+                    mw._last_render_stride,
+                    mw._last_color_mode,
+                    mw._last_active_scalar,
+                    mw._last_tube_mode,
+                    mw._last_bundle_opacity,
+                )
+                if current_state == cached_state and self.panel.streamlines_actor is not None:
+                    logger.debug(
+                        "Rebuild guard: skipping redundant actor rebuild "
+                        "(visibility_version=%d, stride=%d)",
+                        mw._visibility_version,
+                        mw.render_stride,
+                    )
+                    return  # Nothing changed, skip rebuild
+
+                # Update cache for next comparison
+                (
+                    mw._last_visibility_version,
+                    mw._last_render_stride,
+                    mw._last_color_mode,
+                    mw._last_active_scalar,
+                    mw._last_tube_mode,
+                    mw._last_bundle_opacity,
+                ) = current_state
 
             # Remove old actor
             if self.panel.streamlines_actor is not None:
@@ -652,7 +1027,7 @@ class StreamlinesManager:
                 self.panel.render_window.Render()
                 return
 
-            # Get Params (includes subsampled list)
+            # Get Params (includes subsampled list and flat buffer metadata)
             params = self.get_streamline_actor_params()
             sl_list = params.get("streamlines_list", [])
 
@@ -669,52 +1044,129 @@ class StreamlinesManager:
                 self.panel.render_window.Render()
                 return
 
-            # Geometry Logic
+            # Determine rendering mode
             use_tubes = getattr(self.panel.main_window, "render_as_tubes", False)
+            has_flat_buffer = "_flat_points" in params
 
-            # Define visual properties
-            colors = params.get("colors")
+            # Visual properties
+            colors = params.get("colors", (0.8, 0.8, 0.8))
             opacity = params.get("opacity", 0.5)
-
-            # Adaptive rendering for large datasets:
-            # - Large tractograms (>threshold): Use thinner lines to reduce GPU load
-            # - Small tractograms: Full quality with normal line width
-            # Note: default LOD is disabled as it conflicts with DesiredUpdateRate-based
-            #       fast render mode and causes visual artifacts
-            LARGE_DATASET_THRESHOLD = 19000
+            line_width = params.get("linewidth", 2)
             num_streamlines = len(sl_list)
+
+            # Large dataset flag for tube radius only (line width stays
+            # constant to avoid visual quality shifts when the rendered
+            # count crosses a threshold during deletions/undo).
+            LARGE_DATASET_THRESHOLD = 19000
             is_large_dataset = num_streamlines > LARGE_DATASET_THRESHOLD
 
-            # Use thinner lines for large datasets to reduce GPU load
-            if is_large_dataset:
-                line_width = 1  # Thinner lines for performance
-            else:
-                line_width = params.get("linewidth", 2)  # Normal width
-
             try:
-                if use_tubes:
-                    # Tube Rendering
-                    tube_radius = (
-                        0.15 if not is_large_dataset else 0.10
-                    )  # Thinner tubes for large datasets
+                if has_flat_buffer and not use_tubes:
+                    # ==========================================================
+                    # FAST PATH: Direct VTK construction (bypasses FURY)
+                    # ==========================================================
+                    flat_points = params["_flat_points"]
+                    lengths = params["_subset_lengths"]
+                    dst_offsets = params["_dst_offsets"]
+                    n_sl = params["_num_streamlines"]
 
-                    self.panel.streamlines_actor = actor.streamtube(
-                        sl_list,
-                        colors=colors,
-                        opacity=opacity,
-                        linewidth=tube_radius,
-                        lod=False,  # Explicitly disable LOD
+                    poly_data = self._build_polydata_direct(
+                        flat_points, lengths, dst_offsets, colors, n_sl
                     )
+
+                    # Build mapper (matching FURY's internal pattern)
+                    mapper = vtk.vtkPolyDataMapper()
+                    mapper.SetInputData(poly_data)
+                    mapper.ScalarVisibilityOn()
+                    mapper.SetScalarModeToUsePointFieldData()
+                    mapper.SelectColorArray("colors")
+                    mapper.Update()
+
+                    # Build actor
+                    self.panel.streamlines_actor = vtk.vtkActor()
+                    self.panel.streamlines_actor.SetMapper(mapper)
+                    self.panel.streamlines_actor.GetProperty().SetLineWidth(
+                        line_width
+                    )
+                    self.panel.streamlines_actor.GetProperty().SetOpacity(opacity)
+
+                elif use_tubes:
+                    tube_radius = 0.15 if not is_large_dataset else 0.10
+
+                    if has_flat_buffer:
+                        # ======================================================
+                        # FAST PATH: Direct VTK tube construction (bypasses FURY)
+                        # ======================================================
+                        flat_points = params["_flat_points"]
+                        lengths = params["_subset_lengths"]
+                        dst_offsets = params["_dst_offsets"]
+                        n_sl = params["_num_streamlines"]
+
+                        # Build line polydata using existing vectorized builder
+                        poly_data = self._build_polydata_direct(
+                            flat_points, lengths, dst_offsets, colors, n_sl
+                        )
+
+                        # Compute normals (matches FURY's streamtube pipeline)
+                        normals = vtk.vtkPolyDataNormals()
+                        normals.SetInputData(poly_data)
+                        normals.ComputeCellNormalsOn()
+                        normals.ComputePointNormalsOn()
+                        normals.ConsistencyOn()
+                        normals.AutoOrientNormalsOn()
+                        normals.Update()
+
+                        # Apply tube filter (C++ geometry generation)
+                        tube_filter = vtk.vtkTubeFilter()
+                        tube_filter.SetInputConnection(
+                            normals.GetOutputPort()
+                        )
+                        tube_filter.SetNumberOfSides(9)
+                        tube_filter.SetRadius(tube_radius)
+                        tube_filter.CappingOn()
+                        tube_filter.Update()
+
+                        # Build mapper
+                        mapper = vtk.vtkPolyDataMapper()
+                        mapper.SetInputConnection(
+                            tube_filter.GetOutputPort()
+                        )
+                        mapper.ScalarVisibilityOn()
+                        mapper.SetScalarModeToUsePointFieldData()
+                        mapper.SelectColorArray("colors")
+                        mapper.Update()
+
+                        # Build actor
+                        self.panel.streamlines_actor = vtk.vtkActor()
+                        self.panel.streamlines_actor.SetMapper(mapper)
+                        prop = self.panel.streamlines_actor.GetProperty()
+                        prop.SetInterpolationToPhong()
+                        prop.BackfaceCullingOn()
+                        prop.SetOpacity(opacity)
+
+                    else:
+                        # ======================================================
+                        # SLOW PATH: FURY fallback (non-ArraySequence data)
+                        # ======================================================
+                        self.panel.streamlines_actor = actor.streamtube(
+                            sl_list,
+                            colors=colors,
+                            opacity=opacity,
+                            linewidth=tube_radius,
+                            lod=False,
+                        )
                 else:
-                    # Line Rendering (Standard)
+                    # ==========================================================
+                    # SLOW PATH: Line rendering via FURY (fallback)
+                    # ==========================================================
                     self.panel.streamlines_actor = actor.line(
                         sl_list,
                         colors=colors,
                         opacity=opacity,
                         linewidth=line_width,
-                        lod=False,  # Explicitly disable LOD
+                        lod=False,
                     )
-            except Exception as e:
+            except (RuntimeError, ValueError, AttributeError) as e:
                 logger.error(
                     f"Error creating streamline actor (Tubes={use_tubes}): {e}"
                 )
@@ -730,6 +1182,6 @@ class StreamlinesManager:
             self.update_highlight()
             self.panel.render_window.Render()
 
-        except Exception as e:
+        except (RuntimeError, ValueError, IndexError, AttributeError, TypeError) as e:
             logger.error(f"Error in update_main_streamlines_actor: {e}", exc_info=True)
             self.panel.update_status("Error updating visualization.")

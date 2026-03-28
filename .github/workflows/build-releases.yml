@@ -145,8 +145,18 @@ jobs:
       - name: Install Python dependencies
         if: steps.check.outputs.should_build == 'true'
         run: |
-          poetry install --no-interaction --no-root
+          poetry install --with build --no-interaction --no-root
           poetry run pip install pyinstaller
+
+      - name: Build AOT numerical extension
+        if: steps.check.outputs.should_build == 'true'
+        shell: bash
+        env:
+          TRACTEDIT_AOT_TARGET_CPU: generic
+        run: |
+          poetry run python tractedit_pkg/_numba_aot/build_aot.py
+          # Verify the compiled module exists
+          python -c "import glob, sys; files = glob.glob('tractedit_pkg/_numba_aot/tractedit_numba.*'); print(f'AOT module: {files}'); sys.exit(0 if files else 1)"
 
       # ========== Build with PyInstaller ==========
       - name: Build with PyInstaller (Linux)

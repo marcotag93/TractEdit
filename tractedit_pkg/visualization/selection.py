@@ -5,7 +5,7 @@ Selection manager for TractEdit visualization.
 
 Handles streamline selection operations including sphere-based and
 box-based streamline finding using vectorized bounding box checks
-followed by precise geometric checks with parallel Numba processing.
+followed by precise geometric checks with parallel AOT-compiled processing.
 """
 
 # ============================================================================
@@ -15,12 +15,10 @@ followed by precise geometric checks with parallel Numba processing.
 from __future__ import annotations
 
 import logging
-from itertools import islice
 from typing import TYPE_CHECKING, List, Set
 
 import numpy as np
 import vtk
-from numba import njit, prange
 
 if TYPE_CHECKING:
     from .vtk_panel import VTKPanel
@@ -29,252 +27,26 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# Numba Optimized Functions
+# AOT-compiled functions (imported from pre-compiled extension)
 # ============================================================================
 
-
-@njit(nogil=True, cache=True)
-def _check_streamline_sphere_intersection(
-    streamline: np.ndarray,
-    center: np.ndarray,
-    radius_sq: float,
-) -> bool:
-    """
-    Numba-optimized check if a streamline intersects a sphere.
-
-    Checks both vertex distances and segment-to-center distances.
-
-    Args:
-        streamline: (N, 3) array of streamline points.
-        center: (3,) sphere center.
-        radius_sq: Squared radius of sphere.
-
-    Returns:
-        True if streamline intersects sphere.
-    """
-    n_pts = streamline.shape[0]
-    if n_pts == 0:
-        return False
-
-    # First check vertices (fast path)
-    for i in range(n_pts):
-        dx = streamline[i, 0] - center[0]
-        dy = streamline[i, 1] - center[1]
-        dz = streamline[i, 2] - center[2]
-        dist_sq = dx * dx + dy * dy + dz * dz
-        if dist_sq < radius_sq:
-            return True
-
-    # Check segments
-    for i in range(n_pts - 1):
-        # Segment from p1 to p2
-        p1x, p1y, p1z = streamline[i, 0], streamline[i, 1], streamline[i, 2]
-        p2x, p2y, p2z = streamline[i + 1, 0], streamline[i + 1, 1], streamline[i + 1, 2]
-
-        # Segment vector
-        seg_x = p2x - p1x
-        seg_y = p2y - p1y
-        seg_z = p2z - p1z
-
-        # Vector from p1 to center
-        pc_x = center[0] - p1x
-        pc_y = center[1] - p1y
-        pc_z = center[2] - p1z
-
-        # Segment length squared
-        seg_len_sq = seg_x * seg_x + seg_y * seg_y + seg_z * seg_z
-
-        if seg_len_sq == 0:
-            continue
-
-        # Project center onto segment line
-        t = (pc_x * seg_x + pc_y * seg_y + pc_z * seg_z) / seg_len_sq
-
-        # Clamp to segment
-        if t < 0:
-            t = 0.0
-        elif t > 1:
-            t = 1.0
-
-        # Closest point on segment
-        closest_x = p1x + t * seg_x
-        closest_y = p1y + t * seg_y
-        closest_z = p1z + t * seg_z
-
-        # Distance to center
-        dx = closest_x - center[0]
-        dy = closest_y - center[1]
-        dz = closest_z - center[2]
-        dist_sq = dx * dx + dy * dy + dz * dz
-
-        if dist_sq < radius_sq:
-            return True
-
-    return False
+from tractedit_pkg._numba_aot import (  # noqa: E402
+    check_streamline_sphere_intersection as _check_streamline_sphere_intersection,
+)
 
 
-@njit(parallel=True, nogil=True, cache=True)
-def _batch_check_sphere_intersection(
-    streamline_data: np.ndarray,
-    streamline_offsets: np.ndarray,
-    center: np.ndarray,
-    radius_sq: float,
-) -> np.ndarray:
-    """
-    Batch check multiple streamlines against a sphere using parallel execution.
+# _batch_check_sphere_intersection — AOT chunk + ThreadPool wrapper
+from tractedit_pkg._numba_aot._parallel_wrappers import (
+    batch_check_sphere_intersection as _batch_check_sphere_intersection,
+)
 
-    Args:
-        streamline_data: Flattened (N_total_points, 3) array of all streamline points.
-        streamline_offsets: (N_streamlines + 1,) array of start indices for each
-            streamline in streamline_data. The i-th streamline's points are at
-            streamline_data[offsets[i]:offsets[i+1]].
-        center: (3,) sphere center.
-        radius_sq: Squared radius of sphere.
-
-    Returns:
-        Boolean array of length (N_streamlines,) indicating intersection.
-    """
-    n_streamlines = len(streamline_offsets) - 1
-    results = np.zeros(n_streamlines, dtype=np.bool_)
-
-    for i in prange(n_streamlines):
-        start_idx = streamline_offsets[i]
-        end_idx = streamline_offsets[i + 1]
-
-        if end_idx <= start_idx:
-            continue
-
-        streamline = streamline_data[start_idx:end_idx]
-        results[i] = _check_streamline_sphere_intersection(
-            streamline, center, radius_sq
-        )
-
-    return results
+# _batch_check_box_intersection — AOT chunk + ThreadPool wrapper
+from tractedit_pkg._numba_aot._parallel_wrappers import (
+    batch_check_box_intersection as _batch_check_box_intersection,
+)
 
 
-@njit(parallel=True, nogil=True, cache=True)
-def _batch_check_box_intersection(
-    streamline_data: np.ndarray,
-    streamline_offsets: np.ndarray,
-    box_min: np.ndarray,
-    box_max: np.ndarray,
-) -> np.ndarray:
-    """
-    Batch check multiple streamlines against a box using parallel execution.
-
-    Args:
-        streamline_data: Flattened (N_total_points, 3) array of all streamline points.
-        streamline_offsets: (N_streamlines + 1,) array of start indices.
-        box_min: (3,) minimum corner of box.
-        box_max: (3,) maximum corner of box.
-
-    Returns:
-        Boolean array of length (N_streamlines,) indicating intersection.
-    """
-    n_streamlines = len(streamline_offsets) - 1
-    results = np.zeros(n_streamlines, dtype=np.bool_)
-
-    for i in prange(n_streamlines):
-        start_idx = streamline_offsets[i]
-        end_idx = streamline_offsets[i + 1]
-
-        if end_idx <= start_idx:
-            continue
-
-        # Check if any point in the streamline is inside the box
-        for j in range(start_idx, end_idx):
-            x, y, z = (
-                streamline_data[j, 0],
-                streamline_data[j, 1],
-                streamline_data[j, 2],
-            )
-            if (
-                x >= box_min[0]
-                and x <= box_max[0]
-                and y >= box_min[1]
-                and y <= box_max[1]
-                and z >= box_min[2]
-                and z <= box_max[2]
-            ):
-                results[i] = True
-                break
-
-    return results
-
-
-@njit(parallel=True, nogil=True, cache=True)
-def _copy_streamlines_parallel(
-    src_data: np.ndarray,
-    dst_data: np.ndarray,
-    src_starts: np.ndarray,
-    dst_starts: np.ndarray,
-    lengths: np.ndarray,
-) -> None:
-    """
-    Parallel copy of streamline data from source to destination buffer.
-
-    Uses Numba parallel execution to accelerate data preparation for
-    batch geometric checks.
-
-    Args:
-        src_data: Source array containing all streamline points.
-        dst_data: Pre-allocated destination array.
-        src_starts: Start indices in source for each streamline.
-        dst_starts: Start indices in destination for each streamline.
-        lengths: Number of points in each streamline.
-    """
-    n = len(lengths)
-    for i in prange(n):
-        src_start = src_starts[i]
-        dst_start = dst_starts[i]
-        length = lengths[i]
-        for j in range(length):
-            dst_data[dst_start + j, 0] = src_data[src_start + j, 0]
-            dst_data[dst_start + j, 1] = src_data[src_start + j, 1]
-            dst_data[dst_start + j, 2] = src_data[src_start + j, 2]
-
-
-def warmup_selection_numba_functions() -> None:
-    """
-    Pre-compiles selection-related Numba JIT functions with minimal dummy data.
-
-    This should be called during application startup to avoid JIT compilation
-    delay on first sphere/box selection operation.
-    """
-    # Minimal dummy data (5 streamlines, 3 points each)
-    dummy_data = np.zeros((15, 3), dtype=np.float64)
-    dummy_offsets = np.array([0, 3, 6, 9, 12, 15], dtype=np.int64)
-    dummy_center = np.array([0.0, 0.0, 0.0], dtype=np.float64)
-    dummy_box_min = np.array([-1.0, -1.0, -1.0], dtype=np.float64)
-    dummy_box_max = np.array([1.0, 1.0, 1.0], dtype=np.float64)
-
-    # Warmup sphere intersection check
-    try:
-        _batch_check_sphere_intersection(dummy_data, dummy_offsets, dummy_center, 1.0)
-    except Exception:
-        pass
-
-    # Warmup box intersection check
-    try:
-        _batch_check_box_intersection(
-            dummy_data, dummy_offsets, dummy_box_min, dummy_box_max
-        )
-    except Exception:
-        pass
-
-    # Warmup parallel copy
-    try:
-        dst_data = np.zeros((15, 3), dtype=np.float64)
-        src_starts = np.array([0, 3, 6, 9, 12], dtype=np.int64)
-        dst_starts = np.array([0, 3, 6, 9, 12], dtype=np.int64)
-        lengths = np.array([3, 3, 3, 3, 3], dtype=np.int64)
-        _copy_streamlines_parallel(
-            dummy_data, dst_data, src_starts, dst_starts, lengths
-        )
-    except Exception:
-        pass
-
-    logger.debug("Selection Numba functions warmed up")
+from ..utils import MAX_HIGHLIGHT_STREAMLINES
 
 
 # ============================================================================
@@ -284,7 +56,7 @@ def warmup_selection_numba_functions() -> None:
 
 def _prepare_batch_data_fast(tractogram, candidate_indices: np.ndarray) -> tuple:
     """
-    Prepare flattened streamline data and offsets for batch Numba processing.
+    Prepare flattened streamline data and offsets for batch AOT processing.
 
     Optimized version that leverages ArraySequence's internal _data and _offsets
     arrays for vectorized access when available.
@@ -348,7 +120,7 @@ def _prepare_batch_data_fast(tractogram, candidate_indices: np.ndarray) -> tuple
 
         total_points = int(lengths.sum())
 
-        # SMALL SET OPTIMIZATION: For very few candidates, skip Numba overhead
+        # SMALL SET OPTIMIZATION: For very few candidates, skip AOT overhead
         # and use simple concatenation instead
         if len(valid_candidates) < 20:
             # Simple concatenation for small sets (faster than parallel copy)
@@ -381,7 +153,6 @@ def _prepare_batch_data_fast(tractogram, candidate_indices: np.ndarray) -> tuple
 
             return streamline_data, offsets, full_valid_mask
 
-        # LARGE SET PATH: Use Numba parallel copy
         # Build output offsets
         out_offsets = np.zeros(n_candidates + 1, dtype=np.int64)
         valid_cumsum = np.cumsum(lengths)
@@ -390,28 +161,48 @@ def _prepare_batch_data_fast(tractogram, candidate_indices: np.ndarray) -> tuple
         valid_indices = np.where(valid_mask)[0]
         out_offsets[valid_indices + 1] = valid_cumsum
 
-        # Forward fill to create proper offset array
-        for i in range(1, n_candidates + 1):
-            if out_offsets[i] == 0 and i > 0:
-                out_offsets[i] = out_offsets[i - 1]
+        # Forward fill to create proper offset array (vectorized)
+        np.maximum.accumulate(out_offsets, out=out_offsets)
 
-        # Allocate output data
+        # Copy only the needed streamlines into a packed float64 buffer.
+        # Optimisation: merge *contiguous* source runs into large block copies
+        src_starts = src_offsets[valid_candidates].astype(np.int64)
+        src_ends = src_starts + lengths
+
+        # Destination starts (packed, no gaps)
+        dst_starts = np.empty(len(lengths), dtype=np.int64)
+        dst_starts[0] = 0
+        if len(lengths) > 1:
+            np.cumsum(lengths[:-1], out=dst_starts[1:])
+
+        # Detect contiguous runs: a break occurs when the next source
+        # start doesn't immediately follow the current source end.
+        if len(src_starts) > 1:
+            breaks = np.where(src_starts[1:] != src_ends[:-1])[0]
+        else:
+            breaks = np.empty(0, dtype=np.int64)
+
         streamline_data = np.empty((total_points, 3), dtype=np.float64)
 
-        # Vectorized copy using source offsets
-        src_starts = src_offsets[valid_candidates]
-        dst_starts = np.zeros(len(valid_candidates), dtype=np.int64)
-        if len(valid_cumsum) > 1:
-            dst_starts[1:] = valid_cumsum[:-1]
+        # Run boundaries
+        n_runs = len(breaks) + 1
+        run_starts = np.empty(n_runs, dtype=np.int64)
+        run_starts[0] = 0
+        if len(breaks) > 0:
+            run_starts[1:] = breaks + 1
+        run_ends_idx = np.empty(n_runs, dtype=np.int64)
+        if len(breaks) > 0:
+            run_ends_idx[:-1] = breaks + 1
+        run_ends_idx[-1] = len(valid_candidates)
 
-        # Parallel copy using Numba
-        _copy_streamlines_parallel(
-            np.ascontiguousarray(src_data, dtype=np.float64),
-            streamline_data,
-            src_starts.astype(np.int64),
-            dst_starts.astype(np.int64),
-            lengths.astype(np.int64),
-        )
+        for r in range(n_runs):
+            rs = int(run_starts[r])
+            re = int(run_ends_idx[r])
+            s_begin = int(src_starts[rs])
+            s_end = int(src_ends[re - 1])
+            d_begin = int(dst_starts[rs])
+            d_end = int(dst_starts[re - 1]) + int(lengths[re - 1])
+            streamline_data[d_begin:d_end] = src_data[s_begin:s_end]
 
         # Rebuild full valid_mask for all candidates
         full_valid_mask = np.zeros(n_candidates, dtype=np.bool_)
@@ -432,7 +223,8 @@ def _prepare_batch_data_fast(tractogram, candidate_indices: np.ndarray) -> tuple
                     point_counts[i] = 0
                 else:
                     point_counts[i] = len(sl)
-            except Exception:
+            except (IndexError, ValueError, TypeError):
+                logger.debug("Failed to extract streamline at index %d.", idx)
                 valid_mask[i] = False
                 point_counts[i] = 0
 
@@ -472,7 +264,7 @@ class SelectionManager:
 
     Provides sphere-based and box-based streamline finding with a two-phase
     approach: vectorized bounding box checks (broad phase) followed by
-    precise geometric checks (narrow phase) with parallel Numba processing.
+    precise geometric checks (narrow phase) with parallel AOT-compiled processing.
     """
 
     def __init__(self, vtk_panel: "VTKPanel") -> None:
@@ -485,8 +277,11 @@ class SelectionManager:
         self.panel = vtk_panel
         # Cached visible array for faster filtering
         self._cached_visible_array: np.ndarray = None
-        self._cached_visible_count: int = 0
-        self._cached_visible_hash: int = 0
+        self._cached_visibility_version: int = -1
+        # Reusable cell picker — avoids recreating the VTK object (and its
+        # internal cell locator structures) on every S key press.
+        self._cell_picker: vtk.vtkCellPicker = vtk.vtkCellPicker()
+        self._cell_picker.SetTolerance(0.005)
 
     def _filter_visible_candidates(
         self, candidate_indices: np.ndarray, check_all: bool
@@ -533,36 +328,30 @@ class SelectionManager:
         Returns:
             Sorted numpy array of visible streamline indices.
         """
-        visible_indices = self.panel.main_window.visible_indices
-        current_count = len(visible_indices)
+        mw = self.panel.main_window
+        visible_indices = mw.visible_indices
+        current_version = mw._visibility_version
 
-        if current_count == 0:
+        if len(visible_indices) == 0:
             return np.array([], dtype=np.int64)
-
-        # Use a quick hash based on a sample of indices to detect changes
-        # Use islice for efficient sampling without creating intermediate list
-        sample_hash = hash(frozenset(islice(visible_indices, 100)))
 
         if (
             self._cached_visible_array is None
-            or self._cached_visible_count != current_count
-            or self._cached_visible_hash != sample_hash
+            or self._cached_visibility_version != current_version
         ):
             # Rebuild cache
             self._cached_visible_array = np.fromiter(
-                visible_indices, dtype=np.int64, count=current_count
+                visible_indices, dtype=np.int64, count=len(visible_indices)
             )
             self._cached_visible_array.sort()
-            self._cached_visible_count = current_count
-            self._cached_visible_hash = sample_hash
+            self._cached_visibility_version = current_version
 
         return self._cached_visible_array
 
     def invalidate_visible_cache(self) -> None:
         """Invalidate the cached visible array, forcing rebuild on next use."""
         self._cached_visible_array = None
-        self._cached_visible_count = 0
-        self._cached_visible_hash = 0
+        self._cached_visibility_version = -1
 
     def find_streamlines_in_radius(
         self, center_point: np.ndarray, radius: float, check_all: bool = False
@@ -571,7 +360,7 @@ class SelectionManager:
         Find streamlines within a sphere using optimized batch processing.
 
         Uses vectorized bounding box checks (Broad Phase) followed by parallel
-        Numba-optimized geometric checks (Narrow Phase).
+        AOT-optimized geometric checks (Narrow Phase).
 
         When working with filtered tractograms, pre-filters to visible indices
         before the broad phase to avoid checking millions of irrelevant bboxes.
@@ -640,7 +429,7 @@ class SelectionManager:
                 final_mask = valid_mask & intersection_results
                 return set(valid_candidates[final_mask].tolist())
 
-        # --- STANDARD PATH: BROAD PHASE on all bboxes ---
+        # STANDARD PATH: BROAD PHASE on all bboxes
         # Used when check_all=True or visible count is large (>10% of total)
         overlap_mask = np.all(bboxes[:, 1] >= sphere_min, axis=1) & np.all(
             bboxes[:, 0] <= sphere_max, axis=1
@@ -654,7 +443,7 @@ class SelectionManager:
         if len(valid_candidates) == 0:
             return set()
 
-        # --- NARROW PHASE: Parallel Numba Geometric Check ---
+        # NARROW PHASE: Parallel AOT Geometric Check
         radius_sq = radius * radius
         center_c = np.ascontiguousarray(center_point, dtype=np.float64)
 
@@ -684,7 +473,7 @@ class SelectionManager:
         Find streamlines within a box using optimized batch processing.
 
         Uses vectorized bounding box checks (Broad Phase) followed by parallel
-        Numba-optimized point-in-box checks (Narrow Phase).
+        AOT-optimized point-in-box checks (Narrow Phase).
 
         When working with filtered tractograms, pre-filters to visible indices
         before the broad phase to avoid checking millions of irrelevant bboxes.
@@ -749,7 +538,7 @@ class SelectionManager:
                 final_mask = valid_mask & intersection_results
                 return set(valid_candidates[final_mask].tolist())
 
-        # --- STANDARD PATH: BROAD PHASE on all bboxes ---
+        # STANDARD PATH: BROAD PHASE on all bboxes
         # Used when check_all=True or visible count is large (>10% of total)
         overlap_mask = np.all(bboxes[:, 1] >= min_point, axis=1) & np.all(
             bboxes[:, 0] <= max_point, axis=1
@@ -763,7 +552,7 @@ class SelectionManager:
         if len(valid_candidates) == 0:
             return set()
 
-        # --- NARROW PHASE: Parallel Numba Point-in-Box Check ---
+        # NARROW PHASE: Parallel AOT Point-in-Box Check
         box_min_c = np.ascontiguousarray(min_point, dtype=np.float64)
         box_max_c = np.ascontiguousarray(max_point, dtype=np.float64)
 
@@ -786,54 +575,95 @@ class SelectionManager:
 
         return indices_in_box
 
-    def toggle_selection(self, indices_to_toggle: Set[int]) -> None:
-        """
-        Toggles the selection state for given indices and updates status/highlight.
+    def apply_selection(
+        self, indices_in_sphere: Set[int], deselect: bool = False
+    ) -> None:
+        """Apply a sphere selection result to the current selection set.
 
-        Uses deferred updates with debouncing for rapid consecutive operations
-        to prevent redundant actor rebuilds.
+        Depending on the ``deselect`` flag, this method either adds streamlines
+        to the selection (add-only mode) or removes them from it
+        (deselect-in-sphere mode).  Neither path can accidentally perform the
+        other's job:
+
+        - ``deselect=False`` (default, ``S`` key): performs a pure set union.
+          Streamlines already selected are silently ignored; the selection can
+          only grow.
+        - ``deselect=True`` (``Shift+S``): performs a pure set difference.
+          Streamlines not currently selected are silently ignored; the
+          selection can only shrink.
+
+        Both branches use a single C-level ``set`` operation (``update`` /
+        ``difference_update``), so there is no per-element Python loop and no
+        performance regression relative to the previous toggle implementation.
 
         Args:
-            indices_to_toggle: Set of streamline indices to toggle.
+            indices_in_sphere: Set of streamline indices found within the
+                selection sphere.
+            deselect: When ``True``, remove ``indices_in_sphere`` from the
+                current selection.  When ``False`` (default), add them.
         """
         if not self.panel.main_window or not hasattr(
             self.panel.main_window, "selected_streamline_indices"
         ):
             return
+
         current_selection: Set[int] = self.panel.main_window.selected_streamline_indices
         if current_selection is None:
-            self.panel.main_window.selected_streamline_indices = current_selection = (
-                set()
-            )
+            current_selection = set()
+            self.panel.main_window.selected_streamline_indices = current_selection
 
-        added_count, removed_count = 0, 0
-        for idx in indices_to_toggle:
-            if idx in current_selection:
-                current_selection.remove(idx)
-                removed_count += 1
-            else:
-                current_selection.add(idx)
-                added_count += 1
+        if deselect:
+            # Intersection first so ``removed_count`` reflects only indices
+            # that were actually present in the selection.
+            removed = indices_in_sphere & current_selection
+            # Save the delta BEFORE mutating
+            self.panel.main_window.state_manager.save_selection_change_for_undo(
+                added_indices=set(), removed_indices=removed
+            )
+            current_selection.difference_update(removed)
+            added_count = 0
+            removed_count = len(removed)
+        else:
+            # Difference first so ``added_count`` reflects only genuinely new
+            # indices (not those already present).
+            added = indices_in_sphere - current_selection
+            # Save the delta BEFORE mutating
+            self.panel.main_window.state_manager.save_selection_change_for_undo(
+                added_indices=added, removed_indices=set()
+            )
+            current_selection.update(added)
+            added_count = len(added)
+            removed_count = 0
+
+        total_selected = len(current_selection)
 
         if added_count > 0 or removed_count > 0:
-            total_selected = len(current_selection)
-            status_msg = (
-                f"Radius Sel: Found {len(indices_to_toggle)}. "
-                f"Added {added_count}, Removed {removed_count}. Total Sel: {total_selected}"
-            )
-            self.panel.update_status(status_msg)
-
-            # Always update highlight immediately for visual feedback
-            self.panel.update_highlight()
-        elif indices_to_toggle:
+            verb = "Deselected" if deselect else "Added"
+            n = removed_count if deselect else added_count
             self.panel.update_status(
-                f"Radius Sel: Found {len(indices_to_toggle)}. Selection unchanged."
+                f"Radius Sel: {verb} {n:,}. Total selected: {total_selected:,}"
+            )
+            self.panel.update_highlight()
+        elif indices_in_sphere:
+            action = "to deselect" if deselect else "to add"
+            self.panel.update_status(
+                f"Radius Sel: Found {len(indices_in_sphere):,} — "
+                f"none {action}. Total selected: {total_selected:,}"
             )
 
     def invert_selection(self) -> None:
-        """
-        Inverts the current selection based on visible streamlines.
+        """Invert the current selection against the set of visible streamlines.
+
         Selects all visible streamlines that are NOT currently selected.
+
+        The inversion itself is always computed (trivial set difference).
+        When the result exceeds ``MAX_HIGHLIGHT_STREAMLINES``, the yellow
+        highlight is suppressed to avoid RAM exhaustion, but a cyan contour
+        is always rendered on the (small) pre-inversion keeper set so the
+        user retains clear spatial feedback.
+
+        Pressing ``I`` a second time while inversion mode is active restores
+        the original keeper selection and exits inversion mode.
         """
         if (
             not self.panel.main_window
@@ -850,42 +680,90 @@ class SelectionManager:
             self.panel.update_status("Inverse Sel: No visible streamlines to select.")
             return
 
-        current_selection: Set[int] = self.panel.main_window.selected_streamline_indices
+        mw = self.panel.main_window
+        current_selection: Set[int] = mw.selected_streamline_indices
         if current_selection is None:
             current_selection = set()
-            self.panel.main_window.selected_streamline_indices = current_selection
+            mw.selected_streamline_indices = current_selection
 
-        # Convert to numpy array for fast set difference if possible, or sets
-        # Using sets for clarity and typical selection sizes
-        visible_set = set(visible_indices)
+        # --- Toggle: if already inverted, revert to the keeper set ---
+        if mw._inversion_active:
+            restored = mw._inversion_keeper_indices.copy()
+            current_selection.clear()
+            current_selection.update(restored)
 
-        # New selection = Visible - Currently Selected
-        # This will select everything visible that wasn't selected,
-        # and unselect everything that was selected (effectively, though we rewrite the set).
-        # Note: If there are selected items that are NOT visible (e.g. filtered out),
-        # should they remain selected? "Inverse" typically implies "swap state".
-        # If I am looking at a subset, "Inverse" usually means "Select the other part of this subset".
-        # So we should probably clearer: new_selection = Visible - (Visible & Current)
-        # effectively: new_selection = visible_set - current_selection
+            mw._inversion_active = False
+            mw._inversion_keeper_indices = set()
 
-        new_selection = visible_set - current_selection
+            self.panel.clear_invert_contour()
+            self.panel.update_highlight()
+            self.panel.update_status(
+                f"Inverse Sel: Reverted to original "
+                f"{len(current_selection):,} streamlines."
+            )
+            return
 
-        # Update the main set
-        # We replace the content of the set to maintain the reference if used elsewhere,
-        # or just reassign. Reassigning is safer if we own it.
-        # But 'selected_streamline_indices' is likely a set object on main_window.
-        # Let's clear and update to be safe and keep the object reference if it matters.
+        # --- First inversion: save keepers, compute set difference ---
+        if not current_selection:
+            self.panel.update_status("Inverse Sel: No current selection to invert.")
+            return
 
+        # Snapshot the pre-inversion (keeper) set before mutating.
+        keeper_indices: Set[int] = current_selection.copy()
+
+        # Set difference is O(|visible|) and negligible compared to actor build.
+        new_selection = visible_indices - current_selection
+
+        # Update in-place to preserve any external references to the set object.
         current_selection.clear()
         current_selection.update(new_selection)
 
-        self.panel.update_status(
-            f"Inverse Sel: Selected {len(current_selection)} streamlines."
-        )
-        self.panel.update_highlight()
+        count = len(current_selection)
 
-    def handle_streamline_selection(self) -> None:
-        """Handles the logic for selecting streamlines triggered by the 's' key."""
+        mw._inversion_active = True
+        mw._inversion_keeper_indices = keeper_indices
+
+        # Cyan contour on keepers is always cheap (keeper set is small).
+        self.panel.update_invert_contour()
+
+        if count > MAX_HIGHLIGHT_STREAMLINES:
+            self.panel.clear_highlight()
+            self.panel.update_status(
+                f"Inverse Sel: {count:,} streamlines selected "
+                f"(cyan contour shows {len(keeper_indices):,} keepers — "
+                f"press D to delete, I to revert)."
+            )
+            logger.info(
+                "Invert selection: %d streamlines selected; yellow highlight "
+                "suppressed (exceeds MAX_HIGHLIGHT_STREAMLINES=%d). "
+                "Cyan contour rendered for %d keepers.",
+                count,
+                MAX_HIGHLIGHT_STREAMLINES,
+                len(keeper_indices),
+            )
+            mw._update_action_states()
+        else:
+            # Cyan contour on keepers is the sole visual indicator during
+            # inversion — no yellow highlight regardless of bundle size.
+            self.panel.clear_highlight()
+            self.panel.update_status(
+                f"Inverse Sel: Selected {count:,} streamlines "
+                f"(cyan contour shows {len(keeper_indices):,} keepers)."
+            )
+            mw._update_action_states()
+
+    def handle_streamline_selection(self, deselect: bool = False) -> None:
+        """Handle the sphere-based streamline selection triggered by the ``S`` key.
+
+        A new sphere selection always exits inversion mode: the cyan contour is
+        removed and inversion state is cleared before the new selection is built.
+
+        Args:
+            deselect: When ``True`` (``Shift+S``), remove streamlines found
+                within the sphere from the current selection.  When ``False``
+                (default, ``S``), add them.  Corresponds to the two modes
+                implemented in :meth:`apply_selection`.
+        """
         if (
             not self.panel.scene
             or not self.panel.main_window
@@ -897,10 +775,22 @@ class SelectionManager:
             self.panel.update_radius_actor(visible=False)
             return
 
+        # Exit inversion mode before starting a fresh sphere selection.
+        # Crucially, ``selected_streamline_indices`` must be restored to the
+        # pre-inversion keeper set BEFORE clearing ``_inversion_keeper_indices``
+        mw = self.panel.main_window
+        if mw._inversion_active:
+            mw.selected_streamline_indices.clear()
+            mw.selected_streamline_indices.update(mw._inversion_keeper_indices)
+            mw._inversion_active = False
+            mw._inversion_keeper_indices = set()
+            self.panel.clear_invert_contour()
+
         display_pos = self.panel.interactor.GetEventPosition()
 
-        picker = vtk.vtkCellPicker()
-        picker.SetTolerance(0.005)
+        # Reuse the cached vtkCellPicker to avoid recreating the internal
+        # cell locator on every S press.
+        picker = self._cell_picker
         picker.Pick(
             display_pos[0],
             display_pos[1],
@@ -934,6 +824,5 @@ class SelectionManager:
             self.panel.update_status(
                 "Radius Sel: No streamlines found within radius at click position."
             )
-            self.toggle_selection(set())
         else:
-            self.toggle_selection(indices_in_radius)
+            self.apply_selection(indices_in_radius, deselect=deselect)

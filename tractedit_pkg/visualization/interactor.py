@@ -14,6 +14,8 @@ coronal, and sagittal slice views.
 from typing import TYPE_CHECKING
 import vtk
 
+from ..utils import signals_blocked
+
 if TYPE_CHECKING:
     from .vtk_panel import VTKPanel
 
@@ -115,19 +117,22 @@ class CustomInteractorStyle2D(vtk.vtkInteractorStyleImage):
         if self.vtk_panel:
             interactor = self.GetInteractor()
             is_ctrl = interactor.GetControlKey()
+            is_shift = interactor.GetShiftKey()
+
             if is_ctrl and getattr(self.vtk_panel, "is_sphere_mode", False):
-                # Determine view type
+                # Ctrl+scroll in sphere mode: adjust radius preview
                 view_type = "axial"
                 if interactor == self.vtk_panel.coronal_interactor:
                     view_type = "coronal"
                 elif interactor == self.vtk_panel.sagittal_interactor:
                     view_type = "sagittal"
-
-                # Update preview radius (increase by 0.5 mm)
                 self._adjust_preview_radius(0.5, view_type)
+            elif is_shift:
+                # Shift+scroll: navigate slices on the panel under the cursor
+                self._navigate_slice_by_scroll(interactor, direction=1)
             else:
+                # Plain scroll: zoom in/out
                 super().OnMouseWheelForward()
-                # Update scale bar after zoom
                 self._update_scale_bar_for_interactor(interactor)
         else:
             super().OnMouseWheelForward()
@@ -137,19 +142,22 @@ class CustomInteractorStyle2D(vtk.vtkInteractorStyleImage):
         if self.vtk_panel:
             interactor = self.GetInteractor()
             is_ctrl = interactor.GetControlKey()
+            is_shift = interactor.GetShiftKey()
+
             if is_ctrl and getattr(self.vtk_panel, "is_sphere_mode", False):
-                # Determine view type
+                # Ctrl+scroll in sphere mode: adjust radius preview
                 view_type = "axial"
                 if interactor == self.vtk_panel.coronal_interactor:
                     view_type = "coronal"
                 elif interactor == self.vtk_panel.sagittal_interactor:
                     view_type = "sagittal"
-
-                # Update preview radius (decrease by 0.5 mm)
                 self._adjust_preview_radius(-0.5, view_type)
+            elif is_shift:
+                # Shift+scroll: navigate slices on the panel under the cursor
+                self._navigate_slice_by_scroll(interactor, direction=-1)
             else:
+                # Plain scroll: zoom in/out
                 super().OnMouseWheelBackward()
-                # Update scale bar after zoom
                 self._update_scale_bar_for_interactor(interactor)
         else:
             super().OnMouseWheelBackward()
@@ -167,6 +175,29 @@ class CustomInteractorStyle2D(vtk.vtkInteractorStyleImage):
             self.vtk_panel.scale_bar_manager.update_view("coronal")
         elif interactor == self.vtk_panel.sagittal_interactor:
             self.vtk_panel.scale_bar_manager.update_view("sagittal")
+
+    def _navigate_slice_by_scroll(self, interactor, direction: int) -> None:
+        """
+        Navigate slices via Shift+scroll on the 2D panel under the cursor.
+
+        Determines which panel the interactor belongs to and moves the
+        orthogonal slice axis by one step in the given direction.
+
+        Args:
+            interactor: The VTK interactor that received the scroll event.
+            direction: +1 for forward scroll, -1 for backward scroll.
+        """
+        if not self.vtk_panel:
+            return
+
+        if interactor == self.vtk_panel.coronal_interactor:
+            axis = "y"
+        elif interactor == self.vtk_panel.sagittal_interactor:
+            axis = "x"
+        else:
+            axis = "z"
+
+        self.vtk_panel.move_slice(axis, direction)
 
     def _adjust_preview_radius(self, delta: float, view_type: str) -> None:
         """
@@ -220,9 +251,8 @@ class CustomInteractorStyle2D(vtk.vtkInteractorStyleImage):
 
         # Update spinbox to show current preview value
         if hasattr(mw, "sphere_radius_spinbox"):
-            mw.sphere_radius_spinbox.blockSignals(True)
-            mw.sphere_radius_spinbox.setValue(self._preview_radius)
-            mw.sphere_radius_spinbox.blockSignals(False)
+            with signals_blocked(mw.sphere_radius_spinbox):
+                mw.sphere_radius_spinbox.setValue(self._preview_radius)
 
         self.vtk_panel.update_status(
             f"(Preview) Radius: {self._preview_radius:.1f} mm - Release Ctrl to apply"

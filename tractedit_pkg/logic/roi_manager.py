@@ -22,7 +22,6 @@ from typing import TYPE_CHECKING, Set, Optional, List
 
 import numpy as np
 import nibabel as nib
-from numba import njit, prange
 from PyQt6.QtWidgets import (
     QApplication,
     QColorDialog,
@@ -31,6 +30,8 @@ from PyQt6.QtWidgets import (
     QMessageBox,
 )
 
+from ..utils import AUTO_SKIP_THRESHOLD, TARGET_RENDER_COUNT
+
 if TYPE_CHECKING:
     from ..main_window import MainWindow
 
@@ -38,72 +39,14 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# Numba Optimized Functions
+# AOT-compiled functions (imported from pre-compiled extension)
 # ============================================================================
 
 
-@njit(nogil=True, cache=True)
-def _check_streamline_roi_intersection(
-    streamline: np.ndarray,
-    R: np.ndarray,
-    T: np.ndarray,
-    roi_data: np.ndarray,
-    dims: np.ndarray,
-) -> bool:
-    """
-    Numba-optimized check if a single streamline intersects with ROI.
-
-    Args:
-        streamline: (N, 3) array of streamline points in world space.
-        R: (3, 3) rotation part of inverse affine.
-        T: (3,) translation part of inverse affine.
-        roi_data: 3D ROI volume.
-        dims: (3,) array of volume dimensions.
-
-    Returns:
-        True if streamline intersects ROI.
-    """
-    n_pts = streamline.shape[0]
-
-    for i in range(n_pts):
-        # Apply inverse affine: vox = point @ R.T + T
-        vx = (
-            streamline[i, 0] * R[0, 0]
-            + streamline[i, 1] * R[1, 0]
-            + streamline[i, 2] * R[2, 0]
-            + T[0]
-        )
-        vy = (
-            streamline[i, 0] * R[0, 1]
-            + streamline[i, 1] * R[1, 1]
-            + streamline[i, 2] * R[2, 1]
-            + T[1]
-        )
-        vz = (
-            streamline[i, 0] * R[0, 2]
-            + streamline[i, 1] * R[1, 2]
-            + streamline[i, 2] * R[2, 2]
-            + T[2]
-        )
-
-        # Round to nearest integer
-        ix = int(np.round(vx))
-        iy = int(np.round(vy))
-        iz = int(np.round(vz))
-
-        # Bounds check
-        if (
-            ix >= 0
-            and ix < dims[0]
-            and iy >= 0
-            and iy < dims[1]
-            and iz >= 0
-            and iz < dims[2]
-        ):
-            if roi_data[ix, iy, iz] > 0:
-                return True
-
-    return False
+# _check_streamline_roi_intersection — AOT-compiled (see _numba_aot/build_aot.py)
+from tractedit_pkg._numba_aot import (
+    check_streamline_roi_intersection as _check_streamline_roi_intersection,
+)
 
 
 # ============================================================================
@@ -202,16 +145,17 @@ class ROIManager:
 
             candidate_indices = np.where(overlap_mask)[0]
 
-            # NARROW PHASE: Numba-optimized Voxel Grid Check
+            # NARROW PHASE: AOT-optimized Voxel Grid Check
             intersecting: Set[int] = set()
 
-            # Pre-fetch affine components for Numba (ensure contiguous float64)
+            # Pre-fetch affine components for AOT kernel (ensure contiguous float64)
             T = np.ascontiguousarray(inv_affine[:3, 3], dtype=np.float64)
             R = np.ascontiguousarray(inv_affine[:3, :3], dtype=np.float64)
             dims_arr = np.array(dims[:3], dtype=np.int64)
 
-            # Ensure ROI data is contiguous for Numba
-            roi_data_c = np.ascontiguousarray(roi_data)
+            # AOT kernel expects uint8[:,:,::1]; loaded NIfTI ROIs may
+            # arrive as float64 or other dtypes — cast to uint8 safely.
+            roi_data_c = np.ascontiguousarray(roi_data, dtype=np.uint8)
 
             n_candidates = len(candidate_indices)
             for i, idx in enumerate(candidate_indices):
@@ -221,7 +165,7 @@ class ROIManager:
 
                 sl = mw.tractogram_data[idx]
 
-                # Use Numba-optimized check
+                # Use AOT-optimized check
                 sl_c = np.ascontiguousarray(sl, dtype=np.float64)
                 if _check_streamline_roi_intersection(sl_c, R, T, roi_data_c, dims_arr):
                     intersecting.add(idx)
@@ -233,7 +177,7 @@ class ROIManager:
             )
             return True
 
-        except Exception as e:
+        except (ValueError, IndexError, TypeError, RuntimeError) as e:
             logger.warning(f"Intersection Error: {e}")
             mw.vtk_panel.update_status("Intersection failed.")
             return False
@@ -312,7 +256,7 @@ class ROIManager:
 
         # Refresh Visuals
         self.update_roi_visual_selection()
-        self.apply_logic_filters()
+        self._apply_filters_with_skip_protection()
 
         # Refresh Panel Text (to show [TAG])
         mw._update_data_panel_display()
@@ -381,6 +325,7 @@ class ROIManager:
             final_indices = mw.manual_visible_indices
 
         mw.visible_indices = final_indices
+        mw._visibility_version += 1
 
         # Invalidate visible array cache since visibility changed
         if mw.vtk_panel and hasattr(mw.vtk_panel, "selection_manager"):
@@ -396,9 +341,40 @@ class ROIManager:
                     "No streamlines match current filters - remove filters to restore"
                 )
 
+        # Re-render with current stride (do NOT recalculate skip level).
+        # The rebuild guard handles deduplication.
         if mw.vtk_panel:
             mw.vtk_panel.update_main_streamlines_actor()
         mw._update_bundle_info_display()
+
+    def _apply_filters_with_skip_protection(self) -> None:
+        """Applies logic filters with automatic skip/stride recalculation.
+
+        For tractograms at or above AUTO_SKIP_THRESHOLD, the
+        user's manual skip-disable override is cleared and a conservative
+        pre-stride is applied before the filter pass to prevent a transient
+        stride-1 render from exhausting RAM.
+        """
+        mw = self.mw
+
+        if mw.tractogram_data is not None:
+            try:
+                total = len(mw.tractogram_data)
+            except TypeError:
+                total = 0
+
+            if total >= AUTO_SKIP_THRESHOLD:
+                mw._skip_user_disabled = False
+                approx_visible = len(mw.manual_visible_indices)
+                if approx_visible > TARGET_RENDER_COUNT:
+                    mw.render_stride = max(
+                        1, approx_visible // TARGET_RENDER_COUNT
+                    )
+                else:
+                    mw.render_stride = 1
+
+        self.apply_logic_filters()
+        mw._auto_calculate_skip_level()
 
     def change_roi_color_action(self, path: str) -> None:
         """Opens a color picker and updates the ROI layer color."""
@@ -446,57 +422,66 @@ class ROIManager:
             old_dir = os.path.dirname(old_path) if os.path.dirname(old_path) else ""
             new_path = os.path.join(old_dir, new_name) if old_dir else new_name
 
-            # Update all dictionaries
-            # roi_layers - store display_name for custom naming
-            layer_data = mw.roi_layers.pop(old_path)
+            # Collect values under old key before mutating any dictionary.
+            # This collect-then-swap pattern ensures that a mid-rename error
+            # does not leave some dictionaries updated and others stale.
+            layer_data = mw.roi_layers[old_path]
             layer_data["display_name"] = new_name
+
+            vis = mw.roi_visibility.get(old_path)
+            opa = mw.roi_opacities.get(old_path)
+            state = mw.roi_states.get(old_path)
+            cache = mw.roi_intersection_cache.get(old_path)
+
+            vtk_slice = None
+            vtk_sphere = None
+            vtk_rect = None
+            if mw.vtk_panel:
+                vtk_slice = mw.vtk_panel.roi_slice_actors.get(old_path)
+                vtk_sphere = mw.vtk_panel.sphere_params_per_roi.get(old_path)
+                vtk_rect = mw.vtk_panel.rectangle_params_per_roi.get(old_path)
+
+            # Swap phase: insert new key, then remove old key
             mw.roi_layers[new_path] = layer_data
+            if vis is not None:
+                mw.roi_visibility[new_path] = vis
+            if opa is not None:
+                mw.roi_opacities[new_path] = opa
+            if state is not None:
+                mw.roi_states[new_path] = state
+            if cache is not None:
+                mw.roi_intersection_cache[new_path] = cache
 
-            # roi_visibility
-            if old_path in mw.roi_visibility:
-                mw.roi_visibility[new_path] = mw.roi_visibility.pop(old_path)
+            if mw.vtk_panel:
+                if vtk_slice is not None:
+                    mw.vtk_panel.roi_slice_actors[new_path] = vtk_slice
+                if vtk_sphere is not None:
+                    mw.vtk_panel.sphere_params_per_roi[new_path] = vtk_sphere
+                if vtk_rect is not None:
+                    mw.vtk_panel.rectangle_params_per_roi[new_path] = vtk_rect
 
-            # roi_opacities
-            if old_path in mw.roi_opacities:
-                mw.roi_opacities[new_path] = mw.roi_opacities.pop(old_path)
-
-            # roi_states
-            if old_path in mw.roi_states:
-                mw.roi_states[new_path] = mw.roi_states.pop(old_path)
-
-            # roi_intersection_cache
-            if old_path in mw.roi_intersection_cache:
-                mw.roi_intersection_cache[new_path] = mw.roi_intersection_cache.pop(
-                    old_path
-                )
+            # Remove old keys only after all new keys are in place
+            mw.roi_layers.pop(old_path, None)
+            mw.roi_visibility.pop(old_path, None)
+            mw.roi_opacities.pop(old_path, None)
+            mw.roi_states.pop(old_path, None)
+            mw.roi_intersection_cache.pop(old_path, None)
+            if mw.vtk_panel:
+                mw.vtk_panel.roi_slice_actors.pop(old_path, None)
+                mw.vtk_panel.sphere_params_per_roi.pop(old_path, None)
+                mw.vtk_panel.rectangle_params_per_roi.pop(old_path, None)
 
             # Update current_drawing_roi if it was the renamed ROI
             if mw.current_drawing_roi == old_path:
                 mw.current_drawing_roi = new_path
 
-            # Update VTK panel
             if mw.vtk_panel:
-                if old_path in mw.vtk_panel.roi_slice_actors:
-                    mw.vtk_panel.roi_slice_actors[new_path] = (
-                        mw.vtk_panel.roi_slice_actors.pop(old_path)
-                    )
-
-                if old_path in mw.vtk_panel.sphere_params_per_roi:
-                    mw.vtk_panel.sphere_params_per_roi[new_path] = (
-                        mw.vtk_panel.sphere_params_per_roi.pop(old_path)
-                    )
-
-                if old_path in mw.vtk_panel.rectangle_params_per_roi:
-                    mw.vtk_panel.rectangle_params_per_roi[new_path] = (
-                        mw.vtk_panel.rectangle_params_per_roi.pop(old_path)
-                    )
-
                 mw.vtk_panel.update_status(f"Renamed: {current_name} -> {new_name}")
 
             mw._update_data_panel_display()
             mw._update_bundle_info_display()
 
-        except Exception as e:
+        except (KeyError, ValueError, AttributeError, RuntimeError) as e:
             logger.error(f"Error renaming ROI: {e}", exc_info=True)
             QMessageBox.warning(mw, "Rename Error", f"Failed to rename ROI: {e}")
 
@@ -530,7 +515,7 @@ class ROIManager:
             nib.save(nib.Nifti1Image(roi_data, roi_affine), save_path)
             if mw.vtk_panel:
                 mw.vtk_panel.update_status(f"Saved ROI to: {save_path}")
-        except Exception as e:
+        except (OSError, ValueError) as e:
             logger.error(f"Error saving ROI: {e}", exc_info=True)
             QMessageBox.critical(mw, "Save Error", f"Failed to save ROI: {e}")
 
@@ -540,14 +525,6 @@ class ROIManager:
 
         if path not in mw.roi_layers:
             return
-
-        # Check if this ROI had an active filter before removal
-        had_active_filter = False
-        if path in mw.roi_states:
-            state = mw.roi_states[path]
-            had_active_filter = state.get("include", False) or state.get(
-                "exclude", False
-            )
 
         # Remove from VTK
         if mw.vtk_panel:
@@ -577,7 +554,6 @@ class ROIManager:
         # Reset all drawing modes if:
         # 1. No ROIs left, OR
         # 2. The current drawing ROI was removed and any drawing mode is active
-        # This fixes the crosshair navigation bug on Windows
         should_reset_drawing = False
         if not mw.roi_layers:
             should_reset_drawing = True
@@ -595,26 +571,8 @@ class ROIManager:
         if should_reset_drawing and hasattr(mw, "drawing_modes_manager"):
             mw.drawing_modes_manager.reset_all_drawing_modes()
 
-        # Auto-enable skip toggle if ROI had active filter and skip is currently off
-        # This restores rendering performance after filter removal
-        if had_active_filter:
-            # Check if no other active filters remain
-            remaining_includes = [
-                p for p, s in mw.roi_states.items() if s.get("include")
-            ]
-            remaining_excludes = [
-                p for p, s in mw.roi_states.items() if s.get("exclude")
-            ]
-
-            if not remaining_includes and not remaining_excludes:
-                # No more ROI filters - check skip state
-                if hasattr(mw, "skip_checkbox") and not mw.skip_checkbox.isChecked():
-                    # Re-enable skip with auto-calculated level
-                    if hasattr(mw, "_auto_calculate_skip_level"):
-                        mw._auto_calculate_skip_level()
-
-        # Refresh
-        self.apply_logic_filters()
+        # Refresh with skip protection to prevent RAM exhaustion
+        self._apply_filters_with_skip_protection()
         mw._update_data_panel_display()
         mw._update_bundle_info_display()
 

@@ -64,7 +64,7 @@ class SceneManager:
             self.update_axial_camera(reset_zoom_pan=True)
             self.update_coronal_camera(reset_zoom_pan=True)
             self.update_sagittal_camera(reset_zoom_pan=True)
-        except Exception as e:
+        except (RuntimeError, ValueError, AttributeError) as e:
             logger.error(f"Error setting up ortho cameras: {e}")
 
     def update_axial_camera(self, reset_zoom_pan: bool = False) -> None:
@@ -105,7 +105,7 @@ class SceneManager:
                     )
 
             vp.axial_scene.reset_clipping_range()
-        except Exception as e:
+        except (RuntimeError, ValueError, AttributeError) as e:
             logger.error(f"Error updating axial camera: {e}")
 
     def update_coronal_camera(self, reset_zoom_pan: bool = False) -> None:
@@ -145,7 +145,7 @@ class SceneManager:
                     )
 
             vp.coronal_scene.reset_clipping_range()
-        except Exception as e:
+        except (RuntimeError, ValueError, AttributeError) as e:
             logger.error(f"Error updating coronal camera: {e}")
 
     def update_sagittal_camera(self, reset_zoom_pan: bool = False) -> None:
@@ -164,7 +164,9 @@ class SceneManager:
                     cam.SetParallelProjection(1)
                 fp = cam.GetFocalPoint()
                 dist = cam.GetDistance()
-                cam.SetPosition(fp[0] + dist, fp[1], fp[2])  # Was fp[0] - dist
+                cam.SetPosition(
+                    fp[0] + dist, fp[1], fp[2]
+                )  # View from Right (+X) to Left (-X)
                 cam.SetFocalPoint(fp[0], fp[1], fp[2])
                 cam.SetViewUp(0, 0, 1)  # Up is Z
             else:
@@ -194,7 +196,7 @@ class SceneManager:
                 and vp.sagittal_overlay_renderer
             ):
                 vp.sagittal_overlay_renderer.SetActiveCamera(cam)
-        except Exception as e:
+        except (RuntimeError, ValueError, AttributeError) as e:
             logger.error(f"Error updating sagittal camera: {e}")
 
     def reset_2d_view(self, view_type: str) -> None:
@@ -221,7 +223,7 @@ class SceneManager:
                 if vp.sagittal_render_window:
                     vp.sagittal_render_window.Render()
 
-        except Exception as e:
+        except (RuntimeError, ValueError, AttributeError) as e:
             logger.error(f"Error resetting 2D view ({view_type}): {e}")
 
     # =========================================================================
@@ -243,7 +245,7 @@ class SceneManager:
                     scn.rm(act)
                 except (ValueError, AttributeError):
                     pass
-                except Exception as e:
+                except (RuntimeError, AttributeError) as e:
                     logger.error(f"Error removing crosshair actor: {e}")
 
         # Remove sagittal crosshair from overlay renderer
@@ -254,7 +256,7 @@ class SceneManager:
         ):
             try:
                 vp.sagittal_overlay_renderer.RemoveActor(vp.sagittal_crosshair_actor)
-            except Exception as e:
+            except (RuntimeError, AttributeError) as e:
                 logger.error(f"Error removing sagittal crosshair actor: {e}")
 
         vp.axial_crosshair_actor = None
@@ -341,7 +343,7 @@ class SceneManager:
             if vp.sagittal_crosshair_actor:
                 vp.sagittal_crosshair_actor.Modified()
 
-        except Exception as e:
+        except (RuntimeError, ValueError, AttributeError) as e:
             logger.error(f"Error creating/updating crosshairs:", exc_info=True)
             self.clear_crosshairs()
 
@@ -368,6 +370,8 @@ class SceneManager:
         vp.axial_crosshair_actor.GetProperty().SetColor(1, 1, 0)  # Yellow
         vp.axial_crosshair_actor.GetProperty().SetLineWidth(1.0)
         vp.axial_crosshair_actor.GetProperty().SetOpacity(0.8)
+        # Radiological convention: match slice actor SetScale(-1, 1, 1)
+        vp.axial_crosshair_actor.SetScale(-1, 1, 1)
         vp.axial_scene.add(vp.axial_crosshair_actor)
 
         # --- Coronal ---
@@ -389,6 +393,8 @@ class SceneManager:
         vp.coronal_crosshair_actor.GetProperty().SetColor(1, 1, 0)
         vp.coronal_crosshair_actor.GetProperty().SetLineWidth(1.0)
         vp.coronal_crosshair_actor.GetProperty().SetOpacity(0.8)
+        # Radiological convention: match slice actor SetScale(-1, 1, 1)
+        vp.coronal_crosshair_actor.SetScale(-1, 1, 1)
         vp.coronal_scene.add(vp.coronal_crosshair_actor)
 
         # --- Sagittal ---
@@ -438,7 +444,7 @@ class SceneManager:
             vp.orientation_widget = actors.create_orientation_widget(
                 cube_actor, vp.interactor
             )
-        except Exception as e:
+        except (RuntimeError, ValueError, AttributeError) as e:
             logger.warning(f"Could not create 3D orientation cube: {e}")
 
         # 2D Orientation Labels
@@ -453,18 +459,18 @@ class SceneManager:
             if vp.axial_scene:
                 try:
                     vp.axial_scene.rm(label_actor)
-                except Exception:
-                    pass
+                except (ValueError, RuntimeError):
+                    logger.debug("Failed to remove label actor from axial scene.")
             if vp.coronal_scene:
                 try:
                     vp.coronal_scene.rm(label_actor)
-                except Exception:
-                    pass
+                except (ValueError, RuntimeError):
+                    logger.debug("Failed to remove label actor from coronal scene.")
             if vp.sagittal_scene:
                 try:
                     vp.sagittal_scene.rm(label_actor)
-                except Exception:
-                    pass
+                except (ValueError, RuntimeError):
+                    logger.debug("Failed to remove label actor from sagittal scene.")
         vp.orientation_labels = []
 
         # Axial View (A/P, R/L)

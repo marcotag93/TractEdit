@@ -88,7 +88,7 @@ def export_to_html(
         logger.info(f"HTML export complete: {output_path}")
         return True
 
-    except Exception as e:
+    except (OSError, ValueError, KeyError, AttributeError) as e:
         logger.error(f"HTML export failed: {e}", exc_info=True)
         return False
 
@@ -361,7 +361,7 @@ def _capture_slice_images(
                 b64_data = base64.b64encode(buffer.getvalue()).decode("ascii")
                 slices[name] = f"data:image/jpeg;base64,{b64_data}"
 
-            except Exception as e:
+            except (RuntimeError, ValueError, AttributeError, OSError) as e:
                 logger.warning(f"Failed to capture {name} slice: {e}")
 
     except ImportError:
@@ -446,7 +446,7 @@ def _collect_roi_data(
                         }
                     )
 
-        except Exception as e:
+        except (ValueError, IndexError, KeyError, AttributeError) as e:
             logger.warning(f"Failed to export ROI {roi_name}: {e}")
 
     return rois
@@ -476,7 +476,7 @@ def _generate_html(data: Dict[str, Any], options: Dict[str, Any]) -> str:
         streamlines_data = streamlines_json
         use_compression = False
 
-    ## TODO - this will be refactored a bit ##
+    ## TODO - to refactor
     # Generate HTML content
     html = f"""<!DOCTYPE html>
 <html lang="en">

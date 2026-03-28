@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Optional
 import numpy as np
 from PyQt6.QtCore import pyqtSlot
 
-from ..utils import ColorMode, SLIDER_PRECISION
+from ..utils import ColorMode, SLIDER_PRECISION, signals_blocked
 
 if TYPE_CHECKING:
     from ..main_window import MainWindow
@@ -121,7 +121,7 @@ class ScalarManager:
 
             self.update_scalar_range_widgets()
 
-        except Exception as e:
+        except (ValueError, IndexError, TypeError) as e:
             logger.warning(f"Error calculating scalar data range: {e}")
             mw.scalar_data_min = 0.0
             mw.scalar_data_max = 1.0
@@ -137,28 +137,23 @@ class ScalarManager:
             return
 
         # Block signals to prevent feedback loops
-        mw.scalar_min_spinbox.blockSignals(True)
-        mw.scalar_max_spinbox.blockSignals(True)
-        mw.scalar_min_slider.blockSignals(True)
-        mw.scalar_max_slider.blockSignals(True)
+        with signals_blocked(
+            mw.scalar_min_spinbox,
+            mw.scalar_max_spinbox,
+            mw.scalar_min_slider,
+            mw.scalar_max_slider,
+        ):
+            # Set the allowed range for the spinboxes
+            mw.scalar_min_spinbox.setRange(mw.scalar_data_min, mw.scalar_data_max)
+            mw.scalar_max_spinbox.setRange(mw.scalar_data_min, mw.scalar_data_max)
 
-        # Set the allowed range for the spinboxes
-        mw.scalar_min_spinbox.setRange(mw.scalar_data_min, mw.scalar_data_max)
-        mw.scalar_max_spinbox.setRange(mw.scalar_data_min, mw.scalar_data_max)
+            # Set the current values
+            mw.scalar_min_spinbox.setValue(mw.scalar_min_val)
+            mw.scalar_max_spinbox.setValue(mw.scalar_max_val)
 
-        # Set the current values
-        mw.scalar_min_spinbox.setValue(mw.scalar_min_val)
-        mw.scalar_max_spinbox.setValue(mw.scalar_max_val)
-
-        # Set the slider values
-        mw.scalar_min_slider.setValue(self.float_to_int_slider(mw.scalar_min_val))
-        mw.scalar_max_slider.setValue(self.float_to_int_slider(mw.scalar_max_val))
-
-        # Unblock signals
-        mw.scalar_min_spinbox.blockSignals(False)
-        mw.scalar_max_spinbox.blockSignals(False)
-        mw.scalar_min_slider.blockSignals(False)
-        mw.scalar_max_slider.blockSignals(False)
+            # Set the slider values
+            mw.scalar_min_slider.setValue(self.float_to_int_slider(mw.scalar_min_val))
+            mw.scalar_max_slider.setValue(self.float_to_int_slider(mw.scalar_max_val))
 
     def slider_value_changed(self, slider_val: int) -> None:
         """
@@ -170,25 +165,21 @@ class ScalarManager:
 
         if mw.sender() == mw.scalar_min_slider:
             mw.scalar_min_val = float_val
-            mw.scalar_min_spinbox.blockSignals(True)
-            mw.scalar_min_spinbox.setValue(float_val)
-            mw.scalar_min_spinbox.blockSignals(False)
+            with signals_blocked(mw.scalar_min_spinbox):
+                mw.scalar_min_spinbox.setValue(float_val)
             # Ensure min slider doesn't cross max slider
             if slider_val > mw.scalar_max_slider.value():
-                mw.scalar_max_slider.blockSignals(True)
-                mw.scalar_max_slider.setValue(slider_val)
-                mw.scalar_max_slider.blockSignals(False)
+                with signals_blocked(mw.scalar_max_slider):
+                    mw.scalar_max_slider.setValue(slider_val)
 
         elif mw.sender() == mw.scalar_max_slider:
             mw.scalar_max_val = float_val
-            mw.scalar_max_spinbox.blockSignals(True)
-            mw.scalar_max_spinbox.setValue(float_val)
-            mw.scalar_max_spinbox.blockSignals(False)
+            with signals_blocked(mw.scalar_max_spinbox):
+                mw.scalar_max_spinbox.setValue(float_val)
             # Ensure max slider doesn't cross min slider
             if slider_val < mw.scalar_min_slider.value():
-                mw.scalar_min_slider.blockSignals(True)
-                mw.scalar_min_slider.setValue(slider_val)
-                mw.scalar_min_slider.blockSignals(False)
+                with signals_blocked(mw.scalar_min_slider):
+                    mw.scalar_min_slider.setValue(slider_val)
 
     def spinbox_value_changed(self) -> None:
         """
@@ -238,9 +229,9 @@ class ScalarManager:
         # Update widgets
         self.update_scalar_range_widgets()
 
-        # Trigger Update
+        # Trigger Update (force=True: scalar range is not tracked by rebuild guard)
         if mw.vtk_panel and mw.current_color_mode == ColorMode.SCALAR:
-            mw.vtk_panel.update_main_streamlines_actor()
+            mw.vtk_panel.update_main_streamlines_actor(force=True)
             mw.vtk_panel.update_status(
                 f"Scalar range set to: [{min_val:.3f}, {max_val:.3f}]"
             )
@@ -256,18 +247,14 @@ class ScalarManager:
             return
 
         # Block signals to prevent _on_ras_coordinate_entered from firing
-        mw.ras_coordinate_input.blockSignals(True)
-
-        if ras_coords is not None and len(ras_coords) == 3:
-            display_x = -ras_coords[0]
-
-            coord_str = f"{display_x:.2f}, {ras_coords[1]:.2f}, {ras_coords[2]:.2f}"
-            mw.ras_coordinate_input.setText(coord_str)
-        else:
-            mw.ras_coordinate_input.setText("--, --, --")
-
-        # Unblock signals
-        mw.ras_coordinate_input.blockSignals(False)
+        with signals_blocked(mw.ras_coordinate_input):
+            if ras_coords is not None and len(ras_coords) == 3:
+                coord_str = (
+                    f"{ras_coords[0]:.2f}, {ras_coords[1]:.2f}, {ras_coords[2]:.2f}"
+                )
+                mw.ras_coordinate_input.setText(coord_str)
+            else:
+                mw.ras_coordinate_input.setText("--, --, --")
 
     @pyqtSlot()
     def on_ras_coordinate_entered(self) -> None:
@@ -296,13 +283,11 @@ class ScalarManager:
             if len(parts) != 3:
                 raise ValueError(f"Expected 3 coordinates, got {len(parts)}")
 
-            ras_x_input = float(parts[0])
+            ras_x = float(parts[0])
             ras_y = float(parts[1])
             ras_z = float(parts[2])
 
-            # Negate the X-coordinate
-            internal_ras_x = -ras_x_input
-            ras_coords = np.array([internal_ras_x, ras_y, ras_z])
+            ras_coords = np.array([ras_x, ras_y, ras_z])
 
             # Send to VTKPanel
             mw.vtk_panel.set_slices_from_ras(ras_coords)

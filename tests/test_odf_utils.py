@@ -127,6 +127,47 @@ class TestComputeShBasis:
         dc_values = B[:, 0]
         assert np.std(dc_values) < 0.01  # Should be nearly constant
 
+    def test_sh_basis_regression_values(self):
+        """SH basis values must match golden reference (guards sph_harm_y migration).
+
+        Golden values were captured from the verified sph_harm implementation
+        using axis-aligned unit vectors and one normalized diagonal vertex at
+        SH order 4 (15 coefficients covering l=0, 2, 4).
+        """
+        vertices = np.array([
+            [0.0, 0.0, 1.0],                                      # +Z pole
+            [1.0, 0.0, 0.0],                                      # +X equator
+            [0.0, 1.0, 0.0],                                      # +Y equator
+            [1.0 / np.sqrt(3), 1.0 / np.sqrt(3), 1.0 / np.sqrt(3)],  # diagonal
+        ], dtype=np.float64)
+
+        B = compute_sh_basis(vertices, sh_order=4)
+
+        # Significant (non-near-zero) golden values per row.
+        # Near-zero entries (~1e-16) are verified separately via atol only.
+        golden = np.array([
+            [0.28209479177387814, 0.0, 0.0, 0.63078313050504,
+             0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+             0.8462843753216345, 0.0, 0.0, 0.0, 0.0],
+            [0.28209479177387814, 0.0, 0.0, -0.31539156525252,
+             0.0, 0.5462742152960396, 0.0, 0.0, 0.0, 0.0,
+             0.3173566407456129, 0.0, -0.47308734787878, 0.0,
+             0.6258357354491761],
+            [0.28209479177387814, 0.0, 0.0, -0.31539156525252,
+             0.0, -0.5462742152960396, 0.0, 0.0, 0.0, 0.0,
+             0.3173566407456129, 0.0, 0.47308734787878, 0.0,
+             0.6258357354491761],
+            [0.28209479177387814, -0.36418281019735976,
+             -0.3641828101973598, 0.0, -0.3641828101973598, 0.0,
+             0.0, -0.3933623932844291, -0.42052208700336025,
+             0.1486770096793974, -0.32911059040285784,
+             0.1486770096793974, 0.0, 0.3933623932844291,
+             -0.27814921575518947],
+        ])
+
+        assert B.shape == golden.shape
+        np.testing.assert_allclose(B, golden, atol=1e-10)
+
 
 class TestCalculateShOrder:
     """Tests for the calculate_sh_order function."""
@@ -156,8 +197,6 @@ class TestCalculateShOrder:
         # Valid counts: 1, 6, 15, 28, 45, ...
         try:
             result = calculate_sh_order(10)
-            # If it doesn't raise, the result should be a non-integer internally
-            # which means the function handles it differently
             assert isinstance(result, (int, float))
         except ValueError:
             pass  # Expected behavior

@@ -1,10 +1,11 @@
 [build-system]
-requires = ["poetry-core>=2.0.0"]
-build-backend = "poetry.core.masonry.api"
+requires = ["poetry-core>=2.0.0", "setuptools", "numba==0.63.1", "numpy==2.3.5"]
+build-backend = "_tractedit_build_backend"
+backend-path = ["."]
 
 [tool.poetry]
 name = "tractedit"
-version = "3.3.0"
+version = "3.4.0"
 description = "A Python-based interactive tool for virtual dissection and manual refinement of diffusion MRI tractography. Supports .trk, .tck, .trx, .vtk, .vtp formats."
 authors = [
     "Marco Tagliaferri <marco.tagliaferri@unitn.it>",
@@ -25,6 +26,10 @@ classifiers = [
     "Environment :: X11 Applications :: Qt",
 ]
 packages = [{ include = "tractedit_pkg" }, { include = "main.py" }]
+include = [
+    { path = "tractedit_pkg/_numba_aot/*.pyd", format = "wheel" },
+    { path = "tractedit_pkg/_numba_aot/*.so", format = "wheel" },
+]
 
 [tool.poetry.dependencies]
 python = ">=3.11,<3.12"
@@ -34,10 +39,14 @@ vtk = "9.2.6"
 fury = "0.12.0"
 nibabel = "5.3.3"
 numpy = "2.3.5"
-numba = "0.63.1"
 scipy = "1.16.3"
-pytz = "2025.2"
 trx-python = "0.3"
+
+[tool.poetry.group.build]
+optional = true
+
+[tool.poetry.group.build.dependencies]
+numba = "0.63.1"
 
 [tool.poetry.group.test.dependencies]
 pytest = "==9.0.2"

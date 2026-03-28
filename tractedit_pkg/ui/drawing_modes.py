@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from PyQt6.QtWidgets import QMessageBox
 
-from ..utils import ROI_COLORS
+from ..utils import ROI_COLORS, signals_blocked
 
 if TYPE_CHECKING:
     from ..main_window import MainWindow
@@ -54,51 +54,11 @@ class DrawingModesManager:
 
     def _get_button_style_default(self) -> str:
         """Returns the default button style from theme manager."""
-        if hasattr(self.mw, "theme_manager"):
-            return self.mw.theme_manager.get_button_style_default()
-        # Fallback light style if theme manager not available
-        return """
-            QToolButton {
-                background-color: #f0f0f0;
-                border: 1px solid #c0c0c0;
-                border-radius: 5px;
-                padding: 2px;
-                margin-left: 5px;
-            }
-            QToolButton:hover {
-                background-color: #e8e8e8;
-                border: 1px solid #b0b0b0;
-            }
-            QToolButton:checked {
-                background-color: #d0d0d0;
-                border: 1px inset #a0a0a0;
-                padding: 3px 1px 1px 3px;
-            }
-        """
+        return self.mw.theme_manager.get_button_style_default()
 
     def _get_button_style_active(self) -> str:
         """Returns the active button style from theme manager."""
-        if hasattr(self.mw, "theme_manager"):
-            return self.mw.theme_manager.get_button_style_active()
-        # Fallback active style if theme manager not available
-        return """
-            QToolButton {
-                background-color: rgb(0, 188, 212);
-                border: 1px solid #00ACC1;
-                border-radius: 5px;
-                padding: 2px;
-                margin-left: 5px;
-            }
-            QToolButton:hover {
-                background-color: rgb(0, 172, 193);
-                border: 1px solid #0097A7;
-            }
-            QToolButton:checked {
-                background-color: rgb(0, 151, 167);
-                border: 1px inset #00838F;
-                padding: 3px 1px 1px 3px;
-            }
-        """
+        return self.mw.theme_manager.get_button_style_active()
 
     def trigger_new_roi(self) -> None:
         """Creates a new empty ROI image for manual drawing."""
@@ -303,9 +263,8 @@ class DrawingModesManager:
                 current_radius = mw.vtk_panel.sphere_params_per_roi[
                     mw.current_drawing_roi
                 ].get("radius", 5.0)
-                mw.sphere_radius_spinbox.blockSignals(True)
-                mw.sphere_radius_spinbox.setValue(current_radius)
-                mw.sphere_radius_spinbox.blockSignals(False)
+                with signals_blocked(mw.sphere_radius_spinbox):
+                    mw.sphere_radius_spinbox.setValue(current_radius)
 
         # Update VTK panel
         if mw.vtk_panel:

@@ -101,7 +101,7 @@ def _format_scale_label(size_mm: float) -> str:
 # Scale Bar Actor Class
 # ============================================================================
 
-
+##TODO - to fix 
 class ScaleBarActor:
     """
     A scale bar overlay for 2D views.
@@ -250,7 +250,7 @@ class ScaleBarActor:
                 self._current_width_pixels = int(actual_width)
                 self._update_geometry()
 
-        except Exception as e:
+        except (RuntimeError, ValueError, AttributeError, ZeroDivisionError) as e:
             logger.debug(f"Error updating scale bar: {e}")
 
     def add_to_renderer(self, renderer: vtk.vtkRenderer) -> None:

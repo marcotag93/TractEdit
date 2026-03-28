@@ -77,27 +77,7 @@ class ToolbarsManager:
 
     def _get_button_style_default(self) -> str:
         """Returns the default button style from theme manager."""
-        if hasattr(self.mw, "theme_manager"):
-            return self.mw.theme_manager.get_button_style_default()
-        # Fallback light style if theme manager not available
-        return """
-            QToolButton {
-                background-color: #f0f0f0;
-                border: 1px solid #c0c0c0;
-                border-radius: 5px;
-                padding: 2px;
-                margin-left: 5px;
-            }
-            QToolButton:hover {
-                background-color: #e8e8e8;
-                border: 1px solid #b0b0b0;
-            }
-            QToolButton:checked {
-                background-color: #d0d0d0;
-                border: 1px inset #a0a0a0;
-                padding: 3px 1px 1px 3px;
-            }
-        """
+        return self.mw.theme_manager.get_button_style_default()
 
     def _get_label_color(self) -> str:
         """Returns the label color based on current theme."""
@@ -170,7 +150,8 @@ class ToolbarsManager:
         layout.addSpacing(15)
 
         mw.brush_label = QLabel("Brush:")
-        mw.brush_label.setStyleSheet("font-weight: bold; color: #dddddd;")
+        label_color = self._get_label_color()
+        mw.brush_label.setStyleSheet(f"font-weight: bold; color: {label_color};")
         layout.addWidget(mw.brush_label)
 
         # Brush size value label

@@ -13,7 +13,7 @@ import numpy as np
 import math
 import vtk
 from vtk.util import numpy_support
-from scipy.special import sph_harm
+from scipy.special import sph_harm_y
 from scipy.ndimage import binary_dilation
 import nibabel as nib
 
@@ -65,7 +65,7 @@ def generate_symmetric_sphere(radius=1.0, subdivisions=3):
 # Spherical Harmonics
 # ============================================================================
 
-
+##TODO - handle more sh types
 def compute_sh_basis(vertices, sh_order, basis_type='tournier07'):
     """
     Computes the Spherical Harmonic basis matrix B.
@@ -81,7 +81,7 @@ def compute_sh_basis(vertices, sh_order, basis_type='tournier07'):
     idx = 0
     for l in range(0, sh_order + 1, 2):  # Even orders only
         for m in range(-l, l + 1):
-            Y_lm = sph_harm(m, l, azimuth, polar)
+            Y_lm = sph_harm_y(l, m, polar, azimuth)
             
             # Tournier07 Real Basis
             if m < 0:

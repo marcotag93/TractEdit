@@ -22,13 +22,7 @@
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey" alt="Platform"/>
 </p>
 
-
-
-
-https://github.com/user-attachments/assets/c7cb0dc9-be3f-49b8-b1fa-8b5a9ab88d40
-
-
-
+https://github.com/user-attachments/assets/f97633bb-2f16-493c-8487-64055d8f164d
 
 ---
 
@@ -156,7 +150,7 @@ Load & save streamlines in `.trk`, `.tck`, `.trx`, `.vtk`, `.vtp` formats with w
 
 #### Bundle Analytics
 
-- Calculate **Centroid** and **Medoid** (both Numba optimized) of the edited bundle
+- Calculate **Centroid** and **Medoid** (both AOT-compiled) of the edited bundle with cancellable progress and batched distance computation
 
 #### UI & Performance
 
@@ -167,8 +161,8 @@ Load & save streamlines in `.trk`, `.tck`, `.trx`, `.vtk`, `.vtp` formats with w
 - **Background Loading:** Non-blocking threaded loading for large streamline bundles and anatomical images
 - **Memory-Mapped Images:** Efficient on-demand slice extraction for large anatomical images without loading full volume into RAM
 - **Modular Architecture:** Refactored codebase with dedicated manager classes (ThemeManager, StateManager, SelectionManager, etc.) for improved maintainability
-- **Performance Optimizations:** Numba JIT compilation with parallel batch processing for geometric computations, Numpy vectorizations, debounced UI updates, pre-computed bounding boxes for fast selection
-- **Reliability:** Comprehensive automated test suite (90 tests) ensuring stability of core features
+- **Performance Optimizations:** AOT-compiled numerical kernels with binary search resampling and parallel batch processing for geometric computations, Numpy vectorizations, debounced UI updates, pre-computed bounding boxes for fast selection, TRX bbox cache on reload (`_tractedit_bboxes`), and TRX-native save path (`select(copy_safe=True)` + `tbx.save()`) to avoid nibabel round-trips
+- **Reliability:** Comprehensive automated test suite (152 tests) ensuring stability of core features
 
 #### 💡 Tips for Large Datasets
 
@@ -206,8 +200,6 @@ The project dependencies (including PyQt6, VTK, and Nibabel) are defined in pypr
 - [FURY](https://fury.gl/)
 - [Nibabel](https://nipy.org/nibabel/)
 - NumPy
-- [Numba](https://numba.pydata.org/)
-- pytz
 - [trx-python](https://pypi.org/project/trx-python/)
 - Scipy
 
@@ -217,10 +209,13 @@ Recommend a virtual environment:
 
 ```bash
 python -m venv venv
-source venv/bin/activate 
+source venv/bin/activate   # On Windows: venv\Scripts\activate
+
 # Install the app and its dependencies:
 pip install .
 ```
+
+> **Note:** The install process automatically compiles the AOT numerical extension (optimized computational kernels) for your operating system. [Numba](https://numba.pydata.org/) is temporarily downloaded as a build-time dependency to compile the extension, but is **not** installed into your environment — only the compiled binary is kept.
 
 ### 3. Launch the App
 
@@ -230,7 +225,6 @@ The application can now be launched using the tractedit command installed via pi
 tractedit
 ```
 
-> **Note:** The first launch may be slower due to one-time JIT compilation. Subsequent runs will be significantly faster.
 
 #### Command Line Options
 
@@ -267,45 +261,68 @@ Explore `sample_data/` to test TractEdit with example streamline files, anatomic
 
 ---
 
+### For Developers / Contributors
+
+If you want to contribute or build from source, install the full development stack:
+
+```bash
+# Install all dependency groups
+poetry install --with build,dev,test
+
+# Build the AOT-compiled numerical extension for your OS
+# (this step is automatic when using `pip install .`, but
+# must be run manually after `poetry install`)
+python tractedit_pkg/_numba_aot/build_aot.py
+
+# Run the app
+poetry run tractedit
+
+# Run tests
+poetry run pytest tests/ -v
+```
+
+> **Note:** The AOT extension produces a platform-specific binary (`.pyd` on Windows, `.so` on Linux/macOS) and must be rebuilt after modifying any functions in `tractedit_pkg/_numba_aot/build_aot.py`. These compiled files are not tracked in git — each developer builds them locally.
+
 ### Pre-built Executables
 
-No Python setup is required for these versions. Download the latest release for your operating system:
+No Python setup is required for these versions. Download the latest [release](https://github.com/marcotag93/TractEdit/releases) for your operating system:
 
 * **Windows:** Use the `.exe` file.
 * **macOS (Apple Silicon):** Use the `.dmg` file.
 * **Linux (AppImage):** Use `.AppImage` — portable, runs on most Linux distributions without installation. Simply make it executable (`chmod +x`) and run.
-* **Linux (Debian/Ubuntu):** Use `.deb` — native package for Debian-based distributions. Install with `sudo dpkg -i TractEdit_3.3.0_amd64.deb`.
+* **Linux (Debian/Ubuntu):** Use `.deb` — native package for Debian-based distributions. Install with `sudo dpkg -i TractEdit_3.4.0_amd64.deb`.
 
-> **Note:** The first launch may be slower due to one-time JIT compilation. Subsequent runs will be significantly faster.
 
 ---
 
 ## Keyboard Shortcuts
 
-| Key / Combo                 | Action                                      |
-| --------------------------- | ------------------------------------------- |
-| **s**                 | Select/Deselect streamlines at cursor       |
-| **i**                 | Invert selection                            |
-| **d**                 | Delete selected streamlines                 |
-| **c**                 | Clear current selection                     |
-| **+ / =**             | Increase selection sphere radius            |
-| **-**                 | Decrease selection sphere radius            |
-| **↑ / ↓**           | Axial Slice navigation (Z-axis)             |
-| **← / →**           | Sagittal Slice navigation (X-axis)          |
-| **1**                 | Toggle Pencil drawing mode                  |
-| **2**                 | Toggle Eraser drawing mode                  |
-| **3**                 | Toggle Sphere ROI drawing mode              |
-| **4**                 | Toggle Rectangle ROI drawing mode           |
-| **Ctrl+↑ / Ctrl+↓** | Coronal Slice navigation (Y-axis)           |
-| **Ctrl+Click**        | Replace sphere/rectangle ROI (when in mode) |
-| **Ctrl+Drag**         | Move sphere/rectangle ROI (when in mode)    |
-| **Ctrl+Scroll**       | Resize sphere/rectangle ROI (when in mode)  |
-| **Ctrl+s**            | Save As                                     |
-| **Ctrl+z**            | Undo last deletion / ROI operation          |
-| **Ctrl+y / Shift+z**  | Redo last undone deletion / ROI operation   |
-| **Ctrl+p**            | Save a screenshot                           |
-| **Esc**               | Hide selection sphere                       |
-| **Ctrl+q**            | Quit application                            |
+| Key / Combo                 | Action                                                        |
+| --------------------------- | ------------------------------------------------------------- |
+| **s**                 | Add streamlines at cursor to selection (selection grows only)   |
+| **Shift+s**           | Remove streamlines at cursor from selection (selection shrinks only) |
+| **i**                 | Invert selection                                              |
+| **d**                 | Delete selected streamlines                                   |
+| **c**                 | Clear current selection                                       |
+| **+ / =**             | Increase selection sphere radius                              |
+| **-**                 | Decrease selection sphere radius                              |
+| **↑ / ↓**           | Axial Slice navigation (Z-axis)                               |
+| **← / →**           | Sagittal Slice navigation (X-axis)                            |
+| **Shift+Scroll**      | Slice navigation on the 2D panel under cursor                 |
+| **1**                 | Toggle Pencil drawing mode                                    |
+| **2**                 | Toggle Eraser drawing mode                                    |
+| **3**                 | Toggle Sphere ROI drawing mode                                |
+| **4**                 | Toggle Rectangle ROI drawing mode                             |
+| **Ctrl+↑ / Ctrl+↓** | Coronal Slice navigation (Y-axis)                             |
+| **Ctrl+Click**        | Replace sphere/rectangle ROI (when in mode)                   |
+| **Ctrl+Drag**         | Move sphere/rectangle ROI (when in mode)                      |
+| **Ctrl+Scroll**       | Resize sphere/rectangle ROI (when in mode)                    |
+| **Ctrl+s**            | Save As                                                       |
+| **Ctrl+z**            | Undo last selection change / deletion / ROI operation         |
+| **Ctrl+y / Shift+z**  | Redo last undone selection change / deletion / ROI operation  |
+| **Ctrl+p**            | Save a screenshot                                             |
+| **Esc**               | Hide selection sphere                                         |
+| **Ctrl+q**            | Quit application                                              |
 
 ---
 
@@ -320,7 +337,7 @@ File → Load Image    → Add anatomical image (NIfTI)
 
 ### Step 2: Navigate
 
-- **2D Slices:** Click-drag or use arrow keys
+- **2D Slices:** Click-drag, arrow keys, or Shift+scroll on any 2D panel
 - **3D View:** Rotate, zoom, pan with mouse
 
 ### Step 3: Edit (Choose Your Approach)
@@ -332,8 +349,9 @@ File → Load Image    → Add anatomical image (NIfTI)
 **🎯 Manual Selection**
 
 `+`/`-` adjust radius <br>
-Press `S` to select <br>
-Press `I` to invert selection <br>
+`S` to add streamlines <br>
+`Shift+S` to remove streamlines <br>
+`I` to invert selection <br>
 `D` to delete
 
 </td>
