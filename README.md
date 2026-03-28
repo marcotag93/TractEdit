@@ -22,7 +22,9 @@
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey" alt="Platform"/>
 </p>
 
-https://github.com/user-attachments/assets/f97633bb-2f16-493c-8487-64055d8f164d
+
+https://github.com/user-attachments/assets/258a0709-54db-45af-8ae9-4756f9651d07
+
 
 ---
 
