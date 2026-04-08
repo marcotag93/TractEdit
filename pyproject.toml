@@ -5,7 +5,7 @@ backend-path = ["."]
 
 [tool.poetry]
 name = "tractedit"
-version = "3.4.0"
+version = "3.4.5"
 description = "A Python-based interactive tool for virtual dissection and manual refinement of diffusion MRI tractography. Supports .trk, .tck, .trx, .vtk, .vtp formats."
 authors = [
     "Marco Tagliaferri <marco.tagliaferri@unitn.it>",

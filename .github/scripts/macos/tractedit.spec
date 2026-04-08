@@ -208,8 +208,8 @@ app = BUNDLE(
     info_plist={
         'CFBundleName': 'TractEdit',
         'CFBundleDisplayName': 'TractEdit',
-        'CFBundleVersion': '3.4.0',
-        'CFBundleShortVersionString': '3.4.0',
+        'CFBundleVersion': '3.4.5',
+        'CFBundleShortVersionString': '3.4.5',
         'NSHighResolutionCapable': True,
         'NSRequiresAquaSystemAppearance': False,
         'CFBundleDocumentTypes': [

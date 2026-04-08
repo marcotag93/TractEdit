@@ -9,7 +9,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 #: Application version — keep in sync with ``pyproject.toml``.
-__version__: str = "3.4.0"
+__version__: str = "3.4.5"
 
 try:
     from importlib.metadata import version as _pkg_version

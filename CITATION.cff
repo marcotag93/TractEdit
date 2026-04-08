@@ -5,7 +5,7 @@ authors:
   given-names: "Marco"
   orcid: "https://orcid.org/0000-0002-1800-3977"
 title: "TractEdit"
-version: 3.4.0
+version: 3.4.5
 doi: 10.5281/zenodo.18118153
 date-released: 2026-01-13
 url: "https://github.com/marcotag93/TractEdit"
