@@ -290,7 +290,7 @@ No Python setup is required for these versions. Download the latest [release](ht
 * **Windows:** Use the `.exe` file.
 * **macOS (Apple Silicon):** Use the `.dmg` file.
 * **Linux (AppImage):** Use `.AppImage` — portable, runs on most Linux distributions without installation. Simply make it executable (`chmod +x`) and run.
-* **Linux (Debian/Ubuntu):** Use `.deb` — native package for Debian-based distributions. Install with `sudo dpkg -i TractEdit_3.4.0_amd64.deb`.
+* **Linux (Debian/Ubuntu):** Use `.deb` — native package for Debian-based distributions. Install with `sudo dpkg -i TractEdit_3.4.5_amd64.deb`.
 
 
 ---
