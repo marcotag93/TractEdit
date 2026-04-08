@@ -11,10 +11,14 @@ coronal, and sagittal slice views.
 # Imports
 # ============================================================================
 
+import logging
 from typing import TYPE_CHECKING
+
 import vtk
 
 from ..utils import signals_blocked
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .vtk_panel import VTKPanel
@@ -79,22 +83,26 @@ class CustomInteractorStyle2D(vtk.vtkInteractorStyleImage):
 
     def OnLeftButtonUp(self, obj: vtk.vtkObject, event_id: str) -> None:
         """Handles left mouse button release."""
-        if self.vtk_panel:
-            # If we were drawing, update the ROI visualization now
+        if not self.vtk_panel:
+            return
+
+        was_drawing = self.vtk_panel.is_drawing_active
+        was_navigating = self.vtk_panel.is_navigating_2d
+
+        try:
             if (
-                self.vtk_panel.is_drawing_active
+                was_drawing
+                and self.vtk_panel.main_window
                 and self.vtk_panel.main_window.current_drawing_roi
             ):
                 self.vtk_panel._finish_drawing()
-
-            # Disable fast render mode if we were navigating
-            was_navigating = self.vtk_panel.is_navigating_2d
-
+        except Exception:
+            logger.error("Error in _finish_drawing, forcing cleanup.", exc_info=True)
+            self.vtk_panel.drawing_manager._cleanup_preview()
+        finally:
+            self.vtk_panel.is_drawing_active = False
             self.vtk_panel.is_navigating_2d = False
-            self.vtk_panel.is_drawing_active = False  # Stop drawing
             self.vtk_panel._update_slow_slice_components()
-
-            # Restore full quality rendering after navigation
             if was_navigating:
                 self.vtk_panel._disable_fast_render()
 
@@ -284,22 +292,21 @@ class CustomInteractorStyle2D(vtk.vtkInteractorStyleImage):
         if not mw:
             return
 
-        # If we were moving (dragging), trigger finish_drawing
-        # If we only scrolled (resize), use spinbox method
         is_moving = getattr(self.vtk_panel, "is_moving_sphere", False)
 
-        if is_moving:
-            # Trigger finish drawing to apply the move+resize
-            self.vtk_panel._finish_drawing()
-        elif self._is_adjusting_radius:
-            # Only resized via scroll - use spinbox method
-            if hasattr(mw, "_on_sphere_radius_changed"):
-                mw._on_sphere_radius_changed()
-
-        # Reset sphere state
-        self._is_adjusting_radius = False
-        self._preview_radius = 0.0
-        self.vtk_panel.is_moving_sphere = False
+        try:
+            if is_moving:
+                self.vtk_panel._finish_drawing()
+            elif self._is_adjusting_radius:
+                if hasattr(mw, "_on_sphere_radius_changed"):
+                    mw._on_sphere_radius_changed()
+        except Exception:
+            logger.error("Error applying sphere preview.", exc_info=True)
+            self.vtk_panel.drawing_manager._cleanup_preview()
+        finally:
+            self._is_adjusting_radius = False
+            self._preview_radius = 0.0
+            self.vtk_panel.is_moving_sphere = False
 
     def _apply_rectangle_preview(self) -> None:
         """Applies the previewed rectangle changes (position)."""
@@ -309,9 +316,11 @@ class CustomInteractorStyle2D(vtk.vtkInteractorStyleImage):
 
         is_moving = getattr(self.vtk_panel, "is_moving_rectangle", False)
 
-        if is_moving:
-            # Trigger finish drawing to apply the move
-            self.vtk_panel._finish_drawing()
-
-        # Reset rectangle state
-        self.vtk_panel.is_moving_rectangle = False
+        try:
+            if is_moving:
+                self.vtk_panel._finish_drawing()
+        except Exception:
+            logger.error("Error applying rectangle preview.", exc_info=True)
+            self.vtk_panel.drawing_manager._cleanup_preview()
+        finally:
+            self.vtk_panel.is_moving_rectangle = False

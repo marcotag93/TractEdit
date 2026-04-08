@@ -146,10 +146,10 @@ class TestStreamlineUndoRedo:
     def test_undo_preserves_skip_override_for_small_tractogram(
         self, state_manager, mock_main_window
     ):
-        """Undo keeps user skip OFF for tractograms with <= 250k streamlines."""
+        """Undo keeps user skip OFF for tractograms with < 150k streamlines."""
         deleted = {1, 3}
         mock_main_window.manual_visible_indices = {0, 2, 4}
-        mock_main_window.tractogram_data = range(250000)
+        mock_main_window.tractogram_data = range(149999)
         mock_main_window._skip_user_disabled = True
 
         mock_main_window.unified_undo_stack.append(
@@ -167,10 +167,10 @@ class TestStreamlineUndoRedo:
     def test_undo_forces_auto_skip_for_large_tractogram(
         self, state_manager, mock_main_window
     ):
-        """Undo forces auto-skip protection for tractograms with > 250k streamlines."""
+        """Undo forces auto-skip protection for tractograms with >= 150k streamlines."""
         deleted = {1, 3}
         mock_main_window.manual_visible_indices = {0, 2, 4}
-        mock_main_window.tractogram_data = range(250001)
+        mock_main_window.tractogram_data = range(150000)
         mock_main_window._skip_user_disabled = True
 
         mock_main_window.unified_undo_stack.append(

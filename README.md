@@ -22,7 +22,7 @@
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey" alt="Platform"/>
 </p>
 
-https://github.com/user-attachments/assets/f97633bb-2f16-493c-8487-64055d8f164d
+https://github.com/user-attachments/assets/258a0709-54db-45af-8ae9-4756f9651d07
 
 ---
 
@@ -83,7 +83,7 @@ Load & save streamlines in `.trk`, `.tck`, `.trx`, `.vtk`, `.vtp` formats with w
 - **Drawing:** Pencil, Eraser, Sphere, Rectangle modes
 - **Selection:** Sphere-based streamlines selection and deletion with adjustable radius
 - **Filtering:** Include/Exclude logic for ROIs
-- Undo/Redo support for all operations
+- Undo/Redo support for streamline deletions and ROI operations
 
 ### 🧠 Advanced Analysis
 
@@ -318,8 +318,8 @@ No Python setup is required for these versions. Download the latest [release](ht
 | **Ctrl+Drag**         | Move sphere/rectangle ROI (when in mode)                      |
 | **Ctrl+Scroll**       | Resize sphere/rectangle ROI (when in mode)                    |
 | **Ctrl+s**            | Save As                                                       |
-| **Ctrl+z**            | Undo last selection change / deletion / ROI operation         |
-| **Ctrl+y / Shift+z**  | Redo last undone selection change / deletion / ROI operation  |
+| **Ctrl+z**            | Undo last deletion / ROI operation                           |
+| **Ctrl+y / Shift+z**  | Redo last undone deletion / ROI operation                    |
 | **Ctrl+p**            | Save a screenshot                                             |
 | **Esc**               | Hide selection sphere                                         |
 | **Ctrl+q**            | Quit application                                              |

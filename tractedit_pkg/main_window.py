@@ -1716,6 +1716,12 @@ class MainWindow(QMainWindow):
                 self.vtk_panel.update_highlight()
                 self.vtk_panel.remove_odf_actor()
 
+                # Clear inversion mode so it does not bleed into the next session
+                if self._inversion_active:
+                    self._inversion_active = False
+                    self._inversion_keeper_indices = set()
+                    self.vtk_panel.clear_invert_contour()
+
                 # Clear anatomical slices if present AND NOT keep_image
                 if not keep_image and self.anatomical_image_data is not None:
                     self.anatomical_image_path = None
@@ -2187,16 +2193,8 @@ class MainWindow(QMainWindow):
         self.bundle_is_visible = True
 
         file_io.load_streamlines_file(self)
-        if self.tractogram_data:
-            self.manual_visible_indices = set(range(len(self.tractogram_data)))
-            self.visible_indices = self.manual_visible_indices
-            self._visibility_version += 1
-            # Clear caches and user override on new load
-            self._skip_user_disabled = False
-            self.roi_states = {}
-            self.roi_intersection_cache = {}
-            self.roi_highlight_indices = set()
-            self._auto_calculate_skip_level()  # Automatic skip level based on count
+        # All post-load state setup (visible indices, ROI caches, skip level,
+        # etc.) is handled inside the on_finished callback in file_io.py.
 
         # Update scalar range if scalar mode is already active
         if self.current_color_mode == ColorMode.SCALAR and self.active_scalar_name:

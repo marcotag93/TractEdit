@@ -37,7 +37,7 @@ SLIDER_PRECISION: int = 1000  # Use 1000 steps for the slider
 MAX_HIGHLIGHT_STREAMLINES: int = 200_000
 
 TARGET_RENDER_COUNT: int = 20_000
-AUTO_SKIP_THRESHOLD: int = 250_000
+AUTO_SKIP_THRESHOLD: int = 150_000
 
 # Predefined colors for ROIs (distinct palette)
 ROI_COLORS = [

@@ -613,24 +613,12 @@ class SelectionManager:
             self.panel.main_window.selected_streamline_indices = current_selection
 
         if deselect:
-            # Intersection first so ``removed_count`` reflects only indices
-            # that were actually present in the selection.
             removed = indices_in_sphere & current_selection
-            # Save the delta BEFORE mutating
-            self.panel.main_window.state_manager.save_selection_change_for_undo(
-                added_indices=set(), removed_indices=removed
-            )
             current_selection.difference_update(removed)
             added_count = 0
             removed_count = len(removed)
         else:
-            # Difference first so ``added_count`` reflects only genuinely new
-            # indices (not those already present).
             added = indices_in_sphere - current_selection
-            # Save the delta BEFORE mutating
-            self.panel.main_window.state_manager.save_selection_change_for_undo(
-                added_indices=added, removed_indices=set()
-            )
             current_selection.update(added)
             added_count = len(added)
             removed_count = 0

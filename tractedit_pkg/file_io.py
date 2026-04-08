@@ -1816,6 +1816,10 @@ def load_streamlines_file(
             main_window.roi_highlight_indices = set()
 
             main_window.selected_streamline_indices = set()
+            main_window._inversion_active = False
+            main_window._inversion_keeper_indices = set()
+            if main_window.vtk_panel:
+                main_window.vtk_panel.clear_invert_contour()
             main_window.unified_undo_stack = []
             main_window.unified_redo_stack = []
             main_window.current_color_mode = ColorMode.ORIENTATION

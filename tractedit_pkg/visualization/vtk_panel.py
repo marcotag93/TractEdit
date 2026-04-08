@@ -688,7 +688,11 @@ class VTKPanel:
         self.drawing_manager.finish_drawing()
 
     def _remove_actor_set(self, actor_dict: Dict[str, vtk.vtkActor]) -> None:
-        """Removes a set of actors from all scenes."""
+        """Removes a set of actors from all scenes.
+
+        Skips non-vtkProp entries (e.g., sphere_source, rectangle_points)
+        that are stored alongside actors in the dict.
+        """
         scenes_to_check = [
             self.scene,
             self.axial_scene,
@@ -696,12 +700,13 @@ class VTKPanel:
             self.sagittal_scene,
         ]
         for act in actor_dict.values():
-            if act is not None:
-                for scn in scenes_to_check:
-                    try:
-                        scn.rm(act)
-                    except (ValueError, RuntimeError):
-                        logger.debug("Failed to remove actor from scene.")
+            if act is None or not isinstance(act, vtk.vtkProp):
+                continue
+            for scn in scenes_to_check:
+                try:
+                    scn.rm(act)
+                except (ValueError, RuntimeError):
+                    logger.debug("Failed to remove actor from scene.")
 
     def _adjust_sphere_radius(self, delta: float, view_type: str = "axial") -> None:
         """Adjusts the radius of the last created sphere. Delegates to DrawingManager."""
@@ -2341,9 +2346,11 @@ class VTKPanel:
         vis_flag = 1 if visible else 0
         changed = False
 
-        # Iterate over all actors stored for this key
+        # Iterate over all actors stored for this key (skip non-vtkProp entries)
         for act in self.roi_slice_actors[key].values():
-            if act and act.GetVisibility() != vis_flag:
+            if not act or not isinstance(act, vtk.vtkProp):
+                continue
+            if act.GetVisibility() != vis_flag:
                 act.SetVisibility(vis_flag)
                 changed = True
 
@@ -2363,12 +2370,13 @@ class VTKPanel:
         ]
 
         for act in self.roi_slice_actors[key].values():
-            if act is not None:
-                for scn in scenes_to_check:
-                    try:
-                        scn.rm(act)
-                    except (ValueError, RuntimeError):
-                        logger.debug("Failed to remove actor from scene.")
+            if act is None or not isinstance(act, vtk.vtkProp):
+                continue
+            for scn in scenes_to_check:
+                try:
+                    scn.rm(act)
+                except (ValueError, RuntimeError):
+                    logger.debug("Failed to remove actor from scene.")
 
         del self.roi_slice_actors[key]
         self._render_all()
@@ -2392,12 +2400,13 @@ class VTKPanel:
 
         for actor_dict in self.roi_slice_actors.values():
             for act in actor_dict.values():
-                if act:
-                    for scn in scenes_to_check:
-                        try:
-                            scn.rm(act)
-                        except (ValueError, RuntimeError):
-                            logger.debug("Failed to remove actor from scene.")
+                if act is None or not isinstance(act, vtk.vtkProp):
+                    continue
+                for scn in scenes_to_check:
+                    try:
+                        scn.rm(act)
+                    except (ValueError, RuntimeError):
+                        logger.debug("Failed to remove actor from scene.")
 
         self.roi_slice_actors.clear()
         self._render_all()

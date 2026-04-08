@@ -535,15 +535,16 @@ class DrawingManager:
         Rasterizes the preview path into the ROI volume.
         """
         if not self.panel.main_window or not self.panel.main_window.current_drawing_roi:
-            self.panel.drawing_preview_points = []
+            self._cleanup_preview()
             return
 
         roi_name = self.panel.main_window.current_drawing_roi
         if roi_name not in self.panel.main_window.roi_layers:
-            self.panel.drawing_preview_points = []
+            self._cleanup_preview()
             return
 
         if not self.panel.drawing_preview_points:
+            self._cleanup_preview()
             return
 
         try:
@@ -584,15 +585,12 @@ class DrawingManager:
             else:
                 # Freehand drawing
                 auto_fill = getattr(self.panel.main_window, "auto_fill_voxels", False)
-                # Only fill in Draw mode (not eraser)
                 is_eraser = getattr(self.panel, "is_eraser_mode", False)
 
-                # Apply the stroke first (outline)
                 changed_stroke = self._rasterize_freehand(
                     roi_data, vox_points_float, shape, view_type
                 )
 
-                # Apply fill if enabled
                 changed_fill = False
                 if auto_fill and not is_eraser:
                     changed_fill = self._fill_polygon(
@@ -601,7 +599,6 @@ class DrawingManager:
 
                 changed = changed_stroke or changed_fill
 
-            # Update actor if changed
             if changed:
                 self.panel.update_roi_layer(roi_name, roi_data, roi_affine)
                 status_msg = (
@@ -610,59 +607,68 @@ class DrawingManager:
                     else "ROI updated."
                 )
                 self.panel.update_status(status_msg)
+                self._update_intersection_on_finish(
+                    roi_name, is_sphere, is_rectangle, view_type
+                )
 
-                # Force intersection update on finish for sphere/rectangle
-                if is_sphere and len(self.panel.drawing_preview_points) >= 2:
-                    center = self.panel.drawing_preview_points[0]
-                    edge = self.panel.drawing_preview_points[1]
-                    radius = np.linalg.norm(center - edge)
-
-                    # Apply X-axis correction for axial/coronal views
-                    center_corrected = center.copy()
-                    if view_type in ["axial", "coronal"]:
-                        center_corrected[0] = -center_corrected[0]
-
-                    if self.panel.main_window and hasattr(
-                        self.panel.main_window, "update_sphere_roi_intersection"
-                    ):
-                        self.panel.main_window.update_sphere_roi_intersection(
-                            roi_name, center_corrected, radius
-                        )
-                elif is_rectangle and len(self.panel.drawing_preview_points) >= 2:
-                    start = self.panel.drawing_preview_points[0].copy()
-                    end = self.panel.drawing_preview_points[1].copy()
-
-                    # Apply X-axis correction for axial/coronal views
-                    if view_type in ["axial", "coronal"]:
-                        start[0] = -start[0]
-                        end[0] = -end[0]
-
-                    if self.panel.main_window and hasattr(
-                        self.panel.main_window, "update_rectangle_roi_intersection"
-                    ):
-                        min_v = np.minimum(start, end)
-                        max_v = np.maximum(start, end)
-                        epsilon = 0.5
-                        if view_type == "axial":
-                            min_v[2] -= epsilon
-                            max_v[2] += epsilon
-                        elif view_type == "coronal":
-                            min_v[1] -= epsilon
-                            max_v[1] += epsilon
-                        elif view_type == "sagittal":
-                            min_v[0] -= epsilon
-                            max_v[0] += epsilon
-                        self.panel.main_window.update_rectangle_roi_intersection(
-                            roi_name, min_v, max_v
-                        )
-
-            # Clean up preview
+        except Exception as e:
+            logger.error(f"Error finishing drawing: {e}", exc_info=True)
+        finally:
             self._cleanup_preview()
             self.panel._render_all()
 
-        except (ValueError, IndexError, RuntimeError, KeyError, AttributeError) as e:
-            logger.error(f"Error finishing drawing: {e}", exc_info=True)
-            self.panel.drawing_preview_points = []
+    def _update_intersection_on_finish(
+        self,
+        roi_name: str,
+        is_sphere: bool,
+        is_rectangle: bool,
+        view_type: str,
+    ) -> None:
+        """Force ROI-streamline intersection update after rasterization."""
+        points = self.panel.drawing_preview_points
+        if len(points) < 2:
+            return
+
+        mw = self.panel.main_window
+        if not mw:
+            return
+
+        if is_sphere:
+            center = points[0]
+            edge = points[1]
+            radius = np.linalg.norm(center - edge)
+
+            center_corrected = center.copy()
+            if view_type in ["axial", "coronal"]:
+                center_corrected[0] = -center_corrected[0]
+
+            if hasattr(mw, "update_sphere_roi_intersection"):
+                mw.update_sphere_roi_intersection(
+                    roi_name, center_corrected, radius
+                )
+
+        elif is_rectangle:
+            start = points[0].copy()
+            end = points[1].copy()
+
+            if view_type in ["axial", "coronal"]:
+                start[0] = -start[0]
+                end[0] = -end[0]
+
+            if hasattr(mw, "update_rectangle_roi_intersection"):
+                min_v = np.minimum(start, end)
+                max_v = np.maximum(start, end)
+                epsilon = 0.5
+                if view_type == "axial":
+                    min_v[2] -= epsilon
+                    max_v[2] += epsilon
+                elif view_type == "coronal":
+                    min_v[1] -= epsilon
+                    max_v[1] += epsilon
+                elif view_type == "sagittal":
+                    min_v[0] -= epsilon
+                    max_v[0] += epsilon
+                mw.update_rectangle_roi_intersection(roi_name, min_v, max_v)
 
     def _world_to_voxel_points(
         self,
@@ -742,6 +748,16 @@ class DrawingManager:
         edge_vox = vox_points_float[1]
         radius_vox = np.linalg.norm(center_vox - edge_vox)
 
+        # Remove any existing 3D rectangle actor
+        if roi_name in self.panel.roi_slice_actors:
+            old_rect = self.panel.roi_slice_actors[roi_name].get("rectangle_3d")
+            if old_rect:
+                self.panel.scene.rm(old_rect)
+                self.panel.roi_slice_actors[roi_name]["rectangle_3d"] = None
+            old_pts = self.panel.roi_slice_actors[roi_name].get("rectangle_points")
+            if old_pts is not None:
+                self.panel.roi_slice_actors[roi_name]["rectangle_points"] = None
+
         # Clear rectangle params
         self.panel.rectangle_params_per_roi.pop(roi_name, None)
 
@@ -809,12 +825,15 @@ class DrawingManager:
         view_type: str,
     ) -> bool:
         """Rasterize a rectangle ROI."""
-        # Remove any existing 3D sphere actor
+        # Remove any existing 3D sphere actor and source
         if roi_name in self.panel.roi_slice_actors:
             old_sphere = self.panel.roi_slice_actors[roi_name].get("sphere_3d")
             if old_sphere:
                 self.panel.scene.rm(old_sphere)
                 self.panel.roi_slice_actors[roi_name]["sphere_3d"] = None
+            old_src = self.panel.roi_slice_actors[roi_name].get("sphere_source")
+            if old_src is not None:
+                self.panel.roi_slice_actors[roi_name]["sphere_source"] = None
 
         # Clear sphere params
         self.panel.sphere_params_per_roi.pop(roi_name, None)
