@@ -22,6 +22,9 @@
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey" alt="Platform"/>
 </p>
 
+> [!IMPORTANT]
+> **Research Use Only.** TractEdit is a research tool for the visualization, virtual dissection, and quality control of diffusion MRI tractography. It is **not a medical device**, has not been clinically validated, and holds no regulatory clearance (FDA / CE). It must not be used for diagnosis, treatment planning, or neurosurgical guidance.
+
 https://github.com/user-attachments/assets/258a0709-54db-45af-8ae9-4756f9651d07
 
 ---
@@ -290,7 +293,7 @@ No Python setup is required for these versions. Download the latest [release](ht
 * **Windows:** Use the `.exe` file.
 * **macOS (Apple Silicon):** Use the `.dmg` file.
 * **Linux (AppImage):** Use `.AppImage` — portable, runs on most Linux distributions without installation. Simply make it executable (`chmod +x`) and run.
-* **Linux (Debian/Ubuntu):** Use `.deb` — native package for Debian-based distributions. Install with `sudo dpkg -i TractEdit_3.4.5_amd64.deb`.
+* **Linux (Debian/Ubuntu):** Use `.deb` — native package for Debian-based distributions. Install with `sudo dpkg -i TractEdit_3.4.6_amd64.deb`.
 
 
 ---

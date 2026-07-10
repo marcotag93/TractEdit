@@ -3171,9 +3171,9 @@ class MainWindow(QMainWindow):
     # Help-About dialog
     @pyqtSlot()
     def _show_about_dialog(self) -> None:
-        """Displays the About tractedit information box with the application logo."""
+        """Displays the About TractEdit information box with the application logo."""
         msg_box = QMessageBox(self)
-        msg_box.setWindowTitle("About tractedit")
+        msg_box.setWindowTitle("About TractEdit")
 
         # Load and Set Logo
         try:
@@ -3201,6 +3201,12 @@ class MainWindow(QMainWindow):
         Contacts:<br>
         marco.tagliaferri@unitn.it<br>
         marco.tagliaferri93@gmail.com
+        <br><br>
+        <b>Research Use Only.</b> TractEdit is not a medical device and has not
+        received regulatory clearance (FDA / CE). It must not be used for
+        diagnosis, treatment planning, or clinical decision-making.
+        <br><br>
+        Licensed under the MIT License.
         """
         msg_box.setText(about_text)
         msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
