@@ -1,5 +1,6 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
+type: software
 authors:
 - family-names: "Tagliaferri"
   given-names: "Marco"
@@ -9,14 +10,37 @@ version: 3.4.6
 doi: 10.5281/zenodo.18118153
 date-released: 2026-07-10
 url: "https://github.com/marcotag93/TractEdit"
+repository-code: "https://github.com/marcotag93/TractEdit"
 license: MIT
 abstract: "A Python-based Open-Source Interactive Tool for Virtual Dissection and Manual Refinement of Diffusion MRI Tractography"
+keywords:
+  - tractography
+  - diffusion MRI
+  - virtual dissection
+  - white matter
+  - neuroimaging
+  - streamlines
+  - connectivity
+  - visualization
+  - Python
+identifiers:
+  - type: doi
+    value: "10.5281/zenodo.18118153"
+    description: "Concept DOI resolving to the latest archived release"
+  - type: doi
+    value: "10.5281/zenodo.21294633"
+    description: "Archived snapshot of version 3.4.6"
 preferred-citation:
-  type: software
+  type: article
   authors:
   - family-names: "Tagliaferri"
     given-names: "Marco"
     orcid: "https://orcid.org/0000-0002-1800-3977"
-  doi: "10.5281/zenodo.18118153"
   title: "TractEdit: An Open-Source Interactive Tool for Virtual Dissection and Manual Refinement of Diffusion MRI Tractography"
+  journal: "Journal of Neural Engineering"
+  publisher:
+    name: "IOP Publishing"
+  issn: "1741-2552"
   year: 2026
+  doi: "10.1088/1741-2552/ae9346"
+  status: advance-online
