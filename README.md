@@ -24,7 +24,9 @@
 > [!IMPORTANT]
 > **Research Use Only.** TractEdit is a research tool for the visualization, virtual dissection, and quality control of diffusion MRI tractography. It is **not a medical device**, has not been clinically validated, and holds no regulatory clearance (FDA / CE). It must not be used for diagnosis, treatment planning, or neurosurgical guidance.
 
-https://github.com/user-attachments/assets/258a0709-54db-45af-8ae9-4756f9651d07
+
+https://github.com/user-attachments/assets/8b95cfea-a0b9-4537-8e0f-0ac645f44294
+
 
 ---
 
