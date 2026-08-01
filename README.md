@@ -13,13 +13,12 @@
 </p>
 
 <p align="center">
+  <a href="https://doi.org/10.1088/1741-2552/ae9346"><img src="https://img.shields.io/badge/Paper_DOI-10.1088%2F1741--2552%2Fae9346-B31B1B" alt="Journal of Neural Engineering paper DOI"></a>
+  <a href="https://doi.org/10.5281/zenodo.18118153"><img src="https://img.shields.io/badge/Zenodo_DOI-10.5281%2Fzenodo.18118153-1682D4" alt="Zenodo software archive DOI"></a>
+  <a href="https://github.com/marcotag93/TractEdit/releases/latest"><img src="https://img.shields.io/github/v/release/marcotag93/TractEdit" alt="Latest release"></a>
   <a href="https://github.com/marcotag93/TractEdit/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"/></a>
-  <a href="https://doi.org/10.5281/zenodo.18118153"><img src="https://zenodo.org/badge/DOI/10.5281/zenodo.18118153.svg" alt="DOI"></a>
-  <a href="https://gitcgr.com/marcotag93/TractEdit">
-    <img src="https://gitcgr.com/badge/marcotag93/TractEdit.svg" alt="gitcgr" />
-  </a>
   <img src="https://img.shields.io/badge/python-3.11-green.svg" alt="Python"/>
-  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey" alt="Platform"/>
+  <a href="https://github.com/marcotag93/TractEdit/releases/latest"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey" alt="Platform — download the latest release"/></a>
 </p>
 
 > [!IMPORTANT]
