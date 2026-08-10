@@ -46,6 +46,38 @@ from . import coordinates
 
 logger = logging.getLogger(__name__)
 
+_ROI_SLICE_ACTOR_KEYS = (
+    "axial_3d",
+    "coronal_3d",
+    "sagittal_3d",
+    "axial_2d",
+    "coronal_2d",
+    "sagittal_2d",
+)
+
+
+def _crop_roi_for_contour(
+    data: np.ndarray, affine: np.ndarray
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Return the occupied ROI bounds with a one-voxel background margin."""
+    positive = data > 0
+    occupied_axes = [
+        np.flatnonzero(np.any(positive, axis=axes)) for axes in ((1, 2), (0, 2), (0, 1))
+    ]
+    if any(axis.size == 0 for axis in occupied_axes):
+        return None
+
+    lower = np.array([axis[0] for axis in occupied_axes], dtype=int)
+    upper = np.array([axis[-1] + 1 for axis in occupied_axes], dtype=int)
+    lower = np.maximum(lower - 1, 0)
+    upper = np.minimum(upper + 1, np.asarray(data.shape))
+    slices = tuple(slice(start, stop) for start, stop in zip(lower, upper))
+
+    translation = np.eye(4)
+    translation[:3, 3] = lower
+    return data[slices], affine @ translation
+
+
 ##TODO - to refactor 
 # ============================================================================
 # VTK Panel Class
@@ -712,99 +744,68 @@ class VTKPanel:
         """Adjusts the radius of the last created sphere. Delegates to DrawingManager."""
         self.drawing_manager.adjust_sphere_radius(delta, view_type)
 
-    def _update_roi_data_in_place(self, key: str, data: np.ndarray) -> None:
-        """
-        Updates the underlying VTK image data for an ROI without recreating actors.
-        This prevents flickering.
-        """
-        if key not in self.roi_slice_actors:
-            return
+    def _update_roi_data_in_place(self, key: str, data: np.ndarray) -> bool:
+        """Update the shared FURY slicer source without replacing its actors."""
+        actor_set = self.roi_slice_actors.get(key)
+        if not actor_set or data.ndim != 3:
+            return False
+        data_min = np.min(data)
+        data_max = np.max(data)
+        if not np.isfinite([data_min, data_max]).all():
+            return False
+        if data_min < 0 or data_max > 1:
+            return False
 
-        for actor_key, actor_obj in self.roi_slice_actors[key].items():
+        pipelines = []
+        for actor_key in _ROI_SLICE_ACTOR_KEYS:
+            actor_obj = actor_set.get(actor_key)
             if actor_obj is None:
-                continue
+                return False
 
-            # Skip non-actor entries (e.g., 'sphere_source' is a vtkSphereSource)
-            if not hasattr(actor_obj, "GetMapper"):
-                continue
+            top_algorithm = actor_obj.GetMapper().GetInputAlgorithm()
+            source_algorithm = top_algorithm
+            while source_algorithm.GetInputAlgorithm() is not None:
+                source_algorithm = source_algorithm.GetInputAlgorithm()
 
-            # Retrieve the vtkImageData
-            mapper = actor_obj.GetMapper()
-            if not mapper:
-                continue
+            source_image = source_algorithm.GetOutputDataObject(0)
+            if not isinstance(source_image, vtk.vtkImageData):
+                return False
+            if tuple(source_image.GetDimensions()) != tuple(data.shape):
+                return False
+            pipelines.append((top_algorithm, source_image))
 
-            # The mapper input might be the image data directly
-            vtk_input = mapper.GetInput()
+        volume = np.ascontiguousarray(np.swapaxes(data, 0, 2))
+        vtk_array = numpy_support.numpy_to_vtk(volume.ravel(), deep=False)
 
-            if isinstance(vtk_input, vtk.vtkImageData):
-                self._update_vtk_image_scalars(vtk_input, data)
-            else:
-                # Fallback: try to find input connection (e.g. if Reslice filter is used)
-                try:
-                    conn = mapper.GetInputConnection(0, 0)
-                    if conn:
-                        producer = conn.GetProducer()
-                        # If producer is a filter (like vtkImageReslice), get its input
-                        if hasattr(producer, "GetInputConnection"):
-                            input_conn = producer.GetInputConnection(0, 0)
-                            if input_conn:
-                                real_input = input_conn.GetProducer().GetOutput()
-                                if isinstance(real_input, vtk.vtkImageData):
-                                    self._update_vtk_image_scalars(real_input, data)
-                except (AttributeError, RuntimeError):
-                    logger.debug("Failed to traverse VTK pipeline for ROI data update.")
+        unique_sources = {}
+        unique_pipelines = {}
+        for top_algorithm, source_image in pipelines:
+            unique_sources[id(source_image)] = source_image
+            unique_pipelines[id(top_algorithm)] = top_algorithm
 
-    def _update_vtk_image_scalars(
-        self, image_data: vtk.vtkImageData, numpy_data: np.ndarray
-    ) -> None:
-        """
-        Efficiently updates the scalars of a vtkImageData object from a numpy array.
-        """
-        from vtk.util import numpy_support
+        for source_image in unique_sources.values():
+            source_image.GetPointData().SetScalars(vtk_array)
+            source_image.Modified()
+        actor_set["axial_3d"]._roi_scalar_buffer = volume
+        for top_algorithm in unique_pipelines.values():
+            top_algorithm.Update()
 
-        # Ensure data is contiguous and of the right type
-        if not numpy_data.flags.c_contiguous:
-            numpy_data = np.ascontiguousarray(numpy_data)
-
-        # Create VTK array
-        vtk_array = numpy_support.numpy_to_vtk(
-            num_array=numpy_data.ravel(), deep=True, array_type=vtk.VTK_UNSIGNED_CHAR
-        )
-
-        # Update point data
-        image_data.GetPointData().SetScalars(vtk_array)
-        image_data.Modified()
+        for actor_key in _ROI_SLICE_ACTOR_KEYS:
+            actor_obj = actor_set[actor_key]
+            actor_obj.GetMapper().Modified()
+            actor_obj.Modified()
+        return True
 
     def update_roi_layer(self, key: str, data: np.ndarray, affine: np.ndarray) -> None:
-        """
-        Updates an existing ROI layer with new data using a 'Swap' strategy.
-        Adds new actors BEFORE removing old ones to prevent flickering.
-        """
-        # Keep reference to old actors
+        """Update an ROI layer while retaining its slice actor pipeline."""
         old_actors = self.roi_slice_actors.get(key)
-
-        # Add new actors (render=False to avoid intermediate frame)
-        self.add_roi_layer(key, data, affine, render=False)
-
-        # Remove old actors
-        if old_actors:
+        if old_actors and self._update_roi_data_in_place(key, data):
+            self._sync_roi_3d_actor(key, data, affine, render=False)
+        else:
+            self.add_roi_layer(key, data, affine, render=False)
+        if old_actors and self.roi_slice_actors.get(key) is not old_actors:
             self._remove_actor_set(old_actors)
-
-        # Restore assigned color for manual ROIs
-        if "manual_roi" in key:
-            assigned_color = (1.0, 0.0, 0.0)
-            if self.main_window and key in self.main_window.roi_layers:
-                assigned_color = self.main_window.roi_layers[key].get(
-                    "color", (1.0, 0.0, 0.0)
-                )
-            self.set_roi_layer_color(key, assigned_color)
-
-        # Final Render
         self._render_all()
-
-        # Explicitly render sagittal window
-        if self._is_render_window_ready(self.sagittal_render_window):
-            self.sagittal_render_window.Render()
 
     def _show_2d_context_menu(
         self, position: QPoint, widget: QVTKRenderWindowInteractor, view_type: str
@@ -2063,6 +2064,98 @@ class VTKPanel:
             return
 
     # ROI Layer Actor Management
+    def _remove_roi_actor_entries(self, key: str, *actor_keys: str) -> None:
+        """Remove selected ROI actor entries from their scenes and registry."""
+        actor_set = self.roi_slice_actors.get(key)
+        if not actor_set:
+            return
+
+        removed = {}
+        for actor_key in actor_keys:
+            actor_obj = actor_set.pop(actor_key, None)
+            if isinstance(actor_obj, vtk.vtkProp):
+                removed[actor_key] = actor_obj
+        if removed:
+            self._remove_actor_set(removed)
+
+    def _sync_roi_3d_actor(
+        self,
+        key: str,
+        data: np.ndarray,
+        affine: np.ndarray,
+        render: bool,
+    ) -> None:
+        """Synchronize the ROI's sphere, rectangle, or contour representation."""
+        actor_set = self.roi_slice_actors.get(key)
+        if actor_set is None:
+            return
+
+        assigned_color = self.main_window.roi_layers[key].get("color", (1.0, 0.0, 0.0))
+        visibility = int(self.main_window.roi_visibility.get(key, True))
+
+        if key in self.sphere_params_per_roi:
+            self._remove_roi_actor_entries(
+                key, "rectangle_3d", "rectangle_points", "contour_3d"
+            )
+            params = self.sphere_params_per_roi[key]
+            self.drawing_manager.update_3d_sphere_visuals(
+                key, params["center"], params["radius"], render=render
+            )
+            sphere_actor = actor_set.get("sphere_3d")
+            if sphere_actor is not None:
+                sphere_actor.SetVisibility(visibility)
+            return
+
+        if key in self.rectangle_params_per_roi:
+            self._remove_roi_actor_entries(
+                key, "sphere_3d", "sphere_source", "contour_3d"
+            )
+            params = self.rectangle_params_per_roi[key]
+            self.drawing_manager.update_3d_rectangle_visuals(
+                key,
+                np.asarray(params["start"]),
+                np.asarray(params["end"]),
+                params.get("view_type", "axial"),
+                render=render,
+            )
+            rectangle_actor = actor_set.get("rectangle_3d")
+            if rectangle_actor is not None:
+                rectangle_actor.SetVisibility(visibility)
+            return
+
+        self._remove_roi_actor_entries(
+            key,
+            "sphere_3d",
+            "sphere_source",
+            "rectangle_3d",
+            "rectangle_points",
+        )
+        cropped = _crop_roi_for_contour(data, affine)
+        old_contour = actor_set.get("contour_3d")
+        if cropped is None:
+            self._remove_roi_actor_entries(key, "contour_3d")
+            return
+
+        cropped_data, cropped_affine = cropped
+        try:
+            contour_actor = actor.contour_from_roi(
+                cropped_data,
+                affine=cropped_affine,
+                color=assigned_color,
+                opacity=0.5,
+            )
+        except (RuntimeError, ValueError, AttributeError) as e:
+            logger.warning(f"Could not create 3D contour for ROI {key}: {e}")
+            return
+
+        if contour_actor is None:
+            return
+        contour_actor.SetVisibility(visibility)
+        self.scene.add(contour_actor)
+        actor_set["contour_3d"] = contour_actor
+        if old_contour is not None and old_contour is not contour_actor:
+            self._remove_actor_set({"contour_3d": old_contour})
+
     def add_roi_layer(
         self, key: str, data: np.ndarray, affine: np.ndarray, render: bool = True
     ) -> None:
@@ -2131,16 +2224,12 @@ class VTKPanel:
                 "interpolation": interpolation_mode,
             }
 
-            # Create TWO sets of actors
-            # Set 1: For the main 3D Scene
             ax_3d = actor.slicer(data, **slicer_params)
-            cor_3d = actor.slicer(data, **slicer_params)
-            sag_3d = actor.slicer(data, **slicer_params)
-
-            # Set 2: For the 2D Ortho Views
-            ax_2d = actor.slicer(data, **slicer_params)
-            cor_2d = actor.slicer(data, **slicer_params)
-            sag_2d = actor.slicer(data, **slicer_params)
+            cor_3d = ax_3d.copy()
+            sag_3d = ax_3d.copy()
+            ax_2d = ax_3d.copy()
+            cor_2d = ax_3d.copy()
+            sag_2d = ax_3d.copy()
 
             is_visible = True
             if self.main_window:
@@ -2197,81 +2286,12 @@ class VTKPanel:
                     "color", (1.0, 0.0, 0.0)
                 )
 
-            # 3D Sphere Visualization
-            # If this ROI is a sphere, create a 3D sphere actor for the main window
-            if (
-                hasattr(self, "sphere_params_per_roi")
-                and key in self.sphere_params_per_roi
-            ):
-                params = self.sphere_params_per_roi[key]
-                center = params["center"]
-                radius = params["radius"]
-
-                # Create sphere actor
-                sphere_actor = actor.sphere(
-                    centers=np.array([center]),
-                    colors=np.array([assigned_color]),  # Use assigned color
-                    radii=radius,
-                    opacity=0.5,  # Semi-transparent to see streamlines inside
-                )
-
-                self.scene.add(sphere_actor)
-                sphere_actor.SetVisibility(vis_flag)
-
-                # Add to actor dict so it gets managed (removed/hidden) automatically
-                self.roi_slice_actors[key]["sphere_3d"] = sphere_actor
-
-            # Rectangle Visualization
-            # If this ROI is a rectangle, create a 2D rectangle actor for the main window
-            if (
-                hasattr(self, "rectangle_params_per_roi")
-                and key in self.rectangle_params_per_roi
-            ):
-                params = self.rectangle_params_per_roi[key]
-                start = np.array(params["start"])
-                end = np.array(params["end"])
-                view_type = params.get("view_type", "axial")
-
-                # Use the helper method which creates the visualization
-                self._update_3d_rectangle_visuals(
-                    key, start, end, view_type, render=render
-                )
-
-                # Set visibility
-                rect_actor = self.roi_slice_actors[key].get("rectangle_3d")
-                if rect_actor:
-                    rect_actor.SetVisibility(vis_flag)
-
-            # For loaded ROIs that are not spheres or rectangles, create a 3D contour actor
-            is_sphere = (
-                hasattr(self, "sphere_params_per_roi")
-                and key in self.sphere_params_per_roi
-            )
-            is_rectangle = (
-                hasattr(self, "rectangle_params_per_roi")
-                and key in self.rectangle_params_per_roi
-            )
-
-            if not is_sphere and not is_rectangle:
-                # Create a 3D contour actor for this ROI
-                try:
-                    contour_actor = actor.contour_from_roi(
-                        data,
-                        affine=affine,
-                        color=assigned_color,
-                        opacity=0.5,
-                    )
-                    contour_actor.SetVisibility(vis_flag)
-                    self.scene.add(contour_actor)
-                    self.roi_slice_actors[key]["contour_3d"] = contour_actor
-                except (RuntimeError, ValueError, AttributeError) as e:
-                    logger.warning(f"Could not create 3D contour for ROI {key}: {e}")
+            self._sync_roi_3d_actor(key, data, affine, render=False)
 
             # Apply transformation ONLY to 2D actors
             self._apply_display_correction(key)
 
-            # Set color
-            self.set_roi_layer_color(key, assigned_color)
+            self.set_roi_layer_color(key, assigned_color, render=False)
 
             # Explicitly force sagittal actor to update (fixes display issue)
             if sag_2d:
@@ -2411,7 +2431,12 @@ class VTKPanel:
         self.roi_slice_actors.clear()
         self._render_all()
 
-    def set_roi_layer_color(self, key: str, color: Tuple[float, float, float]) -> None:
+    def set_roi_layer_color(
+        self,
+        key: str,
+        color: Tuple[float, float, float],
+        render: bool = True,
+    ) -> None:
         """Sets the color (tint) for a specific ROI layer."""
         if key not in self.roi_slice_actors:
             return
@@ -2444,18 +2469,37 @@ class VTKPanel:
 
             # Handle Slicer Actors (Use LUT)
             prop = act.GetProperty()
+            color_mapper = act.GetMapper().GetInputAlgorithm()
+            value_range = (0.0, 1.0)
+            if isinstance(color_mapper, vtk.vtkImageMapToColors):
+                source_lut = color_mapper.GetLookupTable()
+                if source_lut is not None:
+                    value_range = source_lut.GetTableRange()
+            else:
+                color_window = prop.GetColorWindow()
+                color_level = prop.GetColorLevel()
+                value_range = (
+                    color_level - color_window / 2,
+                    color_level + color_window / 2,
+                )
+
             lut = vtk.vtkLookupTable()
             lut.SetNumberOfTableValues(256)
-            w = prop.GetColorWindow()
-            l = prop.GetColorLevel()
-            lut.SetTableRange(l - w / 2, l + w / 2)
+            lut.SetTableRange(*value_range)
             lut.Build()
             for i in range(256):
                 alpha = 0.0 if i == 0 else 1.0
                 lut.SetTableValue(i, r * i / 255, g * i / 255, b * i / 255, alpha)
-            prop.SetLookupTable(lut)
 
-        self._render_all()
+            if isinstance(color_mapper, vtk.vtkImageMapToColors):
+                color_mapper.SetOutputFormatToRGBA()
+                color_mapper.SetLookupTable(lut)
+                color_mapper.Update()
+            else:
+                prop.SetLookupTable(lut)
+
+        if render:
+            self._render_all()
 
     def take_screenshot(self) -> None:
         """Saves a screenshot of the VTK view with an opaque black background, hiding UI overlays."""

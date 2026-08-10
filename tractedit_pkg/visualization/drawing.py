@@ -29,6 +29,50 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _rasterize_world_sphere(
+    roi_data: np.ndarray,
+    center_voxel: np.ndarray,
+    radius_world: float,
+    affine: np.ndarray,
+    shape: Tuple[int, ...],
+    fill_value: int,
+) -> None:
+    """Rasterize a world-space sphere into an arbitrary voxel grid."""
+    linear = affine[:3, :3]
+    inverse_linear = np.linalg.inv(linear)
+    half_extents = radius_world * np.linalg.norm(inverse_linear, axis=1)
+    minimum = np.floor(center_voxel - half_extents).astype(int)
+    maximum = np.ceil(center_voxel + half_extents).astype(int)
+    minimum = np.maximum(minimum, 0)
+    maximum = np.minimum(maximum, np.asarray(shape[:3]) - 1)
+    if np.any(minimum > maximum):
+        return
+
+    dx = (
+        np.arange(minimum[0], maximum[0] + 1, dtype=float)[:, None, None]
+        - center_voxel[0]
+    )
+    dy = (
+        np.arange(minimum[1], maximum[1] + 1, dtype=float)[None, :, None]
+        - center_voxel[1]
+    )
+    dz = (
+        np.arange(minimum[2], maximum[2] + 1, dtype=float)[None, None, :]
+        - center_voxel[2]
+    )
+    distance_squared = np.zeros(tuple(maximum - minimum + 1), dtype=float)
+    for row in linear:
+        world_component = row[0] * dx + row[1] * dy + row[2] * dz
+        distance_squared += world_component * world_component
+
+    roi_patch = roi_data[
+        minimum[0] : maximum[0] + 1,
+        minimum[1] : maximum[1] + 1,
+        minimum[2] : maximum[2] + 1,
+    ]
+    roi_patch[distance_squared <= radius_world**2] = fill_value
+
+
 # ============================================================================
 # Drawing Manager Class
 # ============================================================================
@@ -123,9 +167,6 @@ class DrawingManager:
                 roi_data = self.panel.main_window.roi_layers[roi_name]["data"]
                 roi_affine = self.panel.main_window.roi_layers[roi_name]["affine"]
                 self.panel.add_roi_layer(roi_name, roi_data, roi_affine)
-                self.panel.set_roi_layer_color(
-                    roi_name, (0.0, 188.0 / 255.0, 212.0 / 255.0)
-                )
                 self.panel.main_window.roi_visibility[roi_name] = True
 
             # Handle different drawing modes
@@ -600,6 +641,9 @@ class DrawingManager:
                 changed = changed_stroke or changed_fill
 
             if changed:
+                if not is_sphere and not is_rectangle:
+                    self.panel.sphere_params_per_roi.pop(roi_name, None)
+                    self.panel.rectangle_params_per_roi.pop(roi_name, None)
                 self.panel.update_roi_layer(roi_name, roi_data, roi_affine)
                 status_msg = (
                     "ROI erased."
@@ -643,9 +687,7 @@ class DrawingManager:
                 center_corrected[0] = -center_corrected[0]
 
             if hasattr(mw, "update_sphere_roi_intersection"):
-                mw.update_sphere_roi_intersection(
-                    roi_name, center_corrected, radius
-                )
+                mw.update_sphere_roi_intersection(roi_name, center_corrected, radius)
 
         elif is_rectangle:
             start = points[0].copy()
@@ -745,8 +787,9 @@ class DrawingManager:
             return False
 
         center_vox = vox_points_float[0]
-        edge_vox = vox_points_float[1]
-        radius_vox = np.linalg.norm(center_vox - edge_vox)
+        radius_world = np.linalg.norm(
+            self.panel.drawing_preview_points[0] - self.panel.drawing_preview_points[1]
+        )
 
         # Remove any existing 3D rectangle actor
         if roi_name in self.panel.roi_slice_actors:
@@ -761,12 +804,6 @@ class DrawingManager:
         # Clear rectangle params
         self.panel.rectangle_params_per_roi.pop(roi_name, None)
 
-        # Define bounding box for the NEW sphere
-        min_vox = np.floor(center_vox - radius_vox).astype(int)
-        max_vox = np.ceil(center_vox + radius_vox).astype(int)
-        min_vox = np.maximum(min_vox, 0)
-        max_vox = np.minimum(max_vox, np.array(shape) - 1)
-
         # Clear only what's needed instead of entire volume
         old_nonzero = np.argwhere(roi_data > 0)
         if len(old_nonzero) > 0:
@@ -778,41 +815,26 @@ class DrawingManager:
                 old_min[2] : old_max[2] + 1,
             ] = 0
 
-        x_range = np.arange(min_vox[0], max_vox[0] + 1)
-        y_range = np.arange(min_vox[1], max_vox[1] + 1)
-        z_range = np.arange(min_vox[2], max_vox[2] + 1)
+        roi_affine = self.panel.main_window.roi_layers[roi_name]["affine"]
+        _rasterize_world_sphere(
+            roi_data,
+            center_vox,
+            radius_world,
+            roi_affine,
+            shape,
+            1,
+        )
 
-        if len(x_range) > 0 and len(y_range) > 0 and len(z_range) > 0:
-            xx, yy, zz = np.meshgrid(x_range, y_range, z_range, indexing="ij")
-            dist_sq = (
-                (xx - center_vox[0]) ** 2
-                + (yy - center_vox[1]) ** 2
-                + (zz - center_vox[2]) ** 2
-            )
-            mask = dist_sq <= radius_vox**2
+        center_to_store = self.panel.drawing_preview_points[0].copy()
+        if view_type in ["axial", "coronal"]:
+            center_to_store[0] = -center_to_store[0]
 
-            roi_slice = roi_data[
-                min_vox[0] : max_vox[0] + 1,
-                min_vox[1] : max_vox[1] + 1,
-                min_vox[2] : max_vox[2] + 1,
-            ]
-            roi_slice[mask] = 1
-
-            # Store params
-            if len(self.panel.drawing_preview_points) >= 2:
-                center_to_store = self.panel.drawing_preview_points[0].copy()
-                if view_type in ["axial", "coronal"]:
-                    center_to_store[0] = -center_to_store[0]
-
-                self.panel.sphere_params_per_roi[roi_name] = {
-                    "center": center_to_store,
-                    "radius": np.linalg.norm(
-                        self.panel.drawing_preview_points[0]
-                        - self.panel.drawing_preview_points[1]
-                    ),
-                    "roi_name": roi_name,
-                    "view_type": view_type,
-                }
+        self.panel.sphere_params_per_roi[roi_name] = {
+            "center": center_to_store,
+            "radius": radius_world,
+            "roi_name": roi_name,
+            "view_type": view_type,
+        }
 
         return True
 
@@ -1134,7 +1156,6 @@ class DrawingManager:
         roi_actors = self.panel.roi_slice_actors.get(roi_name)
 
         center_vox = None
-        edge_vox = None
 
         if roi_actors and actor_key in roi_actors:
             actor_obj = roi_actors[actor_key]
@@ -1174,51 +1195,25 @@ class DrawingManager:
             else:
                 center_vox = model_point
 
-            edge_w = center_w + np.array([radius_w, 0, 0])
-            p_h_e = np.append(edge_w, 1.0)
-            model_point_e = np.dot(mat_np, p_h_e)[:3]
-
-            if image_data and isinstance(image_data, vtk.vtkImageData):
-                edge_vox = (model_point_e - np.array(origin)) / np.array(spacing)
-            else:
-                edge_vox = model_point_e
         else:
             p_h = np.append(center_w, 1.0)
             center_vox = np.dot(roi_inv_affine, p_h)[:3]
 
-            edge_w = center_w + np.array([radius_w, 0, 0])
-            p_h_e = np.append(edge_w, 1.0)
-            edge_vox = np.dot(roi_inv_affine, p_h_e)[:3]
-
-        radius_v = np.linalg.norm(center_vox - edge_vox)
-
-        min_v = np.floor(center_vox - radius_v).astype(int)
-        max_v = np.ceil(center_vox + radius_v).astype(int)
-        min_v = np.maximum(min_v, 0)
-        max_v = np.minimum(max_v, np.array(shape) - 1)
-
-        x_r = np.arange(min_v[0], max_v[0] + 1)
-        y_r = np.arange(min_v[1], max_v[1] + 1)
-        z_r = np.arange(min_v[2], max_v[2] + 1)
-
-        if len(x_r) > 0 and len(y_r) > 0 and len(z_r) > 0:
-            xx, yy, zz = np.meshgrid(x_r, y_r, z_r, indexing="ij")
-            dist_sq = (
-                (xx - center_vox[0]) ** 2
-                + (yy - center_vox[1]) ** 2
-                + (zz - center_vox[2]) ** 2
-            )
-            mask = dist_sq <= radius_v**2
-
-            roi_slice = roi_data[
-                min_v[0] : max_v[0] + 1,
-                min_v[1] : max_v[1] + 1,
-                min_v[2] : max_v[2] + 1,
-            ]
-            roi_slice[mask] = fill_val
+        _rasterize_world_sphere(
+            roi_data,
+            center_vox,
+            radius_w,
+            roi_layer["affine"],
+            shape,
+            fill_val,
+        )
 
     def update_3d_sphere_visuals(
-        self, roi_name: str, center: np.ndarray, radius: float
+        self,
+        roi_name: str,
+        center: np.ndarray,
+        radius: float,
+        render: bool = True,
     ) -> None:
         """
         Updates the 3D sphere actor for an ROI in real-time.
@@ -1251,7 +1246,8 @@ class DrawingManager:
 
             # Mark actor as modified and render
             existing_sphere.Modified()
-            self.panel.render_window.Render()
+            if render:
+                self.panel.render_window.Render()
             return
 
         # Need to create a new sphere actor
@@ -1282,7 +1278,8 @@ class DrawingManager:
         self.panel.scene.add(sphere_actor)
         self.panel.roi_slice_actors[roi_name]["sphere_3d"] = sphere_actor
         self.panel.roi_slice_actors[roi_name]["sphere_source"] = sphere_source
-        self.panel.render_window.Render()
+        if render:
+            self.panel.render_window.Render()
 
     def update_3d_rectangle_visuals(
         self,

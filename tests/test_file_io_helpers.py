@@ -28,6 +28,8 @@ from tractedit_pkg.file_io import (
     MemoryMappedImage,
     MAX_VOXELS,
     MMAP_SLICE_CACHE_SIZE,
+    _align_if_oblique,
+    _deoblique_to_voxel_grid,
 )
 
 
@@ -281,6 +283,81 @@ class TestMemoryMappedImage:
 
         # Clear should not raise
         mmap.clear_cache()
+
+
+class TestAnatomicalAlignment:
+    """Tests for canonical orientation and oblique voxel-grid rebasing."""
+
+    @staticmethod
+    def _oblique_affine() -> np.ndarray:
+        angle = np.deg2rad(12.0)
+        rotation = np.array(
+            [
+                [np.cos(angle), -np.sin(angle), 0.0],
+                [np.sin(angle), np.cos(angle), 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+        affine = np.eye(4)
+        affine[:3, :3] = rotation @ np.diag([0.5, 0.75, 1.25])
+        affine[:3, 3] = [-12.0, 8.0, 21.0]
+        return affine
+
+    def test_deoblique_preserves_data_grid_and_world_center(self, tmp_path):
+        data = np.arange(9 * 10 * 11, dtype=np.int16).reshape(9, 10, 11)
+        path = tmp_path / "oblique.nii.gz"
+        nib.save(nib.Nifti1Image(data, self._oblique_affine()), path)
+        image = nib.load(path)
+
+        rebased = _deoblique_to_voxel_grid(image)
+
+        assert rebased.shape == image.shape
+        assert rebased.dataobj is image.dataobj
+        np.testing.assert_array_equal(np.asanyarray(rebased.dataobj), data)
+        np.testing.assert_allclose(
+            nib.affines.voxel_sizes(rebased.affine),
+            nib.affines.voxel_sizes(image.affine),
+        )
+        np.testing.assert_allclose(
+            rebased.affine[:3, :3],
+            np.diag(nib.affines.voxel_sizes(image.affine)),
+        )
+
+        center = (np.asarray(image.shape[:3], dtype=float) - 1.0) / 2.0
+        np.testing.assert_allclose(
+            nib.affines.apply_affine(rebased.affine, center),
+            nib.affines.apply_affine(image.affine, center),
+        )
+
+    def test_align_canonicalizes_discrete_orientation_without_rebasing(self):
+        data = np.arange(4 * 5 * 6, dtype=np.int16).reshape(4, 5, 6)
+        affine = np.diag([-1.0, 2.0, 3.0, 1.0])
+        affine[:3, 3] = [3.0, -4.0, 5.0]
+        image = nib.Nifti1Image(data, affine)
+        expected = nib.as_closest_canonical(image)
+        statuses = []
+
+        aligned = _align_if_oblique(image, "orthogonal.nii.gz", statuses.append)
+
+        assert nib.aff2axcodes(aligned.affine) == ("R", "A", "S")
+        np.testing.assert_array_equal(
+            np.asanyarray(aligned.dataobj), np.asanyarray(expected.dataobj)
+        )
+        np.testing.assert_allclose(aligned.affine, expected.affine)
+        assert statuses == []
+
+    def test_align_rebases_oblique_image_and_reports_status(self):
+        data = np.zeros((9, 10, 11), dtype=np.uint8)
+        image = nib.Nifti1Image(data, self._oblique_affine())
+        statuses = []
+
+        aligned = _align_if_oblique(image, "oblique.nii.gz", statuses.append)
+
+        np.testing.assert_allclose(
+            aligned.affine[:3, :3],
+            np.diag(nib.affines.voxel_sizes(image.affine)),
+        )
+        assert statuses == ["Aligning oblique image grid..."]
 
 
 class TestModuleConstants:

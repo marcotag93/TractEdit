@@ -78,7 +78,7 @@ Load & save streamlines in `.trk`, `.tck`, `.trx`, `.vtk`, `.vtp` formats with w
 ### 🖥️ Visualization
 
 - Multi-view: 3D + Axial, Coronal, Sagittal slices
-- Anatomical overlay with NIfTI support
+- Anatomical overlay with NIfTI support and native-resolution oblique-image display
 - RGB, scalar, or greyscale coloring
 - Line or tube rendering
 
@@ -108,6 +108,7 @@ Load & save streamlines in `.trk`, `.tck`, `.trx`, `.vtk`, `.vtp` formats with w
 
 - **Multi-View Orthogonal Visualization:** Integrated 3D viewer and three linked 2D orthogonal slice views (Axial, Coronal, Sagittal)
 - **Anatomical Image:** Load NIfTI images (`.nii`, `.nii.gz`) for anatomical context and interactive slice navigation
+  - Oblique acquisitions are displayed on their canonical native voxel grid without interpolation, preserving source resolution. For scanner-RAS co-registration, use already-conformed inputs.
 - **3D Visualization** with [VTK](https://vtk.org/) and [FURY](https://fury.gl/)
   - Default orientation (RGB), or scalar-based coloring with dynamic colormap range adjustment, or greyscale
   - **Render as Lines or Tubes:** Toggle between fast line rendering and high-quality 3D tube rendering via **View → Streamline Geometry**
@@ -116,7 +117,7 @@ Load & save streamlines in `.trk`, `.tck`, `.trx`, `.vtk`, `.vtp` formats with w
 #### ROI Support
 
 - **Multi-Layer Anatomical ROI Support:** Load multiple NIfTI images (`.nii`, `.nii.gz`) as Region of Interest (ROI) layers
-  - Independent visibility toggles and color settings
+  - Independent visibility toggles and matching 2D/3D color settings
   - **Logical Filtering:** Right-click ROIs to set them as exclusion or inclusion ROIs for streamlines
 
 #### Interactive ROI Drawing Tools
@@ -294,7 +295,7 @@ No Python setup is required for these versions. Download the latest [release](ht
 * **Windows:** Use the `.exe` file.
 * **macOS (Apple Silicon):** Use the `.dmg` file.
 * **Linux (AppImage):** Use `.AppImage` — portable, runs on most Linux distributions without installation. Simply make it executable (`chmod +x`) and run.
-* **Linux (Debian/Ubuntu):** Use `.deb` — native package for Debian-based distributions. Install with `sudo dpkg -i TractEdit_3.4.6_amd64.deb`.
+* **Linux (Debian/Ubuntu):** Use `.deb` — native package for Debian-based distributions. Install with `sudo dpkg -i TractEdit_3.4.7_amd64.deb`.
 
 
 ---

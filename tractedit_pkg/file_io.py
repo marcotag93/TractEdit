@@ -180,15 +180,47 @@ class MemoryMappedImage:
         self._get_slice_cached.cache_clear()
 
 
+def _deoblique_to_voxel_grid(img: nib.Nifti1Image) -> nib.Nifti1Image:
+    """
+    Rebase an oblique image to its own voxel grid without resampling.
+
+    The oblique affine is replaced by an orthogonal, RAS+ diagonal affine built
+    from the voxel sizes, with the translation chosen so the volume keeps its
+    original world center. The voxel data is left untouched, preserving full
+    resolution and lazy memory-mapping.
+
+    Args:
+        img: Canonical (RAS+) NiBabel image with an oblique affine.
+
+    Returns:
+        Image with the same data and an orthogonal voxel-aligned affine.
+    """
+    shape = np.array(img.shape[:3], dtype=float)
+    vox_sizes = nib.affines.voxel_sizes(img.affine)
+
+    new_affine = np.eye(4)
+    new_affine[:3, :3] = np.diag(vox_sizes)
+
+    center_vox = np.append((shape - 1.0) / 2.0, 1.0)
+    old_center = img.affine @ center_vox
+    new_center = new_affine @ center_vox
+    new_affine[:3, 3] = old_center[:3] - new_center[:3]
+
+    return img.__class__(img.dataobj, new_affine, img.header)
+
+
 def _align_if_oblique(
     img: nib.Nifti1Image, input_path: str, status_updater: callable
 ) -> nib.Nifti1Image:
     """
-    Checks for and corrects oblique image affines (shears/rotations from gantry tilt).
-    Ensures orthogonal layout so FURY renders slices aligned to world X,Y,Z axes.
+    Rebase oblique image affines so anatomy renders upright on its voxel grid.
+
+    The image is placed in canonical RAS+ orientation and, if oblique, its
+    affine is replaced with an orthogonal voxel-aligned one (no resampling, so
+    resolution and memory-mapping are preserved). Scanner-RAS coordinates away
+    from the volume center are intentionally not preserved.
     """
     from nibabel.funcs import as_closest_canonical
-    from nibabel.processing import resample_to_output
 
     img = as_closest_canonical(img)
 
@@ -202,8 +234,8 @@ def _align_if_oblique(
     if is_oblique:
         if status_updater:
             status_updater("Aligning oblique image grid...")
-        logger.info(f"Image {input_path} is oblique. Resampling to orthogonal grid.")
-        img = resample_to_output(img)
+        logger.info(f"Image {input_path} is oblique. Rebasing to voxel grid.")
+        img = _deoblique_to_voxel_grid(img)
 
     return img
 

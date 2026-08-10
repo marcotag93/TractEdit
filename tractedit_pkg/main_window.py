@@ -495,7 +495,6 @@ class MainWindow(QMainWindow):
         roi_layer = self.roi_layers[roi_name]
         roi_data = roi_layer["data"]
         roi_affine = roi_layer["affine"]
-        roi_inv_affine = roi_layer["inv_affine"]
         shape = roi_data.shape
 
         # Clear existing ROI data
@@ -506,36 +505,15 @@ class MainWindow(QMainWindow):
         if stored_view_type in ["axial", "coronal"]:
             center_world[0] = -center_world[0]
 
-        p_h = np.append(center_world, 1.0)
-        center_vox = np.dot(roi_inv_affine, p_h)[:3]
-
-        # Calculate radius in voxels (approximate using affine scaling)
-        voxel_sizes = np.abs(np.diag(roi_affine)[:3])
-        radius_vox = value / np.mean(voxel_sizes)
-
-        # Rasterize sphere
-        min_vox = np.floor(center_vox - radius_vox).astype(int)
-        max_vox = np.ceil(center_vox + radius_vox).astype(int)
-        min_vox = np.maximum(min_vox, 0)
-        max_vox = np.minimum(max_vox, np.array(shape) - 1)
-
-        x_range = np.arange(min_vox[0], max_vox[0] + 1)
-        y_range = np.arange(min_vox[1], max_vox[1] + 1)
-        z_range = np.arange(min_vox[2], max_vox[2] + 1)
-
-        if len(x_range) > 0 and len(y_range) > 0 and len(z_range) > 0:
-            xx, yy, zz = np.meshgrid(x_range, y_range, z_range, indexing="ij")
-            dist_sq = (
-                (xx - center_vox[0]) ** 2
-                + (yy - center_vox[1]) ** 2
-                + (zz - center_vox[2]) ** 2
-            )
-            mask = dist_sq <= radius_vox**2
-            roi_data[
-                min_vox[0] : max_vox[0] + 1,
-                min_vox[1] : max_vox[1] + 1,
-                min_vox[2] : max_vox[2] + 1,
-            ][mask] = 1
+        self.vtk_panel.drawing_manager._rasterize_sphere_at_position(
+            roi_name,
+            roi_data,
+            center_world,
+            value,
+            shape,
+            stored_view_type,
+            1,
+        )
 
         # Update stored radius
         self.vtk_panel.sphere_params_per_roi[roi_name]["radius"] = value
