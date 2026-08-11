@@ -41,18 +41,21 @@ https://github.com/user-attachments/assets/8b95cfea-a0b9-4537-8e0f-0ac645f44294
 
 If you use TractEdit in your research, please cite:
 
-> Tagliaferri, M. (2026). TractEdit: An Open-Source Interactive Tool for Virtual Dissection and Manual Refinement of Diffusion MRI Tractography. *Journal of Neural Engineering*. https://doi.org/10.1088/1741-2552/ae9346
+> Tagliaferri, M., & Cattaneo, L. (2026). TractEdit: An Open-Source Interactive Tool for Virtual Dissection and Manual Refinement of Diffusion MRI Tractography. *Journal of Neural Engineering*, 23(4), 046046. https://doi.org/10.1088/1741-2552/ae9346
 
 **BibTeX:**
 
 ```bibtex
 @article{tagliaferri2026tractedit,
-  author = {Tagliaferri, Marco},
+  author = {Tagliaferri, Marco and Cattaneo, Luigi},
   title = {TractEdit: An Open-Source Interactive Tool for Virtual Dissection and Manual Refinement of Diffusion MRI Tractography},
   journal = {Journal of Neural Engineering},
   publisher = {IOP Publishing},
   issn = {1741-2552},
   year = {2026},
+  volume = {23},
+  number = {4},
+  pages = {046046},
   doi = {10.1088/1741-2552/ae9346},
   url = {https://doi.org/10.1088/1741-2552/ae9346}
 }

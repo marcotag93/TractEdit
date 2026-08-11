@@ -36,10 +36,16 @@ preferred-citation:
   - family-names: "Tagliaferri"
     given-names: "Marco"
     orcid: "https://orcid.org/0000-0002-1800-3977"
+  - family-names: "Cattaneo"
+    given-names: "Luigi"
   title: "TractEdit: An Open-Source Interactive Tool for Virtual Dissection and Manual Refinement of Diffusion MRI Tractography"
   journal: "Journal of Neural Engineering"
   publisher:
     name: "IOP Publishing"
   issn: "1741-2552"
   year: 2026
+  volume: 23
+  issue: 4
+  start: "046046"
+  end: "046046"
   doi: "10.1088/1741-2552/ae9346"
