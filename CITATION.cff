@@ -38,12 +38,13 @@ preferred-citation:
     orcid: "https://orcid.org/0000-0002-1800-3977"
   - family-names: "Cattaneo"
     given-names: "Luigi"
-  title: "TractEdit: An Open-Source Interactive Tool for Virtual Dissection and Manual Refinement of Diffusion MRI Tractography"
+  title: "TractEdit: an open-source interactive tool for virtual dissection and manual refinement of diffusion MRI tractography"
   journal: "Journal of Neural Engineering"
   publisher:
     name: "IOP Publishing"
   issn: "1741-2552"
   year: 2026
+  date-published: "2026-08-11"
   volume: 23
   issue: 4
   start: "046046"
