@@ -37,6 +37,7 @@ https://github.com/user-attachments/assets/8b95cfea-a0b9-4537-8e0f-0ac645f44294
 
 [![Email](https://img.shields.io/badge/Email-marco.tagliaferri%40unitn.it-D14836?style=flat&logo=gmail&logoColor=white)](mailto:marco.tagliaferri@unitn.it)
 [![Email](https://img.shields.io/badge/Email-marco.tagliaferri93%40gmail.com-D14836?style=flat&logo=gmail&logoColor=white)](mailto:marco.tagliaferri93@gmail.com)
+[![ORCID](https://img.shields.io/badge/ORCID-0000--0002--1800--3977-A6CE39?style=flat&logo=orcid&logoColor=white)](https://orcid.org/0000-0002-1800-3977)
 [![GitHub](https://img.shields.io/badge/GitHub-marcotag93-181717?style=flat&logo=github)](https://github.com/marcotag93)
 
 If you use TractEdit in your research, please cite:
