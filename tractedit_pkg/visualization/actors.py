@@ -160,34 +160,65 @@ def create_roi_highlight_actor(
 # =============================================================================
 
 
+def apply_slicer_affine(
+    slicer_actor: vtk.vtkActor,
+    affine: np.ndarray,
+    radiological: bool = False,
+) -> None:
+    """Apply a NIfTI voxel-to-RAS affine without resampling the slicer input."""
+    affine = np.asarray(affine, dtype=np.float64)
+    if affine.shape != (4, 4) or not np.all(np.isfinite(affine)):
+        raise ValueError("Slicer affine must be a finite 4x4 matrix.")
+
+    if radiological:
+        mirror_x = np.diag([-1.0, 1.0, 1.0, 1.0])
+        affine = mirror_x @ affine
+
+    vtk_matrix = vtk.vtkMatrix4x4()
+    for row in range(4):
+        for column in range(4):
+            vtk_matrix.SetElement(row, column, float(affine[row, column]))
+
+    # Keep all spatial state in one matrix so copies compose identically.
+    slicer_actor.SetOrigin(0.0, 0.0, 0.0)
+    slicer_actor.SetPosition(0.0, 0.0, 0.0)
+    slicer_actor.SetOrientation(0.0, 0.0, 0.0)
+    slicer_actor.SetScale(1.0, 1.0, 1.0)
+    slicer_actor.SetUserMatrix(vtk_matrix)
+
+
 def create_slicer_actor(
     data: np.ndarray,
     affine: np.ndarray,
     value_range: Tuple[float, float],
     opacity: float = 1.0,
     interpolation: str = "nearest",
+    radiological: bool = False,
 ) -> Optional[vtk.vtkActor]:
     """
     Creates a FURY slicer actor for anatomical or ROI data.
 
     Args:
         data: 3D numpy array of image data.
-        affine: 4x4 affine transformation matrix.
+        affine: 4x4 NIfTI voxel-to-RAS affine transformation matrix.
         value_range: (min, max) value range for colormap.
         opacity: Actor opacity.
         interpolation: Interpolation mode ("nearest" or "linear").
+        radiological: Mirror scanner-RAS X after applying the affine.
 
     Returns:
         VTK slicer actor, or None if creation fails.
     """
     try:
-        return actor.slicer(
+        slicer_actor = actor.slicer(
             data,
-            affine=affine,
+            affine=np.eye(4),
             value_range=value_range,
             opacity=opacity,
             interpolation=interpolation,
         )
+        apply_slicer_affine(slicer_actor, affine, radiological=radiological)
+        return slicer_actor
     except (RuntimeError, ValueError, AttributeError) as e:
         logger.error(f"Error creating slicer actor: {e}")
         return None

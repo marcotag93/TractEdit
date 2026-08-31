@@ -1849,15 +1849,15 @@ class MainWindow(QMainWindow):
                                 )
                                 continue
 
-                            from .file_io import _align_if_oblique
+                            from .file_io import _canonicalize_image
 
                             anatomical_img = nib.load(self.anatomical_image_path)
-                            anatomical_img = _align_if_oblique(
+                            anatomical_img = _canonicalize_image(
                                 anatomical_img, self.anatomical_image_path, None
                             )
 
                             roi_img = nib.load(roi_path)
-                            roi_img = _align_if_oblique(roi_img, roi_path, None)
+                            roi_img = _canonicalize_image(roi_img, roi_path, None)
                             # Ensure proper coordinate system alignment
                             current_ornt = nib.io_orientation(roi_img.affine)
                             target_ornt = nib.io_orientation(anatomical_img.affine)
@@ -2618,16 +2618,16 @@ class MainWindow(QMainWindow):
 
             try:
                 # Load the main anatomical image object from its stored path
-                from .file_io import _align_if_oblique
+                from .file_io import _canonicalize_image
 
                 anatomical_img = nib.load(self.anatomical_image_path)
-                anatomical_img = _align_if_oblique(
+                anatomical_img = _canonicalize_image(
                     anatomical_img, self.anatomical_image_path, None
                 )
 
                 # Load the ROI image object again to perform reorientation operations
                 roi_img = nib.load(roi_path)
-                roi_img = _align_if_oblique(roi_img, roi_path, None)
+                roi_img = _canonicalize_image(roi_img, roi_path, None)
 
                 # Ensure proper coordinate system alignment
                 current_ornt = nib.io_orientation(roi_img.affine)

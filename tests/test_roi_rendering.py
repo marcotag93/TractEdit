@@ -69,6 +69,12 @@ def _source_image(actor_obj):
     return algorithm.GetOutputDataObject(0)
 
 
+def _vtk_matrix_to_numpy(matrix) -> np.ndarray:
+    return np.array(
+        [[matrix.GetElement(row, col) for col in range(4)] for row in range(4)]
+    )
+
+
 def test_roi_slice_actors_share_one_pipeline():
     data = np.zeros((7, 8, 9), dtype=np.uint8)
     panel, key, affine = _make_panel(data)
@@ -80,6 +86,57 @@ def test_roi_slice_actors_share_one_pipeline():
         for actor_key in SLICE_ACTOR_KEYS
     ]
     assert all(algorithm is algorithms[0] for algorithm in algorithms[1:])
+
+
+def test_oblique_roi_copies_keep_scanner_ras_and_radiological_matrices():
+    data = np.zeros((7, 8, 9), dtype=np.uint8)
+    panel, key, _ = _make_panel(data)
+    affine = np.array(
+        [
+            [0.77, -0.16, 0.04, -33.0],
+            [0.18, 0.69, -0.11, 14.0],
+            [-0.02, 0.12, 1.08, 22.0],
+            [0.00, 0.00, 0.00, 1.00],
+        ]
+    )
+    panel.main_window.anatomical_image_affine = affine
+    panel.main_window.roi_layers[key]["affine"] = affine
+    panel.main_window.roi_layers[key]["inv_affine"] = np.linalg.inv(affine)
+
+    panel.add_roi_layer(key, data, affine, render=False)
+
+    mirror_x = np.diag([-1.0, 1.0, 1.0, 1.0])
+    for actor_key in ("axial_3d", "coronal_3d", "sagittal_3d", "sagittal_2d"):
+        np.testing.assert_allclose(
+            _vtk_matrix_to_numpy(
+                panel.roi_slice_actors[key][actor_key].GetUserMatrix()
+            ),
+            affine,
+        )
+    for actor_key in ("axial_2d", "coronal_2d"):
+        actor_obj = panel.roi_slice_actors[key][actor_key]
+        np.testing.assert_allclose(
+            _vtk_matrix_to_numpy(actor_obj.GetUserMatrix()), mirror_x @ affine
+        )
+        np.testing.assert_allclose(actor_obj.GetScale(), (1.0, 1.0, 1.0))
+
+
+def test_roi_display_correction_restores_composed_matrix():
+    data = np.zeros((7, 8, 9), dtype=np.uint8)
+    panel, key, affine = _make_panel(data)
+    panel.add_roi_layer(key, data, affine, render=False)
+    panel._apply_display_correction = VTKPanel._apply_display_correction.__get__(panel)
+    axial = panel.roi_slice_actors[key]["axial_2d"]
+    axial.SetUserMatrix(None)
+    axial.SetScale(-1.0, 1.0, 1.0)
+    axial.SetPosition(8.0, 2.0, -3.0)
+
+    panel._apply_display_correction(key)
+
+    expected = np.diag([-1.0, 1.0, 1.0, 1.0]) @ affine
+    np.testing.assert_allclose(_vtk_matrix_to_numpy(axial.GetUserMatrix()), expected)
+    np.testing.assert_allclose(axial.GetScale(), (1.0, 1.0, 1.0))
+    np.testing.assert_allclose(axial.GetPosition(), (0.0, 0.0, 0.0))
 
 
 def test_initial_roi_color_updates_the_2d_slicer_lookup_table():

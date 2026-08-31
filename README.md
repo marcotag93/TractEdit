@@ -113,7 +113,7 @@ Load & save streamlines in `.trk`, `.tck`, `.trx`, `.vtk`, `.vtp` formats with w
 
 - **Multi-View Orthogonal Visualization:** Integrated 3D viewer and three linked 2D orthogonal slice views (Axial, Coronal, Sagittal)
 - **Anatomical Image:** Load NIfTI images (`.nii`, `.nii.gz`) for anatomical context and interactive slice navigation
-  - Oblique acquisitions are displayed on their canonical native voxel grid without interpolation, preserving source resolution. For scanner-RAS co-registration, use already-conformed inputs.
+  - Oblique acquisitions are displayed on their canonical native voxel grid without interpolation, preserving both source resolution and scanner-RAS geometry.
 - **3D Visualization** with [VTK](https://vtk.org/) and [FURY](https://fury.gl/)
   - Default orientation (RGB), or scalar-based coloring with dynamic colormap range adjustment, or greyscale
   - **Render as Lines or Tubes:** Toggle between fast line rendering and high-quality 3D tube rendering via **View → Streamline Geometry**

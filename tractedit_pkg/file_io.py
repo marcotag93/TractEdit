@@ -180,64 +180,27 @@ class MemoryMappedImage:
         self._get_slice_cached.cache_clear()
 
 
-def _deoblique_to_voxel_grid(img: nib.Nifti1Image) -> nib.Nifti1Image:
-    """
-    Rebase an oblique image to its own voxel grid without resampling.
-
-    The oblique affine is replaced by an orthogonal, RAS+ diagonal affine built
-    from the voxel sizes, with the translation chosen so the volume keeps its
-    original world center. The voxel data is left untouched, preserving full
-    resolution and lazy memory-mapping.
-
-    Args:
-        img: Canonical (RAS+) NiBabel image with an oblique affine.
-
-    Returns:
-        Image with the same data and an orthogonal voxel-aligned affine.
-    """
-    shape = np.array(img.shape[:3], dtype=float)
-    vox_sizes = nib.affines.voxel_sizes(img.affine)
-
-    new_affine = np.eye(4)
-    new_affine[:3, :3] = np.diag(vox_sizes)
-
-    center_vox = np.append((shape - 1.0) / 2.0, 1.0)
-    old_center = img.affine @ center_vox
-    new_center = new_affine @ center_vox
-    new_affine[:3, 3] = old_center[:3] - new_center[:3]
-
-    return img.__class__(img.dataobj, new_affine, img.header)
-
-
-def _align_if_oblique(
+def _canonicalize_image(
     img: nib.Nifti1Image, input_path: str, status_updater: callable
 ) -> nib.Nifti1Image:
     """
-    Rebase oblique image affines so anatomy renders upright on its voxel grid.
+    Reorient an image to the closest canonical voxel order without resampling.
 
-    The image is placed in canonical RAS+ orientation and, if oblique, its
-    affine is replaced with an orthogonal voxel-aligned one (no resampling, so
-    resolution and memory-mapping are preserved). Scanner-RAS coordinates away
-    from the volume center are intentionally not preserved.
+    NiBabel reorders/flips the data proxy and composes the affine accordingly,
+    so every voxel retains its original scanner-RAS position. Oblique rotation
+    and shear are deliberately preserved for the rendering transform.
     """
     from nibabel.funcs import as_closest_canonical
 
-    img = as_closest_canonical(img)
-
-    if hasattr(nib.affines, "obliquity"):
-        obliquity = nib.affines.obliquity(img.affine)
-        is_oblique = np.any(np.abs(obliquity) > 1e-4)
-    else:
-        rot_part = img.affine[:3, :3]
-        is_oblique = not np.allclose(rot_part, np.diag(np.diag(rot_part)), atol=1e-4)
-
-    if is_oblique:
-        if status_updater:
-            status_updater("Aligning oblique image grid...")
-        logger.info(f"Image {input_path} is oblique. Rebasing to voxel grid.")
-        img = _deoblique_to_voxel_grid(img)
-
-    return img
+    original_orientation = nib.aff2axcodes(img.affine)
+    canonical = as_closest_canonical(img)
+    if nib.aff2axcodes(canonical.affine) != original_orientation:
+        logger.info(
+            "Image %s reoriented from %s to RAS+ without resampling.",
+            input_path,
+            original_orientation,
+        )
+    return canonical
 
 
 def _maybe_downsample_image(
@@ -803,7 +766,7 @@ class AnatomicalImageLoaderThread(QThread):
             # Load the NIfTI file (lazy - data not loaded yet)
             img = nib.load(self.input_path)
 
-            img = _align_if_oblique(
+            img = _canonicalize_image(
                 img, self.input_path, lambda msg: self.progress.emit(15, msg)
             )
 
@@ -1557,7 +1520,7 @@ def load_anatomical_image(
         # Load NIfTI (lazy - data not loaded yet)
         img = nib.load(input_path)
 
-        img = _align_if_oblique(img, input_path, status_updater)
+        img = _canonicalize_image(img, input_path, status_updater)
 
         # Use auto-downsampling for large images
         image_data, image_affine, was_downsampled = _maybe_downsample_image(img)
@@ -1666,7 +1629,7 @@ def load_roi_images(
         try:
             img = nib.load(input_path)
 
-            img = _align_if_oblique(img, input_path, status_updater)
+            img = _canonicalize_image(img, input_path, status_updater)
 
             image_data_raw = img.get_fdata()
             image_affine = img.affine

@@ -73,38 +73,16 @@ class SceneManager:
         if not vp.axial_scene:
             return
         try:
-            cam = vp.axial_scene.GetActiveCamera()
-            if not cam.GetParallelProjection():
-                cam.SetParallelProjection(1)
-
-            if reset_zoom_pan or not vp.axial_slice_actor:
-                # Full reset (initial setup or fallback)
-                vp.axial_scene.reset_camera()
-                if not cam.GetParallelProjection():
-                    cam.SetParallelProjection(1)
-                fp = cam.GetFocalPoint()
-                dist = cam.GetDistance()
-                cam.SetPosition(fp[0], fp[1], fp[2] + dist)  # View from +Z
-                cam.SetFocalPoint(fp[0], fp[1], fp[2])
-                cam.SetViewUp(0, 1, 0)
-            else:
-                # Just follow the slice in Z, keeping X,Y pan and zoom
-                actor_center = vp.axial_slice_actor.GetCenter()
-
-                current_fp = cam.GetFocalPoint()
-                current_pos = cam.GetPosition()
-
-                new_focal_z = actor_center[2]
-                z_delta = new_focal_z - current_fp[2]
-
-                # Only update if the slice has actually moved in Z
-                if abs(z_delta) > 1e-6:
-                    cam.SetFocalPoint(current_fp[0], current_fp[1], new_focal_z)
-                    cam.SetPosition(
-                        current_pos[0], current_pos[1], current_pos[2] + z_delta
-                    )
-
-            vp.axial_scene.reset_clipping_range()
+            slicer_actor = vp.axial_slice_actor_2d or vp.axial_slice_actor
+            self._update_slice_camera(
+                vp.axial_scene,
+                slicer_actor,
+                slice_axis=2,
+                view_sign=1,
+                view_up_axis=1,
+                radiological=True,
+                reset_zoom_pan=reset_zoom_pan,
+            )
         except (RuntimeError, ValueError, AttributeError) as e:
             logger.error(f"Error updating axial camera: {e}")
 
@@ -114,37 +92,16 @@ class SceneManager:
         if not vp.coronal_scene:
             return
         try:
-            cam = vp.coronal_scene.GetActiveCamera()
-            if not cam.GetParallelProjection():
-                cam.SetParallelProjection(1)
-
-            if reset_zoom_pan or not vp.coronal_slice_actor:
-                # Full reset
-                vp.coronal_scene.reset_camera()
-                if not cam.GetParallelProjection():
-                    cam.SetParallelProjection(1)
-                fp = cam.GetFocalPoint()
-                dist = cam.GetDistance()
-                cam.SetPosition(fp[0], fp[1] - dist, fp[2])  # View from -Y
-                cam.SetFocalPoint(fp[0], fp[1], fp[2])
-                cam.SetViewUp(0, 0, 1)  # Up is Z
-            else:
-                # Just follow the slice in Y
-                actor_center = vp.coronal_slice_actor.GetCenter()
-
-                current_fp = cam.GetFocalPoint()
-                current_pos = cam.GetPosition()
-
-                new_focal_y = actor_center[1]
-                y_delta = new_focal_y - current_fp[1]
-
-                if abs(y_delta) > 1e-6:
-                    cam.SetFocalPoint(current_fp[0], new_focal_y, current_fp[2])
-                    cam.SetPosition(
-                        current_pos[0], current_pos[1] + y_delta, current_pos[2]
-                    )
-
-            vp.coronal_scene.reset_clipping_range()
+            slicer_actor = vp.coronal_slice_actor_2d or vp.coronal_slice_actor
+            self._update_slice_camera(
+                vp.coronal_scene,
+                slicer_actor,
+                slice_axis=1,
+                view_sign=-1,
+                view_up_axis=2,
+                radiological=True,
+                reset_zoom_pan=reset_zoom_pan,
+            )
         except (RuntimeError, ValueError, AttributeError) as e:
             logger.error(f"Error updating coronal camera: {e}")
 
@@ -154,39 +111,18 @@ class SceneManager:
         if not vp.sagittal_scene:
             return
         try:
-            cam = vp.sagittal_scene.GetActiveCamera()
-            if not cam.GetParallelProjection():
-                cam.SetParallelProjection(1)
+            slicer_actor = vp.sagittal_slice_actor_2d or vp.sagittal_slice_actor
+            cam = self._update_slice_camera(
+                vp.sagittal_scene,
+                slicer_actor,
+                slice_axis=0,
+                view_sign=1,
+                view_up_axis=2,
+                radiological=False,
+                reset_zoom_pan=reset_zoom_pan,
+            )
 
-            if reset_zoom_pan or not vp.sagittal_slice_actor:
-                vp.sagittal_scene.reset_camera()
-                if not cam.GetParallelProjection():
-                    cam.SetParallelProjection(1)
-                fp = cam.GetFocalPoint()
-                dist = cam.GetDistance()
-                cam.SetPosition(
-                    fp[0] + dist, fp[1], fp[2]
-                )  # View from Right (+X) to Left (-X)
-                cam.SetFocalPoint(fp[0], fp[1], fp[2])
-                cam.SetViewUp(0, 0, 1)  # Up is Z
-            else:
-                actor_center = vp.sagittal_slice_actor.GetCenter()
-
-                current_fp = cam.GetFocalPoint()
-                current_pos = cam.GetPosition()
-
-                new_focal_x = actor_center[0]
-                x_delta = new_focal_x - current_fp[0]
-
-                if abs(x_delta) > 1e-6:
-                    cam.SetFocalPoint(new_focal_x, current_fp[1], current_fp[2])
-                    cam.SetPosition(
-                        current_pos[0] + x_delta, current_pos[1], current_pos[2]
-                    )
-
-            vp.sagittal_scene.reset_clipping_range()
-
-            # Expand the clipping range to ensure the crosshair in the overlay is never clipped
+            # Keep the crosshair in the overlay outside the clipping planes.
             near, far = cam.GetClippingRange()
             cam.SetClippingRange(near * 0.01, far * 100)
 
@@ -198,6 +134,53 @@ class SceneManager:
                 vp.sagittal_overlay_renderer.SetActiveCamera(cam)
         except (RuntimeError, ValueError, AttributeError) as e:
             logger.error(f"Error updating sagittal camera: {e}")
+
+    def _update_slice_camera(
+        self,
+        scene: window.Scene,
+        slicer_actor: Optional[vtk.vtkActor],
+        slice_axis: int,
+        view_sign: int,
+        view_up_axis: int,
+        radiological: bool,
+        reset_zoom_pan: bool,
+    ) -> vtk.vtkCamera:
+        """Orient or translate one orthographic camera in displayed RAS space."""
+        vp = self.vtk_panel
+        affine = getattr(vp.main_window, "anatomical_image_affine", None)
+        if affine is None:
+            affine = np.eye(4)
+        direction, view_up = coordinates.camera_frame_from_affine(
+            affine,
+            slice_axis,
+            view_sign,
+            view_up_axis,
+            radiological=radiological,
+        )
+
+        cam = scene.GetActiveCamera()
+        cam.SetParallelProjection(1)
+        if reset_zoom_pan or slicer_actor is None:
+            scene.reset_camera()
+            cam.SetParallelProjection(1)
+            focal_point = np.asarray(cam.GetFocalPoint())
+            distance = cam.GetDistance()
+            cam.SetPosition(*(focal_point + direction * distance))
+            cam.SetFocalPoint(*focal_point)
+            cam.SetViewUp(*view_up)
+        else:
+            new_position, new_focal = coordinates.translate_camera_to_plane(
+                cam.GetPosition(),
+                cam.GetFocalPoint(),
+                slicer_actor.GetCenter(),
+                direction,
+            )
+            if np.linalg.norm(new_focal - np.asarray(cam.GetFocalPoint())) > 1e-6:
+                cam.SetPosition(*new_position)
+                cam.SetFocalPoint(*new_focal)
+
+        scene.reset_clipping_range()
+        return cam
 
     def reset_2d_view(self, view_type: str) -> None:
         """
@@ -370,7 +353,7 @@ class SceneManager:
         vp.axial_crosshair_actor.GetProperty().SetColor(1, 1, 0)  # Yellow
         vp.axial_crosshair_actor.GetProperty().SetLineWidth(1.0)
         vp.axial_crosshair_actor.GetProperty().SetOpacity(0.8)
-        # Radiological convention: match slice actor SetScale(-1, 1, 1)
+        # Radiological convention: match the slice actor's mirrored user matrix.
         vp.axial_crosshair_actor.SetScale(-1, 1, 1)
         vp.axial_scene.add(vp.axial_crosshair_actor)
 
@@ -393,7 +376,7 @@ class SceneManager:
         vp.coronal_crosshair_actor.GetProperty().SetColor(1, 1, 0)
         vp.coronal_crosshair_actor.GetProperty().SetLineWidth(1.0)
         vp.coronal_crosshair_actor.GetProperty().SetOpacity(0.8)
-        # Radiological convention: match slice actor SetScale(-1, 1, 1)
+        # Radiological convention: match the slice actor's mirrored user matrix.
         vp.coronal_crosshair_actor.SetScale(-1, 1, 1)
         vp.coronal_scene.add(vp.coronal_crosshair_actor)
 

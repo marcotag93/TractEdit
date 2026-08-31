@@ -43,6 +43,7 @@ from .selection import SelectionManager
 from .streamlines import StreamlinesManager
 from .scale_bar import ScaleBarManager
 from . import coordinates
+from .actors import apply_slicer_affine, create_slicer_actor
 
 logger = logging.getLogger(__name__)
 
@@ -866,9 +867,14 @@ class VTKPanel:
         extent_z = abs(bounds[5] - bounds[4])
         max_extent = max(extent_x, extent_z)
 
-        # Override to anterior-facing coronal view (looking from +Y toward -Y)
-        cam.SetPosition(fp[0], fp[1] + max_extent * 2.0, fp[2])
-        cam.SetViewUp(0, 0, 1)
+        affine = self.main_window.anatomical_image_affine
+        direction, view_up = coordinates.camera_frame_from_affine(
+            affine, slice_axis=1, view_sign=1, view_up_axis=2
+        )
+
+        # Anterior-facing coronal view relative to the displayed image axes.
+        cam.SetPosition(*(np.asarray(fp) + direction * max_extent * 2.0))
+        cam.SetViewUp(*view_up)
 
         self.scene.reset_clipping_range()
 
@@ -1161,86 +1167,73 @@ class VTKPanel:
             slicer_opacity = getattr(self.main_window, "image_opacity", 1.0)
             interpolation_mode = "nearest"
 
-            # Create Slicer Actors using FURY's default gray LUT
-            # Axial Slice (Z plane)
-            self.axial_slice_actor = actor.slicer(
+            # One native-grid pipeline is shared by all anatomical views.
+            self.axial_slice_actor = create_slicer_actor(
                 image_data,
-                affine=affine,
-                value_range=value_range,
-                opacity=slicer_opacity,
-                interpolation=interpolation_mode,
+                affine,
+                value_range,
+                slicer_opacity,
+                interpolation_mode,
             )
+            if self.axial_slice_actor is None:
+                raise RuntimeError("Could not create anatomical slicer actor.")
+            self.coronal_slice_actor = self.axial_slice_actor.copy()
+            self.sagittal_slice_actor = self.axial_slice_actor.copy()
+            self.axial_slice_actor_2d = self.axial_slice_actor.copy()
+            self.coronal_slice_actor_2d = self.axial_slice_actor.copy()
+            self.sagittal_slice_actor_2d = self.axial_slice_actor.copy()
+
+            for slicer_actor in (
+                self.axial_slice_actor,
+                self.coronal_slice_actor,
+                self.sagittal_slice_actor,
+                self.sagittal_slice_actor_2d,
+            ):
+                apply_slicer_affine(slicer_actor, affine)
+            for slicer_actor in (
+                self.axial_slice_actor_2d,
+                self.coronal_slice_actor_2d,
+            ):
+                apply_slicer_affine(slicer_actor, affine, radiological=True)
+            for slicer_actor in (
+                self.axial_slice_actor_2d,
+                self.coronal_slice_actor_2d,
+                self.sagittal_slice_actor_2d,
+            ):
+                slicer_actor.GetProperty().SetOpacity(1.0)
+
             self.axial_slice_actor.display_extent(
                 x_extent[0], x_extent[1], y_extent[0], y_extent[1], current_z, current_z
             )
             self.scene.add(self.axial_slice_actor)
 
             # 2D Actor (Uses FIXED opacity of 1.0)
-            self.axial_slice_actor_2d = actor.slicer(
-                image_data,
-                affine=affine,
-                value_range=value_range,
-                opacity=1.0,
-                interpolation=interpolation_mode,
-            )
             self.axial_slice_actor_2d.display_extent(
                 x_extent[0], x_extent[1], y_extent[0], y_extent[1], current_z, current_z
             )
             if self.axial_scene:
                 self.axial_scene.add(self.axial_slice_actor_2d)
-                # Radiological convention: mirror X so patient-left appears on screen-right
-                self.axial_slice_actor_2d.SetScale(-1, 1, 1)
 
             # Coronal Slice (Y plane)
-            self.coronal_slice_actor = actor.slicer(
-                image_data,
-                affine=affine,
-                value_range=value_range,
-                opacity=slicer_opacity,
-                interpolation=interpolation_mode,
-            )
             self.coronal_slice_actor.display_extent(
                 x_extent[0], x_extent[1], current_y, current_y, z_extent[0], z_extent[1]
             )
             self.scene.add(self.coronal_slice_actor)
 
             # 2D Actor
-            self.coronal_slice_actor_2d = actor.slicer(
-                image_data,
-                affine=affine,
-                value_range=value_range,
-                opacity=1.0,
-                interpolation=interpolation_mode,
-            )
             self.coronal_slice_actor_2d.display_extent(
                 x_extent[0], x_extent[1], current_y, current_y, z_extent[0], z_extent[1]
             )
             if self.coronal_scene:
                 self.coronal_scene.add(self.coronal_slice_actor_2d)
-                # Radiological convention: mirror X so patient-left appears on screen-right
-                self.coronal_slice_actor_2d.SetScale(-1, 1, 1)
 
             # Sagittal Slice (X plane)
-            self.sagittal_slice_actor = actor.slicer(
-                image_data,
-                affine=affine,
-                value_range=value_range,
-                opacity=slicer_opacity,
-                interpolation=interpolation_mode,
-            )
             self.sagittal_slice_actor.display_extent(
                 current_x, current_x, y_extent[0], y_extent[1], z_extent[0], z_extent[1]
             )
             self.scene.add(self.sagittal_slice_actor)
 
             # 2D Actor
-            self.sagittal_slice_actor_2d = actor.slicer(
-                image_data,
-                affine=affine,
-                value_range=value_range,
-                opacity=1.0,
-                interpolation=interpolation_mode,
-            )
             self.sagittal_slice_actor_2d.display_extent(
                 current_x, current_x, y_extent[0], y_extent[1], z_extent[0], z_extent[1]
             )
@@ -1791,7 +1784,7 @@ class VTKPanel:
         # Get the 3D position of the pick
         world_pos = list(picker.GetPickPosition())
 
-        # Reverse the effect of SetScale(-1, 1, 1) applied to 2D radiological actors
+        # Reverse the X mirror composed into the 2D radiological actor matrix.
         if interactor in (self.axial_interactor, self.coronal_interactor):
             world_pos[0] = -world_pos[0]
 
@@ -2217,19 +2210,25 @@ class VTKPanel:
         roi_z_ext = (0, roi_shape[2] - 1)
 
         try:
-            slicer_params = {
-                "affine": affine,
-                "value_range": value_range,
-                "opacity": slicer_opacity,
-                "interpolation": interpolation_mode,
-            }
-
-            ax_3d = actor.slicer(data, **slicer_params)
+            ax_3d = create_slicer_actor(
+                data,
+                affine,
+                value_range,
+                slicer_opacity,
+                interpolation_mode,
+            )
+            if ax_3d is None:
+                raise RuntimeError("Could not create ROI slicer actor.")
             cor_3d = ax_3d.copy()
             sag_3d = ax_3d.copy()
             ax_2d = ax_3d.copy()
             cor_2d = ax_3d.copy()
             sag_2d = ax_3d.copy()
+
+            for slicer_actor in (ax_3d, cor_3d, sag_3d, sag_2d):
+                apply_slicer_affine(slicer_actor, affine)
+            for slicer_actor in (ax_2d, cor_2d):
+                apply_slicer_affine(slicer_actor, affine, radiological=True)
 
             is_visible = True
             if self.main_window:
@@ -2275,10 +2274,6 @@ class VTKPanel:
             self.coronal_scene.add(cor_2d)
             self.sagittal_scene.add(sag_2d)
 
-            # Radiological convention: match anatomical actors' SetScale(-1, 1, 1)
-            ax_2d.SetScale(-1, 1, 1)
-            cor_2d.SetScale(-1, 1, 1)
-
             # Get assigned color from MainWindow (or default to Red)
             assigned_color = (1.0, 0.0, 0.0)
             if self.main_window and key in self.main_window.roi_layers:
@@ -2320,6 +2315,10 @@ class VTKPanel:
         if roi_key not in self.roi_slice_actors:
             return
 
+        roi_info = self.main_window.roi_layers.get(roi_key)
+        if not roi_info or "affine" not in roi_info:
+            return
+
         roi_actors = self.roi_slice_actors[roi_key]
 
         # Only correct the 2D actors
@@ -2328,16 +2327,7 @@ class VTKPanel:
         for actor_type in targets:
             actor_obj = roi_actors.get(actor_type)
             if actor_obj:
-                current_pos = actor_obj.GetPosition()
-                # Radiological convention: mirror X for axial/coronal 2D actors
-                actor_obj.SetScale(-1, 1, 1)
-
-                # Adjustment for position
-                bounds = actor_obj.GetBounds()
-                if bounds[0] != 1.0 and bounds[1] != 1.0:
-                    actor_obj.SetPosition(
-                        -current_pos[0], current_pos[1], current_pos[2]
-                    )
+                apply_slicer_affine(actor_obj, roi_info["affine"], radiological=True)
 
     def _update_3d_sphere_visuals(
         self, roi_name: str, center: np.ndarray, radius: float
