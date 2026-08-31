@@ -567,8 +567,8 @@ def main() -> None:
     except Exception:
         _version = "unknown"
 
-    # Handle --version before argparse to ensure proper multiline output
-    if "--version" in sys.argv or "-V" in sys.argv:
+    # Handle version flags before argparse to ensure proper multiline output
+    if any(flag in sys.argv for flag in ("--version", "-V", "-v")):
         _sep = "=" * 60
         print(_sep)
         print("TractEdit ")
