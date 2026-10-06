@@ -24,9 +24,7 @@
 > [!IMPORTANT]
 > **Research Use Only.** TractEdit is a research tool for the visualization, virtual dissection, and quality control of diffusion MRI tractography. It is **not a medical device**, has not been clinically validated, and holds no regulatory clearance (FDA / CE). It must not be used for diagnosis, treatment planning, or neurosurgical guidance.
 
-
 https://github.com/user-attachments/assets/8b95cfea-a0b9-4537-8e0f-0ac645f44294
-
 
 ---
 
@@ -71,6 +69,7 @@ If you use TractEdit in your research, please cite:
 - [Getting Started](#getting-started-manual-install)
 - [Keyboard Shortcuts](#keyboard-shortcuts)
 - [Sample Workflow](#sample-workflow)
+- [Save and Restore Sessions](#save-and-restore-sessions)
 - [Author](#-author)
 - [License](#license)
 
@@ -80,10 +79,13 @@ If you use TractEdit in your research, please cite:
 
 Load & save streamlines in `.trk`, `.tck`, `.trx`, `.vtk`, `.vtp` formats with whole-brain support (>5M streamlines)
 
+Save and reopen an editing session from the **File** menu to resume work in the
+four-view workspace.
+
 ### 🖥️ Visualization
 
 - Multi-view: 3D + Axial, Coronal, Sagittal slices
-- Anatomical overlay with NIfTI support and native-resolution oblique-image display
+- Affine-aware oblique NIfTI display with bounded previews for large volumes
 - RGB, scalar, or greyscale coloring
 - Line or tube rendering
 
@@ -113,7 +115,7 @@ Load & save streamlines in `.trk`, `.tck`, `.trx`, `.vtk`, `.vtp` formats with w
 
 - **Multi-View Orthogonal Visualization:** Integrated 3D viewer and three linked 2D orthogonal slice views (Axial, Coronal, Sagittal)
 - **Anatomical Image:** Load NIfTI images (`.nii`, `.nii.gz`) for anatomical context and interactive slice navigation
-  - Oblique acquisitions are displayed on their canonical native voxel grid without interpolation, preserving both source resolution and scanner-RAS geometry.
+  - Oblique acquisitions preserve scanner-RAS geometry. Volumes within the display budget use native voxel data; larger volumes use a strided, smoothed preview with an affine adjusted for the stride.
 - **3D Visualization** with [VTK](https://vtk.org/) and [FURY](https://fury.gl/)
   - Default orientation (RGB), or scalar-based coloring with dynamic colormap range adjustment, or greyscale
   - **Render as Lines or Tubes:** Toggle between fast line rendering and high-quality 3D tube rendering via **View → Streamline Geometry**
@@ -154,13 +156,18 @@ Load & save streamlines in `.trk`, `.tck`, `.trx`, `.vtk`, `.vtp` formats with w
 
 #### Export Options
 
+- **Sessions:** Save the editing state and reopen it later, including ROI data,
+  undo/redo, filters, selections, ODF tunnel and the four views. See
+  [Save and Restore Sessions](#save-and-restore-sessions) for the workflow and
+  source-file requirements.
 - **Track Density Imaging (TDI):** Save density maps of visible streamlines as NIfTI files
-- **HTML Export (Experimental):** Export interactive 3D visualization as self-contained HTML file
+- **HTML Export (Experimental):** Share the visible 3D scene as a self-contained,
+  offline HTML file. Simplified geometry is for viewing, not quantitative analysis.
 - Screenshot export in multiple formats
 
 #### Bundle Analytics
 
-- Calculate **Centroid** and **Medoid** (both AOT-compiled) of the edited bundle with cancellable progress and batched distance computation
+- Calculate **Centroid** and **Medoid** of the edited bundle with AOT distance kernels, bounded historical tie handling.
 
 #### UI & Performance
 
@@ -169,10 +176,17 @@ Load & save streamlines in `.trk`, `.tck`, `.trx`, `.vtk`, `.vtp` formats with w
 - **Keyboard Shortcuts** for fast interaction (see full list below)
 - **Fast Startup:** Splash screen implementation for immediate feedback and optimized library loading
 - **Background Loading:** Non-blocking threaded loading for large streamline bundles and anatomical images
-- **Memory-Mapped Images:** Efficient on-demand slice extraction for large anatomical images without loading full volume into RAM
+- **Large-volume previews:** Stride NIfTI proxies before float32 conversion for
+  bounded display data. Canonicalization and native-size previews may still
+  materialize the source volume.
 - **Modular Architecture:** Refactored codebase with dedicated manager classes (ThemeManager, StateManager, SelectionManager, etc.) for improved maintainability
-- **Performance Optimizations:** AOT-compiled numerical kernels with binary search resampling and parallel batch processing for geometric computations, Numpy vectorizations, debounced UI updates, pre-computed bounding boxes for fast selection, TRX bbox cache on reload (`_tractedit_bboxes`), and TRX-native save path (`select(copy_safe=True)` + `tbx.save()`) to avoid nibabel round-trips
-- **Reliability:** Comprehensive automated test suite (152 tests) ensuring stability of core features
+- **Performance Optimizations:** AOT-compiled numerical kernels with binary
+  search resampling and GIL-releasing parallel batch wrappers for measured large
+  workloads; small workloads stay serial. NumPy vectorizations, debounced UI
+  updates, pre-computed bounding boxes, validated TRX bbox cache reuse
+  (`_tractedit_bboxes`), proxy-strided previews, and TRX-native saves avoid
+  unnecessary work and format round-trips.
+- **Reliability:** Automated regression tests cover core features and scientific data handling.
 
 #### 💡 Tips for Large Datasets
 
@@ -235,7 +249,6 @@ The application can now be launched using the tractedit command installed via pi
 tractedit
 ```
 
-
 #### Command Line Options
 
 ```bash
@@ -246,7 +259,7 @@ tractedit bundle.trk --anat T1w.nii.gz
 tractedit bundle.trk --anat T1w.nii.gz --load-roi roi1.nii.gz --load-roi roi2.nii.gz
 
 # Load file creating a spherical ROI at RAS coordinates
-tractedit bundle.trk --anat T1w.nii.gz --roi 10,20,30 --radius 5
+tractedit bundle.trk --anat T1w.nii.gz --roi 10 20 30 --radius 5
 
 # Headless format conversion (no GUI)
 tractedit input.trk --convert-to output.trx
@@ -279,9 +292,7 @@ If you want to contribute or build from source, install the full development sta
 # Install all dependency groups
 poetry install --with build,dev,test
 
-# Build the AOT-compiled numerical extension for your OS
-# (this step is automatic when using `pip install .`, but
-# must be run manually after `poetry install`)
+# Rebuild after changing an AOT kernel
 python tractedit_pkg/_numba_aot/build_aot.py
 
 # Run the app
@@ -291,7 +302,14 @@ poetry run tractedit
 poetry run pytest tests/ -v
 ```
 
-> **Note:** The AOT extension produces a platform-specific binary (`.pyd` on Windows, `.so` on Linux/macOS) and must be rebuilt after modifying any functions in `tractedit_pkg/_numba_aot/build_aot.py`. These compiled files are not tracked in git — each developer builds them locally.
+> **Note:** `pip install .`, `pip install -e .`, and `poetry install` compile the AOT extension automatically. The build produces a platform-specific binary (`.pyd` on Windows, `.so` on Linux/macOS); rebuild it after modifying `tractedit_pkg/_numba_aot/build_aot.py`. Compiled files are not tracked in git.
+
+### Automated Build Checks
+
+[GitHub Actions](.github/workflows/build-releases.yml) checks Python packaging and
+tests conversion, metadata, TDI geometry and GUI startup in all four packages.
+AppImage also receives FUSE, ELF and offline Firejail checks on Ubuntu 22.04/24.04.
+Only build packages are uploaded; releases are published manually.
 
 ### Pre-built Executables
 
@@ -300,39 +318,39 @@ No Python setup is required for these versions. Download the latest [release](ht
 * **Windows:** Use the `.exe` file.
 * **macOS (Apple Silicon):** Use the `.dmg` file.
 * **Linux (AppImage):** Use `.AppImage` — portable, runs on most Linux distributions without installation. Simply make it executable (`chmod +x`) and run.
-* **Linux (Debian/Ubuntu):** Use `.deb` — native package for Debian-based distributions. Install with `sudo dpkg -i TractEdit_3.4.8_amd64.deb`.
+* **Linux (Debian/Ubuntu):** Use `.deb` — native package for Debian-based distributions. Install  with `sudo dpkg -i ./TractEdit_VERSION_amd64.deb`.
 
 
 ---
 
 ## Keyboard Shortcuts
 
-| Key / Combo                 | Action                                                        |
-| --------------------------- | ------------------------------------------------------------- |
-| **s**                 | Add streamlines at cursor to selection (selection grows only)   |
+| Key / Combo                 | Action                                                               |
+| --------------------------- | -------------------------------------------------------------------- |
+| **s**                 | Add streamlines at cursor to selection (selection grows only)        |
 | **Shift+s**           | Remove streamlines at cursor from selection (selection shrinks only) |
-| **i**                 | Invert selection                                              |
-| **d**                 | Delete selected streamlines                                   |
-| **c**                 | Clear current selection                                       |
-| **+ / =**             | Increase selection sphere radius                              |
-| **-**                 | Decrease selection sphere radius                              |
-| **↑ / ↓**           | Axial Slice navigation (Z-axis)                               |
-| **← / →**           | Sagittal Slice navigation (X-axis)                            |
-| **Shift+Scroll**      | Slice navigation on the 2D panel under cursor                 |
-| **1**                 | Toggle Pencil drawing mode                                    |
-| **2**                 | Toggle Eraser drawing mode                                    |
-| **3**                 | Toggle Sphere ROI drawing mode                                |
-| **4**                 | Toggle Rectangle ROI drawing mode                             |
-| **Ctrl+↑ / Ctrl+↓** | Coronal Slice navigation (Y-axis)                             |
-| **Ctrl+Click**        | Replace sphere/rectangle ROI (when in mode)                   |
-| **Ctrl+Drag**         | Move sphere/rectangle ROI (when in mode)                      |
-| **Ctrl+Scroll**       | Resize sphere/rectangle ROI (when in mode)                    |
-| **Ctrl+s**            | Save As                                                       |
-| **Ctrl+z**            | Undo last deletion / ROI operation                           |
-| **Ctrl+y / Shift+z**  | Redo last undone deletion / ROI operation                    |
-| **Ctrl+p**            | Save a screenshot                                             |
-| **Esc**               | Hide selection sphere                                         |
-| **Ctrl+q**            | Quit application                                              |
+| **i**                 | Invert selection                                                     |
+| **d**                 | Delete selected streamlines                                          |
+| **c**                 | Clear current selection                                              |
+| **+ / =**             | Increase selection sphere radius                                     |
+| **-**                 | Decrease selection sphere radius                                     |
+| **↑ / ↓**           | Axial Slice navigation (Z-axis)                                      |
+| **← / →**           | Sagittal Slice navigation (X-axis)                                   |
+| **Shift+Scroll**      | Slice navigation on the 2D panel under cursor                        |
+| **1**                 | Toggle Pencil drawing mode                                           |
+| **2**                 | Toggle Eraser drawing mode                                           |
+| **3**                 | Toggle Sphere ROI drawing mode                                       |
+| **4**                 | Toggle Rectangle ROI drawing mode                                    |
+| **Ctrl+↑ / Ctrl+↓** | Coronal Slice navigation (Y-axis)                                    |
+| **Ctrl+Click**        | Replace sphere/rectangle ROI (when in mode)                          |
+| **Ctrl+Drag**         | Move sphere/rectangle ROI (when in mode)                             |
+| **Ctrl+Scroll**       | Resize sphere/rectangle ROI (when in mode)                           |
+| **Ctrl+s**            | Save As                                                              |
+| **Ctrl+z**            | Undo last deletion / ROI operation                                   |
+| **Ctrl+y / Shift+z**  | Redo last undone deletion / ROI operation                            |
+| **Ctrl+p**            | Save a screenshot                                                    |
+| **Esc**               | Hide selection sphere                                                |
+| **Ctrl+q**            | Quit application                                                     |
 
 ---
 
@@ -399,8 +417,8 @@ Include/Exclude
 
 ### Step 4: Finalize & Export
 
-| Action                    | Menu                             |
-| ------------------------- | -------------------------------- |
+| Action                    | Menu                              |
+| ------------------------- | --------------------------------- |
 | Change colors             | View → Streamline Color          |
 | Calculate centroid/medoid | File → Calculate Centroid/Medoid |
 | Save density map          | File → Save Density Map          |
@@ -408,6 +426,16 @@ Include/Exclude
 | Save bundle               | File → Save As                   |
 
 *💡 Tip: Use `Ctrl+Z` / `Ctrl+Y` for undo/redo at any time!*
+
+---
+
+## Save and Restore Sessions
+
+Use **File → Save Session** and **Open Session…** to save and restore edits, ROIs,
+selections, filters, undo/redo and views in a `.tractedit-session` file.
+Keep the original tractogram, anatomy, parcellation and ODF files: sessions
+reference them rather than embedding them. If moved, locate the matching sources
+when prompted.
 
 ---
 

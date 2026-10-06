@@ -14,6 +14,7 @@ including preview visualization and rasterization to 3D volumes.
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -22,11 +23,38 @@ from fury import actor, window
 from PyQt6.QtCore import Qt
 
 from ..utils import signals_blocked
+from . import coordinates
 
 if TYPE_CHECKING:
     from .vtk_panel import VTKPanel
 
 logger = logging.getLogger(__name__)
+
+_PREVIEW_VIEW_AXES = {
+    "axial": (2, 1, 1, True),
+    "coronal": (1, -1, 2, True),
+    "sagittal": (0, 1, 2, False),
+}
+_PREVIEW_DEPTH_MM = 0.25
+
+
+def _clear_roi_for_shape(roi_data: np.ndarray) -> None:
+    """Clear the old positive ROI, preserving legacy behavior for other dtypes."""
+    if roi_data.dtype == np.uint8:
+        # All nonzero uint8 values are positive. The old bounding box therefore
+        # contained every nonzero voxel, so clearing the array is equivalent.
+        roi_data.fill(0)
+        return
+
+    old_nonzero = np.argwhere(roi_data > 0)
+    if len(old_nonzero):
+        old_min = old_nonzero.min(axis=0)
+        old_max = old_nonzero.max(axis=0)
+        roi_data[
+            old_min[0] : old_max[0] + 1,
+            old_min[1] : old_max[1] + 1,
+            old_min[2] : old_max[2] + 1,
+        ] = 0
 
 
 def _rasterize_world_sphere(
@@ -36,7 +64,7 @@ def _rasterize_world_sphere(
     affine: np.ndarray,
     shape: Tuple[int, ...],
     fill_value: int,
-) -> None:
+) -> bool:
     """Rasterize a world-space sphere into an arbitrary voxel grid."""
     linear = affine[:3, :3]
     inverse_linear = np.linalg.inv(linear)
@@ -46,7 +74,7 @@ def _rasterize_world_sphere(
     minimum = np.maximum(minimum, 0)
     maximum = np.minimum(maximum, np.asarray(shape[:3]) - 1)
     if np.any(minimum > maximum):
-        return
+        return False
 
     dx = (
         np.arange(minimum[0], maximum[0] + 1, dtype=float)[:, None, None]
@@ -70,7 +98,72 @@ def _rasterize_world_sphere(
         minimum[1] : maximum[1] + 1,
         minimum[2] : maximum[2] + 1,
     ]
-    roi_patch[distance_squared <= radius_world**2] = fill_value
+    sphere_mask = distance_squared <= radius_world**2
+    if not np.any(sphere_mask):
+        return False
+    roi_patch[sphere_mask] = fill_value
+    return True
+
+
+def _rectangle_grid_geometry(
+    voxel_points: np.ndarray,
+    affine: np.ndarray,
+    shape: Tuple[int, ...],
+    view_type: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Return inclusive voxel bounds and world corners for a drawn rectangle."""
+    if len(voxel_points) < 2:
+        return None
+
+    axis = {"sagittal": 0, "coronal": 1, "axial": 2}.get(view_type)
+    if axis is None:
+        return None
+
+    first = np.rint(voxel_points[0]).astype(np.int64)
+    second = np.rint(voxel_points[1]).astype(np.int64)
+    plane_index = int(np.rint((voxel_points[0, axis] + voxel_points[1, axis]) / 2))
+    first[axis] = plane_index
+    second[axis] = plane_index
+    minimum = np.maximum(np.minimum(first, second), 0)
+    maximum = np.minimum(np.maximum(first, second), np.asarray(shape[:3]) - 1)
+    if np.any(minimum > maximum):
+        return None
+    plane_index = int(minimum[axis])
+
+    if axis == 2:
+        corners_voxel = np.array(
+            [
+                [minimum[0], minimum[1], plane_index],
+                [maximum[0], minimum[1], plane_index],
+                [maximum[0], maximum[1], plane_index],
+                [minimum[0], maximum[1], plane_index],
+            ],
+            dtype=float,
+        )
+    elif axis == 1:
+        corners_voxel = np.array(
+            [
+                [minimum[0], plane_index, minimum[2]],
+                [maximum[0], plane_index, minimum[2]],
+                [maximum[0], plane_index, maximum[2]],
+                [minimum[0], plane_index, maximum[2]],
+            ],
+            dtype=float,
+        )
+    else:
+        corners_voxel = np.array(
+            [
+                [plane_index, minimum[1], minimum[2]],
+                [plane_index, maximum[1], minimum[2]],
+                [plane_index, maximum[1], maximum[2]],
+                [plane_index, minimum[1], maximum[2]],
+            ],
+            dtype=float,
+        )
+
+    homogeneous = np.column_stack((corners_voxel, np.ones(4)))
+    corners_world = (affine @ homogeneous.T).T[:, :3]
+    return minimum, maximum, corners_world
 
 
 # ============================================================================
@@ -421,20 +514,49 @@ class DrawingManager:
         edge = self.panel.drawing_preview_points[1]
         radius = np.linalg.norm(center - edge)
 
+        view_type = getattr(self.panel, "current_drawing_view_type", "axial")
+        return self._circle_preview_polydata(center, radius, view_type)
+
+    def _preview_slice_frame(
+        self, view_type: str, reference_point: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+        """Return the displayed voxel grid, camera direction and active plane."""
+        axis, sign, up, radiological = _PREVIEW_VIEW_AXES[view_type]
+        affine = np.asarray(self.panel.main_window.anatomical_image_affine, dtype=float)
+        displayed_affine = affine.copy()
+        if radiological:
+            displayed_affine = np.diag([-1.0, 1.0, 1.0, 1.0]) @ displayed_affine
+        direction, _ = coordinates.camera_frame_from_affine(
+            affine, axis, sign, up, radiological=radiological
+        )
+        indices = getattr(self.panel, "current_slice_indices", {})
+        slice_index = indices.get("xyz"[axis]) if indices else None
+        if slice_index is None:
+            voxel_point = np.linalg.inv(displayed_affine) @ np.append(
+                reference_point, 1.0
+            )
+            slice_index = voxel_point[axis]
+        plane_voxel = np.zeros(4, dtype=float)
+        plane_voxel[axis] = slice_index
+        plane_voxel[3] = 1.0
+        plane_point = (displayed_affine @ plane_voxel)[:3]
+        return displayed_affine, direction, plane_point, axis
+
+    def _circle_preview_polydata(
+        self, center: np.ndarray, radius: float, view_type: str
+    ) -> vtk.vtkPolyData:
+        """Place a world-mm circle parallel to and in front of the 2D slice."""
+        _, direction, plane_point, _ = self._preview_slice_frame(view_type, center)
+        center = np.asarray(center, dtype=float)
+        center = center - np.dot(center - plane_point, direction) * direction
+        center += _PREVIEW_DEPTH_MM * direction
+
         circle = vtk.vtkRegularPolygonSource()
-        circle.SetCenter(center)
-        circle.SetRadius(radius)
+        circle.SetCenter(*center)
+        circle.SetRadius(float(radius))
         circle.SetNumberOfSides(50)
         circle.GeneratePolygonOff()
-
-        view_type = getattr(self.panel, "current_drawing_view_type", "")
-        if view_type == "axial":
-            circle.SetNormal(0, 0, 1)
-        elif view_type == "coronal":
-            circle.SetNormal(0, 1, 0)
-        elif view_type == "sagittal":
-            circle.SetNormal(1, 0, 0)
-
+        circle.SetNormal(*direction)
         circle.Update()
         return circle.GetOutput()
 
@@ -457,21 +579,7 @@ class DrawingManager:
             scene: The 2D scene to add the preview to.
         """
         try:
-            # Create circle polydata
-            circle = vtk.vtkRegularPolygonSource()
-            circle.SetCenter(center[0], center[1], center[2])
-            circle.SetRadius(radius)
-            circle.SetNumberOfSides(50)
-            circle.GeneratePolygonOff()
-
-            if view_type == "axial":
-                circle.SetNormal(0, 0, 1)
-            elif view_type == "coronal":
-                circle.SetNormal(0, 1, 0)
-            elif view_type == "sagittal":
-                circle.SetNormal(1, 0, 0)
-
-            circle.Update()
+            polydata = self._circle_preview_polydata(center, radius, view_type)
 
             # Remove old preview from ALL scenes
             if self.panel.preview_line_actor:
@@ -489,7 +597,7 @@ class DrawingManager:
 
             # Create new preview actor
             mapper = vtk.vtkPolyDataMapper()
-            mapper.SetInputData(circle.GetOutput())
+            mapper.SetInputData(polydata)
 
             self.panel.preview_line_actor = vtk.vtkActor()
             self.panel.preview_line_actor.SetMapper(mapper)
@@ -513,29 +621,24 @@ class DrawingManager:
         p2 = self.panel.drawing_preview_points[1]
         view_type = getattr(self.panel, "current_drawing_view_type", "")
 
-        points = vtk.vtkPoints()
+        displayed_affine, direction, _, axis = self._preview_slice_frame(view_type, p1)
+        inverse = np.linalg.inv(displayed_affine)
+        first = (inverse @ np.append(p1, 1.0))[:3]
+        second = (inverse @ np.append(p2, 1.0))[:3]
+        slice_indices = getattr(self.panel, "current_slice_indices", {})
+        plane_index = slice_indices.get("xyz"[axis]) if slice_indices else None
+        if plane_index is None:
+            plane_index = first[axis]
+        in_plane_axes = [index for index in range(3) if index != axis]
 
-        if view_type == "axial":
-            z = p1[2]
-            points.InsertNextPoint(p1[0], p1[1], z)
-            points.InsertNextPoint(p2[0], p1[1], z)
-            points.InsertNextPoint(p2[0], p2[1], z)
-            points.InsertNextPoint(p1[0], p2[1], z)
-        elif view_type == "coronal":
-            y = p1[1]
-            points.InsertNextPoint(p1[0], y, p1[2])
-            points.InsertNextPoint(p2[0], y, p1[2])
-            points.InsertNextPoint(p2[0], y, p2[2])
-            points.InsertNextPoint(p1[0], y, p2[2])
-        elif view_type == "sagittal":
-            x = p1[0]
-            points.InsertNextPoint(x, p1[1], p1[2])
-            points.InsertNextPoint(x, p2[1], p1[2])
-            points.InsertNextPoint(x, p2[1], p2[2])
-            points.InsertNextPoint(x, p1[1], p2[2])
-        else:
-            points.InsertNextPoint(p1[0], p1[1], p1[2])
-            points.InsertNextPoint(p2[0], p2[1], p2[2])
+        points = vtk.vtkPoints()
+        for first_axis, second_axis in ((0, 0), (1, 0), (1, 1), (0, 1)):
+            voxel = first.copy()
+            voxel[axis] = plane_index
+            voxel[in_plane_axes[0]] = (first, second)[first_axis][in_plane_axes[0]]
+            voxel[in_plane_axes[1]] = (first, second)[second_axis][in_plane_axes[1]]
+            world = (displayed_affine @ np.append(voxel, 1.0))[:3]
+            points.InsertNextPoint(*(world + _PREVIEW_DEPTH_MM * direction))
 
         polyline = vtk.vtkPolyLine()
         polyline.GetPointIds().SetNumberOfIds(5)
@@ -595,12 +698,6 @@ class DrawingManager:
             roi_inv_affine = roi_layer["inv_affine"]
             shape = roi_data.shape
 
-            # Save state for undo
-            if self.panel.main_window and hasattr(
-                self.panel.main_window, "_save_roi_state_for_undo"
-            ):
-                self.panel.main_window._save_roi_state_for_undo(roi_name)
-
             view_type = getattr(self.panel, "current_drawing_view_type", None)
             if not view_type:
                 return
@@ -614,37 +711,43 @@ class DrawingManager:
             is_sphere = getattr(self.panel, "is_sphere_mode", False)
             is_rectangle = getattr(self.panel, "is_rectangle_mode", False)
             changed = False
-
-            if is_sphere:
-                changed = self._rasterize_sphere(
-                    roi_name, roi_data, vox_points_float, shape, view_type
-                )
-            elif is_rectangle:
-                changed = self._rasterize_rectangle(
-                    roi_name, roi_data, vox_points_float, shape, view_type
-                )
-            else:
-                # Freehand drawing
-                auto_fill = getattr(self.panel.main_window, "auto_fill_voxels", False)
-                is_eraser = getattr(self.panel, "is_eraser_mode", False)
-
-                changed_stroke = self._rasterize_freehand(
-                    roi_data, vox_points_float, shape, view_type
-                )
-
-                changed_fill = False
-                if auto_fill and not is_eraser:
-                    changed_fill = self._fill_polygon(
+            state_manager = getattr(self.panel.main_window, "state_manager", None)
+            history = (
+                state_manager.roi_modification(roi_name)
+                if state_manager is not None
+                else nullcontext()
+            )
+            with history:
+                if is_sphere:
+                    changed = self._rasterize_sphere(
                         roi_name, roi_data, vox_points_float, shape, view_type
                     )
+                elif is_rectangle:
+                    changed = self._rasterize_rectangle(
+                        roi_name, roi_data, vox_points_float, shape, view_type
+                    )
+                else:
+                    auto_fill = getattr(
+                        self.panel.main_window, "auto_fill_voxels", False
+                    )
+                    is_eraser = getattr(self.panel, "is_eraser_mode", False)
+                    changed_stroke = self._rasterize_freehand(
+                        roi_data, vox_points_float, shape, view_type
+                    )
+                    changed_fill = False
+                    if auto_fill and not is_eraser:
+                        changed_fill = self._fill_polygon(
+                            roi_name, roi_data, vox_points_float, shape, view_type
+                        )
+                    changed = changed_stroke or changed_fill
 
-                changed = changed_stroke or changed_fill
-
-            if changed:
-                if not is_sphere and not is_rectangle:
+                if changed and not is_sphere and not is_rectangle:
                     self.panel.sphere_params_per_roi.pop(roi_name, None)
                     self.panel.rectangle_params_per_roi.pop(roi_name, None)
-                self.panel.update_roi_layer(roi_name, roi_data, roi_affine)
+
+            if changed:
+                # The final render runs after the yellow preview is removed.
+                self.panel.update_roi_layer(roi_name, roi_data, roi_affine, render=False)
                 status_msg = (
                     "ROI erased."
                     if getattr(self.panel, "is_eraser_mode", False)
@@ -690,27 +793,8 @@ class DrawingManager:
                 mw.update_sphere_roi_intersection(roi_name, center_corrected, radius)
 
         elif is_rectangle:
-            start = points[0].copy()
-            end = points[1].copy()
-
-            if view_type in ["axial", "coronal"]:
-                start[0] = -start[0]
-                end[0] = -end[0]
-
             if hasattr(mw, "update_rectangle_roi_intersection"):
-                min_v = np.minimum(start, end)
-                max_v = np.maximum(start, end)
-                epsilon = 0.5
-                if view_type == "axial":
-                    min_v[2] -= epsilon
-                    max_v[2] += epsilon
-                elif view_type == "coronal":
-                    min_v[1] -= epsilon
-                    max_v[1] += epsilon
-                elif view_type == "sagittal":
-                    min_v[0] -= epsilon
-                    max_v[0] += epsilon
-                mw.update_rectangle_roi_intersection(roi_name, min_v, max_v)
+                mw.update_rectangle_roi_intersection(roi_name)
 
     def _world_to_voxel_points(
         self,
@@ -767,11 +851,6 @@ class DrawingManager:
             else:
                 vox_points_float = model_points
 
-            # Compensate for sagittal +1 display offset
-            # (see vtk_panel.py add_roi_layer line ~2039 and slice navigation line ~1504)
-            if view_type == "sagittal":
-                vox_points_float[:, 0] = vox_points_float[:, 0] - 1
-
         return vox_points_float
 
     def _rasterize_sphere(
@@ -804,16 +883,7 @@ class DrawingManager:
         # Clear rectangle params
         self.panel.rectangle_params_per_roi.pop(roi_name, None)
 
-        # Clear only what's needed instead of entire volume
-        old_nonzero = np.argwhere(roi_data > 0)
-        if len(old_nonzero) > 0:
-            old_min = old_nonzero.min(axis=0)
-            old_max = old_nonzero.max(axis=0)
-            roi_data[
-                old_min[0] : old_max[0] + 1,
-                old_min[1] : old_max[1] + 1,
-                old_min[2] : old_max[2] + 1,
-            ] = 0
+        _clear_roi_for_shape(roi_data)
 
         roi_affine = self.panel.main_window.roi_layers[roi_name]["affine"]
         _rasterize_world_sphere(
@@ -863,32 +933,15 @@ class DrawingManager:
         if len(vox_points_float) < 2:
             return False
 
-        p1_vox = vox_points_float[0]
-        p2_vox = vox_points_float[1]
+        roi_affine = self.panel.main_window.roi_layers[roi_name]["affine"]
+        geometry = _rectangle_grid_geometry(
+            vox_points_float, roi_affine, shape, view_type
+        )
+        if geometry is None:
+            return False
+        min_v, max_v, corners_world = geometry
 
-        min_v = np.minimum(p1_vox, p2_vox).astype(int)
-        max_v = np.maximum(p1_vox, p2_vox).astype(int)
-        min_v = np.maximum(min_v, 0)
-        max_v = np.minimum(max_v, np.array(shape) - 1)
-
-        # Clear only existing ROI data instead of entire volume
-        old_nonzero = np.argwhere(roi_data > 0)
-        if len(old_nonzero) > 0:
-            old_min = old_nonzero.min(axis=0)
-            old_max = old_nonzero.max(axis=0)
-            roi_data[
-                old_min[0] : old_max[0] + 1,
-                old_min[1] : old_max[1] + 1,
-                old_min[2] : old_max[2] + 1,
-            ] = 0
-
-        # Ensure thickness for 2D drawing
-        if view_type == "axial" and min_v[2] == max_v[2]:
-            max_v[2] += 1
-        elif view_type == "coronal" and min_v[1] == max_v[1]:
-            max_v[1] += 1
-        elif view_type == "sagittal" and min_v[0] == max_v[0]:
-            max_v[0] += 1
+        _clear_roi_for_shape(roi_data)
 
         roi_data[
             min_v[0] : max_v[0] + 1,
@@ -907,6 +960,9 @@ class DrawingManager:
             "start": start_to_store,
             "end": end_to_store,
             "view_type": view_type,
+            "voxel_min": min_v.copy(),
+            "voxel_max": max_v.copy(),
+            "corners": corners_world,
         }
 
         return True
@@ -1078,13 +1134,8 @@ class DrawingManager:
         if new_radius == current_radius:
             return
 
-        # Save state for undo
-        if self.panel.main_window and hasattr(
-            self.panel.main_window, "_save_roi_state_for_undo"
-        ):
-            self.panel.main_window._save_roi_state_for_undo(roi_name)
-
-        roi_layer = self.panel.main_window.roi_layers[roi_name]
+        mw = self.panel.main_window
+        roi_layer = mw.roi_layers[roi_name]
         roi_data = roi_layer["data"]
         shape = roi_data.shape
 
@@ -1092,24 +1143,26 @@ class DrawingManager:
         current_max = roi_data.max()
         fill_val = current_max if current_max > 0 else 1
 
-        roi_data.fill(0)
-
-        # Rasterize new sphere
-        self._rasterize_sphere_at_position(
-            roi_name,
-            roi_data,
-            center_world,
-            new_radius,
-            shape,
-            stored_view_type,
-            fill_val,
+        state_manager = getattr(mw, "state_manager", None)
+        history = (
+            state_manager.roi_modification(roi_name)
+            if state_manager is not None
+            else nullcontext()
         )
-
-        # Update params
-        self.panel.sphere_params_per_roi[roi_name]["radius"] = new_radius
+        with history:
+            roi_data.fill(0)
+            self._rasterize_sphere_at_position(
+                roi_name,
+                roi_data,
+                center_world,
+                new_radius,
+                shape,
+                stored_view_type,
+                fill_val,
+            )
+            self.panel.sphere_params_per_roi[roi_name]["radius"] = new_radius
 
         # Sync the radius spinbox if it exists
-        mw = self.panel.main_window
         if hasattr(mw, "sphere_radius_spinbox"):
             with signals_blocked(mw.sphere_radius_spinbox):
                 mw.sphere_radius_spinbox.setValue(new_radius)
@@ -1288,6 +1341,7 @@ class DrawingManager:
         end: np.ndarray,
         view_type: str,
         render: bool = True,
+        corners: Optional[np.ndarray] = None,
     ) -> None:
         """
         Updates the 3D rectangle actor for an ROI in real-time.
@@ -1305,34 +1359,43 @@ class DrawingManager:
                 "color", (1.0, 0.0, 0.0)
             )
 
-        # Calculate corners
-        min_pt = np.minimum(start, end)
-        max_pt = np.maximum(start, end)
-
-        if view_type == "axial":
-            z_pos = (min_pt[2] + max_pt[2]) / 2.0
-            corners = [
-                [min_pt[0], min_pt[1], z_pos],
-                [max_pt[0], min_pt[1], z_pos],
-                [max_pt[0], max_pt[1], z_pos],
-                [min_pt[0], max_pt[1], z_pos],
-            ]
-        elif view_type == "coronal":
-            y_pos = (min_pt[1] + max_pt[1]) / 2.0
-            corners = [
-                [min_pt[0], y_pos, min_pt[2]],
-                [max_pt[0], y_pos, min_pt[2]],
-                [max_pt[0], y_pos, max_pt[2]],
-                [min_pt[0], y_pos, max_pt[2]],
-            ]
-        else:  # sagittal
-            x_pos = (min_pt[0] + max_pt[0]) / 2.0
-            corners = [
-                [x_pos, min_pt[1], min_pt[2]],
-                [x_pos, max_pt[1], min_pt[2]],
-                [x_pos, max_pt[1], max_pt[2]],
-                [x_pos, min_pt[1], max_pt[2]],
-            ]
+        if corners is None:
+            min_pt = np.minimum(start, end)
+            max_pt = np.maximum(start, end)
+            if view_type == "axial":
+                z_pos = (min_pt[2] + max_pt[2]) / 2.0
+                corners = np.array(
+                    [
+                        [min_pt[0], min_pt[1], z_pos],
+                        [max_pt[0], min_pt[1], z_pos],
+                        [max_pt[0], max_pt[1], z_pos],
+                        [min_pt[0], max_pt[1], z_pos],
+                    ]
+                )
+            elif view_type == "coronal":
+                y_pos = (min_pt[1] + max_pt[1]) / 2.0
+                corners = np.array(
+                    [
+                        [min_pt[0], y_pos, min_pt[2]],
+                        [max_pt[0], y_pos, min_pt[2]],
+                        [max_pt[0], y_pos, max_pt[2]],
+                        [min_pt[0], y_pos, max_pt[2]],
+                    ]
+                )
+            else:
+                x_pos = (min_pt[0] + max_pt[0]) / 2.0
+                corners = np.array(
+                    [
+                        [x_pos, min_pt[1], min_pt[2]],
+                        [x_pos, max_pt[1], min_pt[2]],
+                        [x_pos, max_pt[1], max_pt[2]],
+                        [x_pos, min_pt[1], max_pt[2]],
+                    ]
+                )
+        else:
+            corners = np.asarray(corners, dtype=float)
+            if corners.shape != (4, 3):
+                raise ValueError("Rectangle corners must have shape (4, 3).")
 
         existing_rect = self.panel.roi_slice_actors[roi_name].get("rectangle_3d")
         rect_points = self.panel.roi_slice_actors[roi_name].get("rectangle_points")

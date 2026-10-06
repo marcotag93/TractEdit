@@ -14,7 +14,7 @@ file I/O, and the VTK panel.
 
 import os
 import numpy as np
-from typing import Optional, List, Set, Dict, Any, Tuple
+from typing import TYPE_CHECKING, Optional, List, Set, Dict, Any, Tuple
 import nibabel as nib
 import logging
 
@@ -62,6 +62,8 @@ from PyQt6.QtCore import Qt, pyqtSlot, QTimer, QSettings
 
 from . import file_io
 from . import odf_utils
+from .reference_grid import ReferenceGrid
+from .transactional_io import transactional_save
 from .utils import (
     ColorMode,
     get_formatted_datetime,
@@ -77,6 +79,10 @@ from .utils import (
     TARGET_RENDER_COUNT,
 )
 from .visualization import VTKPanel
+
+if TYPE_CHECKING:
+    from .data_contracts import AnatomicalImageLoadResult, RoiLayer
+from .visualization.drawing import _rasterize_world_sphere
 from .ui import (
     ActionsManager,
     ToolbarsManager,
@@ -109,6 +115,7 @@ class MainWindow(QMainWindow):
 
         # Initialize Streamline Data Variables
         self.tractogram_data: Optional["nib.streamlines.ArraySequence"] = None
+        self._tractogram_data_version: int = 0
         self.streamline_bboxes: Optional[np.ndarray] = None
         self.visible_indices: Set[int] = set()
         self.original_trk_header: Optional[Dict[str, Any]] = (
@@ -117,6 +124,7 @@ class MainWindow(QMainWindow):
         self.original_trk_affine: Optional[np.ndarray] = (
             None  # Affine matrix (affine_to_rasmm)
         )
+        self.tractogram_reference_grid: Optional[ReferenceGrid] = None
         self.original_trk_path: Optional[str] = None  # Full path
         self.original_file_extension: Optional[str] = (
             None  # '.trk', '.tck', '.trx', or None
@@ -125,6 +133,7 @@ class MainWindow(QMainWindow):
         self.scalar_data_per_point: Optional[
             Dict[str, "nib.streamlines.ArraySequence"]
         ] = None  # Dictionary: {scalar_name: [scalar_array_sl0, ...]}
+        self.data_per_streamline: Optional[Dict[str, np.ndarray]] = None
         self.active_scalar_name: Optional[str] = (
             None  # Key for the currently active scalar
         )
@@ -158,12 +167,26 @@ class MainWindow(QMainWindow):
         # Background thread references (for cleanup)
         self._loader_thread: Optional[Any] = None
         self._image_loader_thread: Optional[Any] = None
+        self._medoid_thread: Optional[Any] = None
+        self._background_workers: List[Any] = []
+        self._deferred_trx_owners: List[Any] = []
+        self._bundle_load_generation = 0
+        self._image_load_generation = 0
+        self._medoid_generation = 0
+        self._shutdown_requested = False
+        self.session_path: Optional[str] = None
+        self._session_busy = False
+        self._session_source_associations: Dict[str, Any] = {}
+        self._session_deferred_odf = False
+        self._session_deferred_odf_owner = None
+        self._session_deferred_regions: Dict[int, Dict[str, Any]] = {}
 
         # Initialize Anatomical Image Data Variables
         self.anatomical_image_path: Optional[str] = None
         self.anatomical_image_data: Optional[np.ndarray] = None  # Numpy array
         self.anatomical_image_affine: Optional[np.ndarray] = None  # 4x4 numpy array
         self.anatomical_mmap_image: Optional["file_io.MemoryMappedImage"] = None
+        self.anatomical_reference_grid: Optional[ReferenceGrid] = None
 
         # Unified Undo/Redo Stacks (all operations - streamlines and ROI)
         self.unified_undo_stack: List[Dict[str, Any]] = []
@@ -197,13 +220,14 @@ class MainWindow(QMainWindow):
         self.odf_sh_order: int = 0
         self.odf_sphere = None
         self.odf_basis_matrix = None
-        self.odf_tunnel_sphere = None       # Lower-res sphere for tunnel display
-        self.odf_tunnel_basis = None         # SH basis for tunnel display sphere
+        self.odf_tunnel_sphere = None  # Lower-res sphere for tunnel display
+        self.odf_tunnel_basis = None  # SH basis for tunnel display sphere
         self.odf_tunnel_is_visible: bool = False
         self.MAX_ODF_STREAMLINES = 26000  # Safety limit for Tunnel View
 
         # Parcellation / Connectivity Data
         self.parcellation_data: Optional[np.ndarray] = None
+        self._parcellation_data_version: int = 0
         self.parcellation_affine: Optional[np.ndarray] = None
         self.parcellation_path: Optional[str] = None
         self.parcellation_labels: Dict[int, str] = {}  # Label ID -> Region name
@@ -217,7 +241,7 @@ class MainWindow(QMainWindow):
         self._data_panel_update_pending: bool = False
 
         # ROI Layer Data Variables
-        self.roi_layers: Dict[str, Dict[str, Any]] = (
+        self.roi_layers: Dict[str, "RoiLayer"] = (
             {}
         )  # Key: path, Val: {'data':, 'affine':, 'inv_affine':}
 
@@ -248,6 +272,7 @@ class MainWindow(QMainWindow):
         # Parcellation Overlay & Region State
         self._parcellation_overlay_visible: bool = False
         self._parcellation_overlay_cached: bool = False
+        self._parcellation_overlay_cache_key: Optional[Tuple[Any, ...]] = None
         self.parcellation_overlay_actor: Optional[Any] = None
         self.parcellation_connected_labels: Set[int] = set()
         self.parcellation_region_visibility: Dict[int, bool] = {}
@@ -257,10 +282,14 @@ class MainWindow(QMainWindow):
         self.parcellation_region_states: Dict[int, Dict[str, bool]] = {}
 
         # Parcellation filter data (also reset in _clear_parcellation)
-        self.parcellation_region_intersection_cache: Dict[str, Set[int]] = {}
+        self.parcellation_region_intersection_cache: Dict[int, Set[int]] = {}
         self.parcellation_start_labels: Optional[np.ndarray] = None
         self.parcellation_end_labels: Optional[np.ndarray] = None
-        self.parcellation_visible_indices: Optional[Set[int]] = None
+        self.parcellation_visible_indices: Optional[np.ndarray] = None
+        self._parcellation_endpoint_labels_computed: Optional[np.ndarray] = None
+        self._parcellation_endpoint_cache_key: Optional[
+            Tuple[int, int, int, bytes, int, int, int]
+        ] = None
 
         # Pending / Cache
         self._pending_expanded_items: Set[str] = set()
@@ -488,35 +517,28 @@ class MainWindow(QMainWindow):
         center_3d = roi_params["center"].copy()
         stored_view_type = roi_params.get("view_type", "axial")
 
-        # Save undo state
-        self._save_roi_state_for_undo(roi_name)
-
         # Get ROI layer data
         roi_layer = self.roi_layers[roi_name]
         roi_data = roi_layer["data"]
         roi_affine = roi_layer["affine"]
         shape = roi_data.shape
 
-        # Clear existing ROI data
-        roi_data.fill(0)
+        with self.state_manager.roi_modification(roi_name):
+            roi_data.fill(0)
+            center_world = center_3d.copy()
+            if stored_view_type in ["axial", "coronal"]:
+                center_world[0] = -center_world[0]
 
-        # Convert center from world to voxel coordinates
-        center_world = center_3d.copy()
-        if stored_view_type in ["axial", "coronal"]:
-            center_world[0] = -center_world[0]
-
-        self.vtk_panel.drawing_manager._rasterize_sphere_at_position(
-            roi_name,
-            roi_data,
-            center_world,
-            value,
-            shape,
-            stored_view_type,
-            1,
-        )
-
-        # Update stored radius
-        self.vtk_panel.sphere_params_per_roi[roi_name]["radius"] = value
+            self.vtk_panel.drawing_manager._rasterize_sphere_at_position(
+                roi_name,
+                roi_data,
+                center_world,
+                value,
+                shape,
+                stored_view_type,
+                1,
+            )
+            self.vtk_panel.sphere_params_per_roi[roi_name]["radius"] = value
 
         # Remove any existing 3D preview sphere
         if roi_name in self.vtk_panel.roi_slice_actors:
@@ -741,6 +763,7 @@ class MainWindow(QMainWindow):
                 return
 
             self.odf_data = data
+            self._session_deferred_odf = False
             self.odf_affine = affine
             self.odf_path = file_path
             self.odf_sh_order = sh_order
@@ -794,13 +817,20 @@ class MainWindow(QMainWindow):
             self._sync_parcellation_toggle_state(False)
             return
 
-        # Show the overlay (just visibility, no creation/computation)
-        # If actors exist, show them; otherwise do nothing
-        if self.parcellation_region_actors:
-            self.connectivity_manager._show_parcellation_actors()
-            self._sync_parcellation_toggle_state(True)
+        if self.parcellation_region_actors or getattr(
+            self, "_session_deferred_regions", {}
+        ):
+            cache_current = (
+                self.connectivity_manager.is_parcellation_overlay_cache_current()
+            )
+            if cache_current:
+                shown = self.connectivity_manager._show_parcellation_actors()
+                self._sync_parcellation_toggle_state(shown is not False)
+            elif self.connectivity_manager.create_parcellation_overlay():
+                self._sync_parcellation_toggle_state(True)
+            else:
+                self._sync_parcellation_toggle_state(False)
         else:
-            # No actors to show - need to create overlay first via recalculate
             self._sync_parcellation_toggle_state(False)
             if self.parcellation_data is not None:
                 self.vtk_panel.update_status(
@@ -814,7 +844,7 @@ class MainWindow(QMainWindow):
             with signals_blocked(self.view_parcellation_action):
                 self.view_parcellation_action.setChecked(checked)
 
-        # Update data panel checkbox (parcellation is now nested under header) - ##TODO - to refactor 
+        # Update data panel checkbox (parcellation is now nested under header) - ##TODO - to refactor
         if self.data_tree_widget:
             with signals_blocked(self.data_tree_widget):
                 # Search through top-level headers and their children
@@ -825,9 +855,7 @@ class MainWindow(QMainWindow):
                         # Look for the actual file item
                         for j in range(header.childCount()):
                             child = header.child(j)
-                            item_data = child.data(
-                                0, Qt.ItemDataRole.UserRole
-                            )
+                            item_data = child.data(0, Qt.ItemDataRole.UserRole)
                             if (
                                 item_data
                                 and isinstance(item_data, dict)
@@ -879,8 +907,11 @@ class MainWindow(QMainWindow):
 
     def _clear_parcellation(self) -> None:
         """Clears all parcellation data and overlay."""
-        # Remove overlay from scene
-        self.connectivity_manager.remove_parcellation_overlay()
+        self.connectivity_manager.invalidate_parcellation_cache(
+            clear_region_states=True,
+            clear_region_visibility=True,
+        )
+        self._parcellation_data_version += 1
 
         # Clear parcellation data
         self.parcellation_data = None
@@ -894,10 +925,6 @@ class MainWindow(QMainWindow):
 
         # Clear region filter data
         self.parcellation_region_states = {}
-        self.parcellation_region_intersection_cache = {}
-        self.parcellation_start_labels = None
-        self.parcellation_end_labels = None
-        self.parcellation_visible_indices = None
 
         # Update menu action state
         if self.view_parcellation_action is not None:
@@ -910,6 +937,9 @@ class MainWindow(QMainWindow):
     @pyqtSlot(bool)
     def _toggle_odf_tunnel(self, checked: bool) -> None:
         """Computes the mask and updates the VTK actor with progress indication."""
+        if checked and getattr(self, "_session_deferred_odf", False):
+            self._toggle_odf_tunnel_visibility(True)
+            return
         if not checked:
             self.odf_tunnel_is_visible = False
             if self.vtk_panel:
@@ -951,57 +981,34 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
 
         try:
-            # Create Mask (Heavy operation)
-            mask = odf_utils.create_tunnel_mask(
-                current_streamlines,
-                self.odf_affine,
-                self.odf_data.shape,
-                dilation_iter=1,
-            )
+            tunnel_sphere = self.odf_tunnel_sphere
+            tunnel_basis = self.odf_tunnel_basis
 
-            # Update Progress -> 25%
             self.vtk_panel.update_progress_bar(1, TOTAL_STEPS, visible=True)
             QApplication.processEvents()
 
-            # Apply Mask to ODF Data
-            masked_coeffs = self.odf_data * mask[..., np.newaxis]
+            odf_amplitudes, cropped_affine = odf_utils.build_tunnel_odf_amplitudes(
+                self.odf_data,
+                current_streamlines,
+                self.odf_affine,
+                tunnel_basis,
+                dilation_iter=1,
+            )
 
-            # Update Progress -> 50%
             self.vtk_panel.update_progress_bar(2, TOTAL_STEPS, visible=True)
             QApplication.processEvents()
 
-            # Project to Amplitudes (SF) using lightweight tunnel sphere
-            tunnel_sphere = self.odf_tunnel_sphere
-            tunnel_basis = self.odf_tunnel_basis
-            amplitudes_shape = self.odf_data.shape[:3] + (
-                tunnel_sphere.vertices.shape[0],
-            )
-            odf_amplitudes = np.zeros(amplitudes_shape, dtype=np.float32)
-
-            # Flatten mask to find indices
-            mask_indices = np.where(mask)
-
             extent = None
-
-            if len(mask_indices[0]) > 0:
-                valid_coeffs = masked_coeffs[mask_indices]
-                valid_amps = np.dot(valid_coeffs, tunnel_basis.T)
-                odf_amplitudes[mask_indices] = valid_amps
-
-                # Determine min/max for x, y, z to constrain the actor
-                min_x, max_x = np.min(mask_indices[0]), np.max(mask_indices[0])
-                min_y, max_y = np.min(mask_indices[1]), np.max(mask_indices[1])
-                min_z, max_z = np.min(mask_indices[2]), np.max(mask_indices[2])
-
-                extent = (min_x, max_x, min_y, max_y, min_z, max_z)
+            if odf_amplitudes is not None:
+                shape = odf_amplitudes.shape
+                extent = (0, shape[0] - 1, 0, shape[1] - 1, 0, shape[2] - 1)
 
             # Update Progress -> 75%
             self.vtk_panel.update_progress_bar(3, TOTAL_STEPS, visible=True)
             QApplication.processEvents()
 
-            # Update VTK with Extent
             self.vtk_panel.update_odf_actor(
-                odf_amplitudes, tunnel_sphere, self.odf_affine, extent=extent
+                odf_amplitudes, tunnel_sphere, cropped_affine, extent=extent
             )
 
             # Update Progress -> 100% and Hide
@@ -1009,9 +1016,20 @@ class MainWindow(QMainWindow):
             QApplication.processEvents()
 
             # Mark tunnel as visible and update data panel
+            self._odf_tunnel_indices = np.asarray(strided_indices, dtype=np.int64)
+            self._odf_tunnel_source = (
+                id(self.odf_data),
+                id(self.tractogram_data),
+                np.asarray(self.odf_affine, dtype=np.float64).tobytes(),
+            )
             self.odf_tunnel_is_visible = True
             self._update_data_panel_display()
 
+        except MemoryError:
+            logger.error("Insufficient memory for ODF Tunnel View", exc_info=True)
+            self.vtk_panel.update_status("Insufficient memory for Tunnel View.")
+            self.view_odf_tunnel_action.setChecked(False)
+            self.odf_tunnel_is_visible = False
         except (RuntimeError, ValueError, IndexError, TypeError) as e:
             logger.error(f"Error computing Tunnel View: {e}", exc_info=True)
             self.vtk_panel.update_status("Error generating Tunnel View.")
@@ -1027,6 +1045,14 @@ class MainWindow(QMainWindow):
         Args:
             visible: True to show, False to hide the ODF tunnel.
         """
+        if visible and getattr(self, "_session_deferred_odf", False):
+            from .logic.session_manager import materialize_session_odf
+
+            if not materialize_session_odf(self):
+                with signals_blocked(self.view_odf_tunnel_action):
+                    self.view_odf_tunnel_action.setChecked(False)
+                self._update_data_panel_display()
+                return
         if not self.vtk_panel or not self.vtk_panel.odf_actor:
             return
 
@@ -1115,21 +1141,32 @@ class MainWindow(QMainWindow):
             )
 
             dims_str, vox_str, order = "N/A", "N/A", "N/A"
-            if "dimensions" in header:
+            if self.tractogram_reference_grid is not None:
+                dims_str = format_tuple(
+                    self.tractogram_reference_grid.shape,
+                    precision=0,
+                )
+                vox_str = format_tuple(
+                    self.tractogram_reference_grid.voxel_sizes,
+                    precision=2,
+                )
+                order = self.tractogram_reference_grid.voxel_order
+            elif "dimensions" in header:
                 dims_val = header["dimensions"]
                 if (
                     isinstance(dims_val, (tuple, list, np.ndarray))
                     and len(dims_val) == 3
                 ):
                     dims_str = format_tuple(dims_val, precision=0)
-            if "voxel_sizes" in header:
+            if self.tractogram_reference_grid is None and "voxel_sizes" in header:
                 vox_val = header["voxel_sizes"]
-                if (
-                    isinstance(vox_val, (tuple, list, np.ndarray))
-                    and len(dims_val) == 3
-                ):
+                if isinstance(vox_val, (tuple, list, np.ndarray)) and len(vox_val) == 3:
                     vox_str = format_tuple(vox_val, precision=2)
-            if "voxel_order" in header and isinstance(header["voxel_order"], str):
+            if (
+                self.tractogram_reference_grid is None
+                and "voxel_order" in header
+                and isinstance(header["voxel_order"], str)
+            ):
                 order = header["voxel_order"]
 
             bundle_text = (
@@ -1144,7 +1181,12 @@ class MainWindow(QMainWindow):
                 if self.anatomical_image_path
                 else "Unknown"
             )
-            shape_str = format_tuple(self.anatomical_image_data.shape, precision=0)
+            image_shape = (
+                self.anatomical_reference_grid.shape
+                if self.anatomical_reference_grid is not None
+                else self.anatomical_image_data.shape
+            )
+            shape_str = format_tuple(image_shape, precision=0)
             image_text = f"Image: {filename} | Shape={shape_str}"
 
         # ROI Info
@@ -1234,9 +1276,7 @@ class MainWindow(QMainWindow):
             if self._pending_expanded_items:
                 for i in range(self.data_tree_widget.topLevelItemCount()):
                     item = self.data_tree_widget.topLevelItem(i)
-                    self._restore_expanded_items(
-                        item, "", self._pending_expanded_items
-                    )
+                    self._restore_expanded_items(item, "", self._pending_expanded_items)
                 self._pending_expanded_items = set()
         finally:
             self.data_tree_widget.blockSignals(False)
@@ -1264,9 +1304,7 @@ class MainWindow(QMainWindow):
         bundle_item = QTreeWidgetItem(tractogram_header, [bundle_name])
         bundle_item.setFlags(bundle_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
         bundle_state = (
-            Qt.CheckState.Checked
-            if self.bundle_is_visible
-            else Qt.CheckState.Unchecked
+            Qt.CheckState.Checked if self.bundle_is_visible else Qt.CheckState.Unchecked
         )
         bundle_item.setCheckState(0, bundle_state)
         bundle_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "bundle"})
@@ -1278,7 +1316,9 @@ class MainWindow(QMainWindow):
             else "TRK"
         )
         dims = "N/A"
-        if self.original_trk_header and "dimensions" in self.original_trk_header:
+        if self.tractogram_reference_grid is not None:
+            dims = format_tuple(self.tractogram_reference_grid.shape, precision=0)
+        elif self.original_trk_header and "dimensions" in self.original_trk_header:
             dims = format_tuple(self.original_trk_header["dimensions"], precision=0)
 
         tooltip_text = f"Type: {ext}\nCount: {count}\nDimensions: {dims}"
@@ -1318,9 +1358,7 @@ class MainWindow(QMainWindow):
         image_item = QTreeWidgetItem(image_header, [image_name])
         image_item.setFlags(image_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
         image_state = (
-            Qt.CheckState.Checked
-            if self.image_is_visible
-            else Qt.CheckState.Unchecked
+            Qt.CheckState.Checked if self.image_is_visible else Qt.CheckState.Unchecked
         )
         image_item.setCheckState(0, image_state)
         image_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "image"})
@@ -1376,13 +1414,9 @@ class MainWindow(QMainWindow):
 
             roi_item.setFlags(roi_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             is_visible = self.roi_visibility.get(path, True)
-            roi_state = (
-                Qt.CheckState.Checked if is_visible else Qt.CheckState.Unchecked
-            )
+            roi_state = Qt.CheckState.Checked if is_visible else Qt.CheckState.Unchecked
             roi_item.setCheckState(0, roi_state)
-            roi_item.setData(
-                0, Qt.ItemDataRole.UserRole, {"type": "roi", "path": path}
-            )
+            roi_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "roi", "path": path})
 
             shape_str = format_tuple(roi_info["data"].shape, precision=0)
             roi_item.setToolTip(0, f"Path: {path}\nShape: {shape_str}")
@@ -1399,9 +1433,7 @@ class MainWindow(QMainWindow):
             0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
         )
 
-        odf_name = (
-            os.path.basename(self.odf_path) if self.odf_path else "Loaded ODF"
-        )
+        odf_name = os.path.basename(self.odf_path) if self.odf_path else "Loaded ODF"
 
         odf_file_item = QTreeWidgetItem(odf_header, [odf_name])
         odf_file_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "odf_data"})
@@ -1414,11 +1446,12 @@ class MainWindow(QMainWindow):
         )
 
         # ODF Tunnel View item (checkable for visibility toggle)
-        if self.vtk_panel and self.vtk_panel.odf_actor is not None:
+        if self.vtk_panel and (
+            self.vtk_panel.odf_actor is not None
+            or getattr(self, "_session_deferred_odf", False)
+        ):
             tunnel_item = QTreeWidgetItem(odf_header, ["ODF Tunnel View"])
-            tunnel_item.setFlags(
-                tunnel_item.flags() | Qt.ItemFlag.ItemIsUserCheckable
-            )
+            tunnel_item.setFlags(tunnel_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             tunnel_state = (
                 Qt.CheckState.Checked
                 if self.odf_tunnel_is_visible
@@ -1428,8 +1461,7 @@ class MainWindow(QMainWindow):
             tunnel_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "odf_tunnel"})
             tunnel_item.setToolTip(
                 0,
-                "Toggle visibility of the ODF Tunnel View.\n"
-                "Right-click to remove.",
+                "Toggle visibility of the ODF Tunnel View.\n" "Right-click to remove.",
             )
 
         odf_header.setExpanded(True)
@@ -1456,9 +1488,7 @@ class MainWindow(QMainWindow):
         parc_item.setFlags(parc_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
 
         parc_visible = self._parcellation_overlay_visible
-        parc_state = (
-            Qt.CheckState.Checked if parc_visible else Qt.CheckState.Unchecked
-        )
+        parc_state = Qt.CheckState.Checked if parc_visible else Qt.CheckState.Unchecked
         parc_item.setCheckState(0, parc_state)
         parc_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "parcellation"})
 
@@ -1552,18 +1582,14 @@ class MainWindow(QMainWindow):
                 display_name = f"{label_name} [EXC]"
 
             region_item = QTreeWidgetItem(parent_item, [display_name])
-            region_item.setFlags(
-                region_item.flags() | Qt.ItemFlag.ItemIsUserCheckable
-            )
+            region_item.setFlags(region_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
 
             has_actor = int(label) in main_labels
             region_visible = self.parcellation_region_visibility.get(
                 int(label), has_actor
             )
             region_state = (
-                Qt.CheckState.Checked
-                if region_visible
-                else Qt.CheckState.Unchecked
+                Qt.CheckState.Checked if region_visible else Qt.CheckState.Unchecked
             )
             region_item.setCheckState(0, region_state)
 
@@ -1624,10 +1650,6 @@ class MainWindow(QMainWindow):
     def _perform_redo(self) -> None:
         """Performs redo. Delegates to StateManager."""
         self.state_manager.perform_redo()
-
-    def _save_roi_state_for_undo(self, roi_name: str) -> None:
-        """Saves ROI state for undo. Delegates to StateManager."""
-        self.state_manager.save_roi_state_for_undo(roi_name)
 
     # Command Actions Logic
     @pyqtSlot()
@@ -1709,11 +1731,13 @@ class MainWindow(QMainWindow):
 
             # Reset streamline data state
             self.tractogram_data = None
+            self._tractogram_data_version += 1
             self.streamline_bboxes = None
             self.visible_indices = set()
             self._visibility_version += 1
             self.original_trk_header = None
             self.original_trk_affine = None
+            self.tractogram_reference_grid = None
             self.original_trk_path = None
             self.original_file_extension = None
 
@@ -1721,6 +1745,7 @@ class MainWindow(QMainWindow):
             self._close_trx_file()
 
             self.scalar_data_per_point = None
+            self.data_per_streamline = None
             self.active_scalar_name = None
             self.odf_data = None
             self.odf_affine = None
@@ -1742,12 +1767,10 @@ class MainWindow(QMainWindow):
             if self.scalar_toolbar:
                 self.scalar_toolbar.setVisible(False)
 
-            # Invalidate parcellation intersection cache (tied to old streamlines)
-            self.parcellation_region_intersection_cache = {}
-            self.parcellation_region_states = {}
-            self.parcellation_start_labels = None
-            self.parcellation_end_labels = None
-            self.parcellation_visible_indices = None
+            self.connectivity_manager.invalidate_parcellation_cache(
+                clear_region_states=True,
+                render=False,
+            )
 
             # Update VTK
             if self.vtk_panel:
@@ -1829,9 +1852,15 @@ class MainWindow(QMainWindow):
                 if valid_rois:
                     logger.info(f"Loading initial ROIs: {valid_rois}")
                     loaded_rois = file_io.load_roi_images(self, file_paths=valid_rois)
+                    main_affine = self.anatomical_image_affine
+                    target_ornt = (
+                        nib.io_orientation(main_affine)
+                        if self.anatomical_image_path
+                        else None
+                    )
 
                     # Iterate through every loaded ROI
-                    for _, _, roi_path in loaded_rois:
+                    for roi_data, roi_affine, roi_path in loaded_rois:
                         if roi_path in self.roi_layers:
                             logger.warning(
                                 f"ROI '{os.path.basename(roi_path)}' is already loaded."
@@ -1842,48 +1871,26 @@ class MainWindow(QMainWindow):
                         self.roi_opacities[roi_path] = 0.5
 
                         try:
-                            # Load the main anatomical image object from its stored path
+                            # Reuse the canonicalized, scaled ROI returned by the loader.
                             if not self.anatomical_image_path:
                                 logger.warning(
                                     f"Skipping ROI {roi_path}: No anatomical image loaded for reorientation."
                                 )
                                 continue
-
-                            from .file_io import _canonicalize_image
-
-                            anatomical_img = nib.load(self.anatomical_image_path)
-                            anatomical_img = _canonicalize_image(
-                                anatomical_img, self.anatomical_image_path, None
-                            )
-
-                            roi_img = nib.load(roi_path)
-                            roi_img = _canonicalize_image(roi_img, roi_path, None)
-                            # Ensure proper coordinate system alignment
-                            current_ornt = nib.io_orientation(roi_img.affine)
-                            target_ornt = nib.io_orientation(anatomical_img.affine)
-
+                            # Reorient array and affine together without another file read.
+                            current_ornt = nib.io_orientation(roi_affine)
                             if not np.array_equal(current_ornt, target_ornt):
-                                if self.vtk_panel:
-                                    current_axcodes = "".join(
-                                        nib.aff2axcodes(roi_img.affine)
-                                    )
-                                    target_axcodes = "".join(
-                                        nib.aff2axcodes(anatomical_img.affine)
-                                    )
-                                    self.vtk_panel.update_status(
-                                        f"Reorienting {os.path.basename(roi_path)} ({current_axcodes} -> {target_axcodes})..."
-                                    )
                                 transform = ornt_transform(current_ornt, target_ornt)
-                                reoriented_roi_img = roi_img.as_reoriented(transform)
-                                roi_data = reoriented_roi_img.get_fdata()
-                                roi_affine = reoriented_roi_img.affine
-                            else:
-                                roi_data = roi_img.get_fdata()
-                                roi_affine = roi_img.affine
+                                original_shape = roi_data.shape
+                                roi_data = nib.orientations.apply_orientation(
+                                    roi_data, transform
+                                )
+                                roi_affine = roi_affine @ nib.orientations.inv_ornt_aff(
+                                    transform, original_shape
+                                )
 
                             # Store the data
                             inv_affine = np.linalg.inv(roi_affine)
-                            main_affine = self.anatomical_image_affine
                             T_main_to_roi = np.dot(inv_affine, main_affine)
 
                             self.roi_layers[roi_path] = {
@@ -1964,56 +1971,27 @@ class MainWindow(QMainWindow):
                         p_h = np.append(center_world, 1.0)
                         center_vox = np.dot(roi_inv_affine, p_h)[:3]
 
-                        # Calculate radius in voxels
-                        edge_world = center_world + np.array([r_val, 0, 0])
-                        p_h_e = np.append(edge_world, 1.0)
-                        edge_vox = np.dot(roi_inv_affine, p_h_e)[:3]
+                        _rasterize_world_sphere(
+                            roi_data,
+                            center_vox,
+                            r_val,
+                            roi_affine,
+                            shape,
+                            1,
+                        )
 
-                        radius_vox = np.linalg.norm(center_vox - edge_vox)
-
-                        # Bounding box
-                        min_v = np.floor(center_vox - radius_vox).astype(int)
-                        max_v = np.ceil(center_vox + radius_vox).astype(int)
-                        min_v = np.maximum(min_v, 0)
-                        max_v = np.minimum(max_v, np.array(shape) - 1)
-
-                        x_r = np.arange(min_v[0], max_v[0] + 1)
-                        y_r = np.arange(min_v[1], max_v[1] + 1)
-                        z_r = np.arange(min_v[2], max_v[2] + 1)
-
-                        if len(x_r) > 0 and len(y_r) > 0 and len(z_r) > 0:
-                            xx, yy, zz = np.meshgrid(x_r, y_r, z_r, indexing="ij")
-                            dist_sq = (
-                                (xx - center_vox[0]) ** 2
-                                + (yy - center_vox[1]) ** 2
-                                + (zz - center_vox[2]) ** 2
+                        if self.vtk_panel:
+                            # Continuous geometry remains valid even when no voxel
+                            # center falls inside the sphere. Actors need it first.
+                            self.vtk_panel.sphere_params_per_roi[roi_name] = {
+                                "center": center_world,
+                                "radius": r_val,
+                                "view_type": "axial",
+                            }
+                            self.vtk_panel.add_roi_layer(roi_name, roi_data, roi_affine)
+                            self.vtk_panel.update_status(
+                                f"Created Sphere ROI at {coords} (r={r_val}mm)"
                             )
-                            mask = dist_sq <= radius_vox**2
-
-                            roi_slice = roi_data[
-                                min_v[0] : max_v[0] + 1,
-                                min_v[1] : max_v[1] + 1,
-                                min_v[2] : max_v[2] + 1,
-                            ]
-                            roi_slice[mask] = 1
-
-                            # Update VTK
-                            if self.vtk_panel:
-                                # We need to add the actor first since _trigger_new_roi doesn't add it until drawn
-                                self.vtk_panel.add_roi_layer(
-                                    roi_name, roi_data, roi_affine
-                                )
-
-                                # Store sphere params for future interaction
-                                self.vtk_panel.sphere_params_per_roi[roi_name] = {
-                                    "center": center_world,
-                                    "radius": r_val,
-                                    "view_type": "axial",  # Default
-                                }
-
-                                self.vtk_panel.update_status(
-                                    f"Created Sphere ROI at {coords} (r={r_val}mm)"
-                                )
 
             self._update_action_states()
             self._update_data_panel_display()
@@ -2055,19 +2033,53 @@ class MainWindow(QMainWindow):
 
         # Create and configure the loader thread
         loader_thread = file_io.AnatomicalImageLoaderThread(anat_path)
+        loader_thread.progress_dialog = progress
+        generation = file_io._register_background_worker(
+            self,
+            "_image_loader_thread",
+            "_image_load_generation",
+            loader_thread,
+        )
+        completed = False
 
         def on_progress(val, msg):
+            if not file_io._worker_is_current(
+                self,
+                "_image_loader_thread",
+                "_image_load_generation",
+                loader_thread,
+                generation,
+            ):
+                return
             progress.setValue(val)
             progress.setLabelText(msg)
 
         def on_error(msg):
-            progress.cancel()
+            nonlocal completed
+            if not file_io._worker_is_current(
+                self,
+                "_image_loader_thread",
+                "_image_load_generation",
+                loader_thread,
+                generation,
+            ):
+                progress.close()
+                loader_thread.complete_result()
+                file_io._release_finished_worker(
+                    self, "_image_loader_thread", loader_thread
+                )
+                return
+            completed = True
+            loader_thread.begin_result()
+            progress.close()
             logger.error(f"Error loading initial anatomical image: {msg}")
-            QMessageBox.critical(
-                self, "Load Error", f"Error loading image:\n{msg}"
-            )
+            QMessageBox.critical(self, "Load Error", f"Error loading image:\n{msg}")
             if self.vtk_panel:
                 self.vtk_panel.update_status("Error loading image.")
+            loader_thread.complete_result()
+            file_io._release_finished_worker(
+                self, "_image_loader_thread", loader_thread
+            )
             # Continue loading remaining files without anatomical image
             self.load_initial_files(
                 bundle_path=bundle_path,
@@ -2076,16 +2088,55 @@ class MainWindow(QMainWindow):
                 radius=radius,
             )
 
-        def on_finished(data):
+        def on_finished(data: "AnatomicalImageLoadResult") -> None:
+            nonlocal completed
+            if completed or not file_io._worker_is_current(
+                self,
+                "_image_loader_thread",
+                "_image_load_generation",
+                loader_thread,
+                generation,
+            ):
+                progress.close()
+                discard = getattr(loader_thread, "discard_result", None)
+                if callable(discard):
+                    discard(data)
+                file_io._release_finished_worker(
+                    self, "_image_loader_thread", loader_thread
+                )
+                return
+            take_result = getattr(loader_thread, "take_result", None)
+            if callable(take_result):
+                data = take_result(data)
+                if data is None:
+                    loader_thread.complete_result()
+                    file_io._release_finished_worker(
+                        self, "_image_loader_thread", loader_thread
+                    )
+                    return
+            completed = True
+            loader_thread.begin_result()
+            previous_image = {
+                "anatomical_image_data": self.anatomical_image_data,
+                "anatomical_image_affine": self.anatomical_image_affine,
+                "anatomical_image_path": self.anatomical_image_path,
+                "anatomical_mmap_image": self.anatomical_mmap_image,
+                "anatomical_reference_grid": self.anatomical_reference_grid,
+                "image_is_visible": self.image_is_visible,
+            }
+            committed = False
             try:
                 progress.setLabelText("Creating slicer actors...")
                 progress.setValue(95)
                 QApplication.processEvents()
+                if loader_thread.is_cancelled:
+                    raise RuntimeError("Image load cancelled.")
 
                 self.anatomical_image_data = data["data"]
                 self.anatomical_image_affine = data["affine"]
                 self.anatomical_image_path = data["path"]
                 self.anatomical_mmap_image = data.get("mmap_image")
+                self.anatomical_reference_grid = data.get("reference_grid")
                 self.image_is_visible = True
 
                 if self.vtk_panel:
@@ -2102,17 +2153,59 @@ class MainWindow(QMainWindow):
 
                 self._update_bundle_info_display()
                 self._update_action_states()
+                if loader_thread.is_cancelled:
+                    raise RuntimeError("Image load cancelled.")
 
                 progress.close()
-
-            except (RuntimeError, ValueError, AttributeError, KeyError) as e:
-                logger.error(
-                    f"Error finalizing initial image load: {e}", exc_info=True
-                )
-                progress.close()
-                QMessageBox.critical(
-                    self, "Load Error", f"Error finalizing load:\n{e}"
-                )
+                committed = True
+            except Exception as e:
+                for name, value in previous_image.items():
+                    setattr(self, name, value)
+                if self.vtk_panel:
+                    try:
+                        if self.anatomical_image_data is None:
+                            self.vtk_panel.clear_anatomical_slices()
+                        else:
+                            self.vtk_panel.update_anatomical_slices()
+                    except Exception:
+                        logger.warning("Failed to restore initial image actors.")
+                for update in (
+                    self._update_bundle_info_display,
+                    self._update_action_states,
+                ):
+                    try:
+                        update()
+                    except Exception:
+                        logger.debug("Failed to refresh initial image UI.")
+                logger.error(f"Error finalizing initial image load: {e}", exc_info=True)
+                try:
+                    progress.close()
+                except Exception:
+                    logger.debug("Failed to close rejected image progress dialog.")
+                if not loader_thread.is_cancelled:
+                    try:
+                        QMessageBox.critical(
+                            self, "Load Error", f"Error finalizing load:\n{e}"
+                        )
+                    except Exception:
+                        logger.debug("Failed to display initial image load error.")
+            finally:
+                try:
+                    rejected_mmap = data.get("mmap_image")
+                    if (
+                        not committed
+                        and rejected_mmap is not None
+                        and rejected_mmap is not previous_image["anatomical_mmap_image"]
+                    ):
+                        try:
+                            rejected_mmap.clear_cache()
+                        except Exception:
+                            logger.warning("Failed to clear rejected image cache.")
+                finally:
+                    loader_thread.complete_result()
+                    file_io._release_finished_worker(
+                        self, "_image_loader_thread", loader_thread
+                    )
 
             # Continue loading remaining CLI arguments
             self.load_initial_files(
@@ -2122,16 +2215,20 @@ class MainWindow(QMainWindow):
                 radius=radius,
             )
 
+        def on_done():
+            file_io._release_finished_worker(
+                self, "_image_loader_thread", loader_thread
+            )
+
         # Connect signals (QueuedConnection ensures VTK calls run on main thread)
         loader_thread.progress.connect(on_progress)
         loader_thread.error.connect(on_error)
         loader_thread.finished.connect(
             on_finished, type=Qt.ConnectionType.QueuedConnection
         )
-        progress.canceled.connect(loader_thread.terminate)
-
-        # Keep reference to prevent garbage collection
-        self._image_loader_thread = loader_thread
+        progress.canceled.connect(loader_thread.cancel)
+        if hasattr(loader_thread, "done"):
+            loader_thread.done.connect(on_done, type=Qt.ConnectionType.QueuedConnection)
 
         loader_thread.start()
 
@@ -2145,6 +2242,7 @@ class MainWindow(QMainWindow):
         self.anatomical_image_data = None
         self.anatomical_image_affine = None
         self.anatomical_image_path = None
+        self.anatomical_reference_grid = None
         if self.anatomical_mmap_image:
             self.anatomical_mmap_image.clear_cache()
         self.anatomical_mmap_image = None
@@ -2163,32 +2261,23 @@ class MainWindow(QMainWindow):
         self._update_action_states()
 
     @pyqtSlot()
+    def _open_session(self) -> None:
+        from .logic.session_manager import SessionManager
+
+        SessionManager(self).open()
+
+    def _save_session(self) -> None:
+        from .logic.session_manager import SessionManager
+
+        SessionManager(self).save()
+
     def _trigger_load_streamlines(self) -> None:
         """Wrapper to call the streamline load function from file_io."""
-        self.scalar_range_initialized = False
-        if self.scalar_toolbar:
-            self.scalar_toolbar.setVisible(False)
-        self.bundle_is_visible = True
-
         file_io.load_streamlines_file(self)
-        # All post-load state setup (visible indices, ROI caches, skip level,
-        # etc.) is handled inside the on_finished callback in file_io.py.
-
-        # Update scalar range if scalar mode is already active
-        if self.current_color_mode == ColorMode.SCALAR and self.active_scalar_name:
-            self._update_scalar_data_range()
-            self.scalar_range_initialized = True
-            if self.scalar_toolbar:
-                self.scalar_toolbar.setVisible(True)
 
     @pyqtSlot()
     def _trigger_replace_bundle(self) -> None:
         """Wrapper to call load_streamlines_file with keep_image=True."""
-        self.scalar_range_initialized = False
-        if self.scalar_toolbar:
-            self.scalar_toolbar.setVisible(False)
-        self.bundle_is_visible = True
-
         file_io.load_streamlines_file(self, keep_image=True)
 
     @pyqtSlot()
@@ -2209,26 +2298,33 @@ class MainWindow(QMainWindow):
         # Determine Target Grid
         affine = None
         shape = None
+        reference_grid = self.anatomical_reference_grid
+        if reference_grid is None:
+            reference_grid = self.tractogram_reference_grid
 
         # Priority A: Loaded Anatomical Image
-        if self.anatomical_image_data is not None:
-            affine = self.anatomical_image_affine
-            shape = self.anatomical_image_data.shape[:3]
+        if reference_grid is not None:
+            affine = reference_grid.affine
+            shape = reference_grid.shape
+
+        elif self.anatomical_image_data is not None:
+            reference_grid = ReferenceGrid(
+                affine=self.anatomical_image_affine,
+                shape=self.anatomical_image_data.shape[:3],
+                provenance="anatomical-preview-fallback",
+            )
+            affine = reference_grid.affine
+            shape = reference_grid.shape
 
         # Priority B: Original Header Info (if compatible/available)
         elif self.original_trk_header:
-            try:
-                # Check for standard TRK header fields
-                if (
-                    "dimensions" in self.original_trk_header
-                    and "voxel_to_rasmm" in self.original_trk_header
-                ):
-                    shape = tuple(
-                        int(d) for d in self.original_trk_header["dimensions"][:3]
-                    )
-                    affine = self.original_trk_header["voxel_to_rasmm"]
-            except (KeyError, ValueError, TypeError):
-                logger.debug("Failed to parse TRK header for density map grid.")
+            reference_grid = ReferenceGrid.from_header(
+                self.original_trk_header,
+                provenance="tractogram-header",
+            )
+            if reference_grid is not None:
+                affine = reference_grid.affine
+                shape = reference_grid.shape
 
         # Priority C: Compute Bounding Box (Fallback)
         # If no reference is found, we create a 1mm isotropic grid around the bundle
@@ -2269,6 +2365,11 @@ class MainWindow(QMainWindow):
                 affine = np.eye(4)
                 affine[:3, :3] = np.diag(voxel_size)
                 affine[:3, 3] = min_coord
+                reference_grid = ReferenceGrid(
+                    affine=affine,
+                    shape=shape,
+                    provenance="synthetic:tdi-bounds",
+                )
 
             except (ValueError, IndexError, TypeError) as e:
                 logger.error(f"Error computing bounds: {e}")
@@ -2335,18 +2436,9 @@ class MainWindow(QMainWindow):
             )
 
             # Save to Disk
-            nifti_img = nib.Nifti1Image(density_data.astype(np.float32), affine)
+            nifti_img = reference_grid.create_nifti(density_data.astype(np.float32))
 
-            # Copy header info if possible (e.g. from anatomy) to preserve orientations
-            if self.anatomical_image_path and self.anatomical_image_data is not None:
-                try:
-                    ref_img = nib.load(self.anatomical_image_path)
-                    nifti_img.header.set_zooms(ref_img.header.get_zooms()[:3])
-                    nifti_img.header.set_xyzt_units(*ref_img.header.get_xyzt_units())
-                except (OSError, ValueError, KeyError):
-                    logger.debug("Failed to copy header info from anatomical image.")
-
-            nib.save(nifti_img, file_path)
+            transactional_save(file_path, lambda path: nib.save(nifti_img, path))
 
             self.vtk_panel.update_status(
                 f"Saved density map: {os.path.basename(file_path)}"
@@ -2443,9 +2535,24 @@ class MainWindow(QMainWindow):
     @pyqtSlot()
     def _trigger_load_anatomical_image(self) -> None:
         """Triggers loading of an anatomical image using a background thread."""
-        # Save path before clearing for file dialog start directory
         saved_image_path = self.anatomical_image_path
         saved_trk_path = self.original_trk_path
+
+        file_filter = "NIfTI Image Files (*.nii *.nii.gz);;All Files (*.*)"
+        start_dir = ""
+        if saved_image_path:
+            start_dir = os.path.dirname(saved_image_path)
+        elif saved_trk_path:
+            start_dir = os.path.dirname(saved_trk_path)
+
+        input_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Input Anatomical Image File", start_dir, file_filter
+        )
+
+        if not input_path:
+            if self.vtk_panel:
+                self.vtk_panel.update_status("Anatomical image load cancelled.")
+            return
 
         if self.anatomical_image_data is not None:
             # Custom message box to enforce "Yes" on the Left and "No" on the Right
@@ -2463,32 +2570,6 @@ class MainWindow(QMainWindow):
 
             if msg_box.clickedButton() != yes_btn:
                 return
-            else:
-                self._trigger_clear_anatomical_image()  # Clear before loading new one
-
-        # Clear ROIs if present
-        if self.roi_layers:
-            self._trigger_clear_all_rois(notify=False)
-
-        # Reset all drawing modes to prevent stuck state after clearing ROIs
-        self._reset_all_drawing_modes()
-
-        # Get file path first (this is fast)
-        file_filter = "NIfTI Image Files (*.nii *.nii.gz);;All Files (*.*)"
-        start_dir = ""
-        if saved_image_path:
-            start_dir = os.path.dirname(saved_image_path)
-        elif saved_trk_path:
-            start_dir = os.path.dirname(saved_trk_path)
-
-        input_path, _ = QFileDialog.getOpenFileName(
-            self, "Select Input Anatomical Image File", start_dir, file_filter
-        )
-
-        if not input_path:
-            if self.vtk_panel:
-                self.vtk_panel.update_status("Anatomical image load cancelled.")
-            return
 
         # Setup Progress Dialog (Modal)
         progress = QProgressDialog("Initializing...", "Cancel", 0, 100, self)
@@ -2505,33 +2586,179 @@ class MainWindow(QMainWindow):
 
         # Create and configure thread
         loader_thread = file_io.AnatomicalImageLoaderThread(input_path)
+        loader_thread.progress_dialog = progress
+        generation = file_io._register_background_worker(
+            self,
+            "_image_loader_thread",
+            "_image_load_generation",
+            loader_thread,
+        )
+        completed = False
 
         def on_progress(val, msg):
+            if not file_io._worker_is_current(
+                self,
+                "_image_loader_thread",
+                "_image_load_generation",
+                loader_thread,
+                generation,
+            ):
+                return
             progress.setValue(val)
             progress.setLabelText(msg)
 
         def on_error(msg):
-            progress.cancel()
+            nonlocal completed
+            if not file_io._worker_is_current(
+                self,
+                "_image_loader_thread",
+                "_image_load_generation",
+                loader_thread,
+                generation,
+            ):
+                progress.close()
+                loader_thread.complete_result()
+                file_io._release_finished_worker(
+                    self, "_image_loader_thread", loader_thread
+                )
+                return
+            completed = True
+            loader_thread.begin_result()
+            progress.close()
             QMessageBox.critical(self, "Load Error", f"Error loading image:\n{msg}")
             if self.vtk_panel:
                 self.vtk_panel.update_status("Error loading image.")
+            loader_thread.complete_result()
+            file_io._release_finished_worker(
+                self, "_image_loader_thread", loader_thread
+            )
 
-        def on_finished(data):
+        def on_finished(data: "AnatomicalImageLoadResult") -> None:
+            nonlocal completed
+            if completed or not file_io._worker_is_current(
+                self,
+                "_image_loader_thread",
+                "_image_load_generation",
+                loader_thread,
+                generation,
+            ):
+                progress.close()
+                discard = getattr(loader_thread, "discard_result", None)
+                if callable(discard):
+                    discard(data)
+                file_io._release_finished_worker(
+                    self, "_image_loader_thread", loader_thread
+                )
+                return
+
+            take_result = getattr(loader_thread, "take_result", None)
+            if callable(take_result):
+                data = take_result(data)
+                if data is None:
+                    loader_thread.complete_result()
+                    file_io._release_finished_worker(
+                        self, "_image_loader_thread", loader_thread
+                    )
+                    return
+
+            completed = True
+            loader_thread.begin_result()
+            previous_image = {
+                "anatomical_image_data": self.anatomical_image_data,
+                "anatomical_image_affine": self.anatomical_image_affine,
+                "anatomical_image_path": self.anatomical_image_path,
+                "anatomical_mmap_image": self.anatomical_mmap_image,
+                "anatomical_reference_grid": self.anatomical_reference_grid,
+                "image_is_visible": self.image_is_visible,
+            }
+            roi_state = {}
+            for name in (
+                "roi_layers",
+                "roi_visibility",
+                "roi_opacities",
+                "roi_states",
+                "roi_intersection_cache",
+                "roi_highlight_indices",
+                "visible_indices",
+                "selected_streamline_indices",
+                "_inversion_active",
+                "_inversion_keeper_indices",
+                "unified_undo_stack",
+                "unified_redo_stack",
+                "_visibility_version",
+                "_skip_user_disabled",
+                "render_stride",
+                "_last_visibility_version",
+                "_last_render_stride",
+                "_last_color_mode",
+                "_last_active_scalar",
+                "_last_tube_mode",
+                "_last_bundle_opacity",
+            ):
+                if hasattr(self, name):
+                    value = getattr(self, name)
+                    roi_state[name] = (
+                        value.copy() if isinstance(value, (dict, set, list)) else value
+                    )
+            drawing_state = {
+                name: getattr(self, name)
+                for name in (
+                    "is_drawing_mode",
+                    "is_eraser_mode",
+                    "is_sphere_mode",
+                    "is_rectangle_mode",
+                    "current_drawing_roi",
+                )
+                if hasattr(self, name)
+            }
+            drawing_actions = {
+                name: getattr(self, name).isChecked()
+                for name in (
+                    "draw_mode_action",
+                    "erase_mode_action",
+                    "sphere_mode_action",
+                    "rectangle_mode_action",
+                )
+                if hasattr(self, name)
+            }
+            drawing_buttons = {
+                name: getattr(self, name).styleSheet()
+                for name in (
+                    "draw_mode_button",
+                    "erase_mode_button",
+                    "sphere_mode_button",
+                    "rectangle_mode_button",
+                )
+                if hasattr(self, name)
+            }
+            sphere_radius_visible = (
+                self.sphere_radius_container.isVisible()
+                if hasattr(self, "sphere_radius_container")
+                else None
+            )
+            roi_clear_started = False
+            drawing_reset_started = False
+            committed = False
             try:
                 # Update progress to show we're creating VTK actors (this is the heavy part)
                 progress.setLabelText("Creating slicer actors...")
                 progress.setValue(95)
                 QApplication.processEvents()  # Keep UI responsive
+                if loader_thread.is_cancelled:
+                    raise RuntimeError("Image load cancelled.")
 
                 self.anatomical_image_data = data["data"]
                 self.anatomical_image_affine = data["affine"]
                 self.anatomical_image_path = data["path"]
                 self.anatomical_mmap_image = data.get("mmap_image")
+                self.anatomical_reference_grid = data.get("reference_grid")
                 self.image_is_visible = True
 
                 if self.vtk_panel:
                     self.vtk_panel.update_anatomical_slices()
                     QApplication.processEvents()  # Allow UI to update after heavy work
+                    if loader_thread.is_cancelled:
+                        raise RuntimeError("Image load cancelled.")
                     if self.vtk_panel.scene:
                         self.vtk_panel.scene.reset_camera()
                         self.vtk_panel.scene.reset_clipping_range()
@@ -2545,13 +2772,123 @@ class MainWindow(QMainWindow):
                 self._update_action_states()
                 self._update_data_panel_display()
 
+                if self.roi_layers:
+                    roi_clear_started = True
+                    self._trigger_clear_all_rois(notify=False)
+                drawing_reset_started = True
+                self._reset_all_drawing_modes()
+                if loader_thread.is_cancelled:
+                    raise RuntimeError("Image load cancelled.")
+
                 # Close progress dialog after ALL work is complete
                 progress.close()
+                committed = True
 
-            except (RuntimeError, ValueError, AttributeError, KeyError) as e:
+            except Exception as e:
+                for name, value in previous_image.items():
+                    setattr(self, name, value)
+                if roi_clear_started:
+                    for name, value in roi_state.items():
+                        setattr(self, name, value)
+                if roi_clear_started or drawing_reset_started:
+                    for name, value in drawing_state.items():
+                        setattr(self, name, value)
+                    for name, checked in drawing_actions.items():
+                        try:
+                            action = getattr(self, name)
+                            with signals_blocked(action):
+                                action.setChecked(checked)
+                        except Exception:
+                            logger.debug("Failed to restore drawing action %s.", name)
+                    for name, style in drawing_buttons.items():
+                        try:
+                            getattr(self, name).setStyleSheet(style)
+                        except Exception:
+                            logger.debug("Failed to restore drawing button %s.", name)
+                    if sphere_radius_visible is not None:
+                        try:
+                            self.sphere_radius_container.setVisible(sphere_radius_visible)
+                        except Exception:
+                            logger.debug("Failed to restore sphere radius control.")
+                    if self.vtk_panel:
+                        try:
+                            self.vtk_panel.set_drawing_mode(
+                                drawing_state.get("is_drawing_mode", False),
+                                is_eraser=drawing_state.get("is_eraser_mode", False),
+                                is_sphere=drawing_state.get("is_sphere_mode", False),
+                                is_rectangle=drawing_state.get(
+                                    "is_rectangle_mode", False
+                                ),
+                            )
+                        except Exception:
+                            logger.debug("Failed to restore drawing mode.")
+                if self.vtk_panel and self.anatomical_image_data is not None:
+                    try:
+                        self.vtk_panel.update_anatomical_slices()
+                    except Exception:
+                        logger.debug("Failed to restore previous anatomical actors.")
+                if roi_clear_started and self.vtk_panel:
+                    try:
+                        self.vtk_panel.clear_all_roi_layers()
+                        for name, layer in self.roi_layers.items():
+                            self.vtk_panel.add_roi_layer(
+                                name, layer["data"], layer["affine"], render=False
+                            )
+                    except Exception:
+                        logger.warning("Failed to restore previous ROI actors.")
+                for update in (
+                    self._update_bundle_info_display,
+                    self._update_action_states,
+                    self._update_data_panel_display,
+                ):
+                    try:
+                        update()
+                    except Exception:
+                        logger.debug("Failed to refresh previous image UI.")
                 logger.error(f"Error in on_finished: {e}", exc_info=True)
-                progress.close()  # Ensure progress is closed on error
-                QMessageBox.critical(self, "Load Error", f"Error finalizing load:\n{e}")
+                try:
+                    progress.close()
+                except Exception:
+                    logger.debug("Failed to close rejected image progress dialog.")
+                if not loader_thread.is_cancelled:
+                    try:
+                        QMessageBox.critical(
+                            self, "Load Error", f"Error finalizing load:\n{e}"
+                        )
+                    except Exception:
+                        logger.debug("Failed to display image load error.")
+            finally:
+                try:
+                    rejected_mmap = data.get("mmap_image")
+                    if (
+                        not committed
+                        and rejected_mmap is not None
+                        and rejected_mmap is not previous_image["anatomical_mmap_image"]
+                    ):
+                        try:
+                            rejected_mmap.clear_cache()
+                        except Exception:
+                            logger.warning("Failed to clear rejected image cache.")
+                    if committed:
+                        old_mmap = previous_image["anatomical_mmap_image"]
+                        if (
+                            old_mmap is not None
+                            and old_mmap is not self.anatomical_mmap_image
+                        ):
+                            try:
+                                old_mmap.clear_cache()
+                            except Exception:
+                                logger.warning("Failed to clear previous image cache.")
+                finally:
+                    loader_thread.complete_result()
+                    file_io._release_finished_worker(
+                        self, "_image_loader_thread", loader_thread
+                    )
+
+        def on_done():
+            file_io._release_finished_worker(
+                self, "_image_loader_thread", loader_thread
+            )
 
         # Connect Signals (QueuedConnection ensures VTK calls run on main thread)
         loader_thread.progress.connect(on_progress)
@@ -2559,10 +2896,9 @@ class MainWindow(QMainWindow):
         loader_thread.finished.connect(
             on_finished, type=Qt.ConnectionType.QueuedConnection
         )
-        progress.canceled.connect(loader_thread.terminate)
-
-        # Keep reference to prevent garbage collection
-        self._image_loader_thread = loader_thread
+        progress.canceled.connect(loader_thread.cancel)
+        if hasattr(loader_thread, "done"):
+            loader_thread.done.connect(on_done, type=Qt.ConnectionType.QueuedConnection)
 
         # Start
         loader_thread.start()
@@ -2596,8 +2932,11 @@ class MainWindow(QMainWindow):
         if not loaded_rois:
             return  # User cancelled or all failed
 
+        main_affine = self.anatomical_image_affine
+        target_ornt = nib.io_orientation(main_affine)
+
         # Iterate through every loaded ROI
-        for _, _, roi_path in loaded_rois:
+        for roi_data, roi_affine, roi_path in loaded_rois:
 
             if roi_path in self.roi_layers:
                 QMessageBox.warning(
@@ -2617,49 +2956,19 @@ class MainWindow(QMainWindow):
                 QApplication.processEvents()
 
             try:
-                # Load the main anatomical image object from its stored path
-                from .file_io import _canonicalize_image
-
-                anatomical_img = nib.load(self.anatomical_image_path)
-                anatomical_img = _canonicalize_image(
-                    anatomical_img, self.anatomical_image_path, None
-                )
-
-                # Load the ROI image object again to perform reorientation operations
-                roi_img = nib.load(roi_path)
-                roi_img = _canonicalize_image(roi_img, roi_path, None)
-
-                # Ensure proper coordinate system alignment
-                current_ornt = nib.io_orientation(roi_img.affine)
-                target_ornt = nib.io_orientation(anatomical_img.affine)
-
-                # Check if they match
+                # Reuse the canonicalized, scaled ROI returned by the loader.
+                # Reorient array and affine together without another file read.
+                current_ornt = nib.io_orientation(roi_affine)
                 if not np.array_equal(current_ornt, target_ornt):
-                    if self.vtk_panel:
-                        current_axcodes = "".join(nib.aff2axcodes(roi_img.affine))
-                        target_axcodes = "".join(nib.aff2axcodes(anatomical_img.affine))
-                        self.vtk_panel.update_status(
-                            f"Reorienting {os.path.basename(roi_path)} ({current_axcodes} -> {target_axcodes})..."
-                        )
-
-                    # Get the transform
                     transform = ornt_transform(current_ornt, target_ornt)
-
-                    # Use as_reoriented to transform *both* data and affine
-                    reoriented_roi_img = roi_img.as_reoriented(transform)
-
-                    # Get the *new* data and *new* affine
-                    roi_data = reoriented_roi_img.get_fdata()
-                    roi_affine = reoriented_roi_img.affine
-
-                else:
-                    # Orientations match, just get the original data and affine
-                    roi_data = roi_img.get_fdata()
-                    roi_affine = roi_img.affine
+                    original_shape = roi_data.shape
+                    roi_data = nib.orientations.apply_orientation(roi_data, transform)
+                    roi_affine = roi_affine @ nib.orientations.inv_ornt_aff(
+                        transform, original_shape
+                    )
 
                 # Store the data
                 inv_affine = np.linalg.inv(roi_affine)
-                main_affine = self.anatomical_image_affine
                 T_main_to_roi = np.dot(inv_affine, main_affine)
 
                 self.roi_layers[roi_path] = {
@@ -2798,7 +3107,10 @@ class MainWindow(QMainWindow):
         self.roi_manager.update_sphere_roi_intersection(roi_name, center, radius)
 
     def update_rectangle_roi_intersection(
-        self, roi_name: str, min_point: np.ndarray, max_point: np.ndarray
+        self,
+        roi_name: str,
+        min_point: Optional[np.ndarray] = None,
+        max_point: Optional[np.ndarray] = None,
     ) -> None:
         """Updates rectangle ROI intersection. Delegates to ROIManager."""
         self.roi_manager.update_rectangle_roi_intersection(
@@ -2927,6 +3239,9 @@ class MainWindow(QMainWindow):
     # Window Close Event
     def closeEvent(self, event: QCloseEvent) -> None:
         """Handles the main window close event, prompting if data is loaded."""
+        if getattr(self, "_session_busy", False):
+            event.ignore()
+            return
         logger.info("Close event received.")
         # Explicitly check for None to avoid ValueError with numpy arrays
         data_loaded = (self.tractogram_data is not None) or (
@@ -2936,7 +3251,9 @@ class MainWindow(QMainWindow):
 
         should_exit = False
 
-        if data_loaded:
+        if self._shutdown_requested:
+            should_exit = True
+        elif data_loaded:
             # Custom message box to enforce "Yes" on the Left and "No" on the Right
             msg_box = QMessageBox(self)
             msg_box.setWindowTitle("Confirm Quit")
@@ -2952,19 +3269,27 @@ class MainWindow(QMainWindow):
 
             if msg_box.clickedButton() == yes_btn:
                 logger.info("User confirmed quit. Cleaning up...")
-                self._cleanup_resources()
-                self._cleanup_vtk()
-                event.accept()
                 should_exit = True
             else:
                 logger.info("User cancelled quit.")
                 event.ignore()
         else:
             logger.info("No data loaded. Cleaning up...")
+            should_exit = True
+
+        if should_exit:
+            self._shutdown_requested = True
+            if not self._cancel_background_workers(wait_ms=0):
+                event.ignore()
+                if self.vtk_panel:
+                    self.vtk_panel.update_status(
+                        "Waiting for background operations to stop..."
+                    )
+                QTimer.singleShot(50, self.close)
+                return
             self._cleanup_resources()
             self._cleanup_vtk()
             event.accept()
-            should_exit = True
 
         # On Linux and macOS, force immediate exit to prevent VTK/Qt cleanup
         # conflicts that cause segmentation faults during Py_FinalizeEx.
@@ -2980,26 +3305,12 @@ class MainWindow(QMainWindow):
     def _close_trx_file(self) -> None:
         """Close the TRX memory-mapped file reference and release resources."""
         if self.trx_file_reference is not None:
-            try:
-                if hasattr(self.trx_file_reference, "close"):
-                    self.trx_file_reference.close()
-            except OSError:
-                logger.debug("Failed to close TRX file reference.")
+            file_io._retire_trx_owner(self, self.trx_file_reference)
             self.trx_file_reference = None
 
     def _cleanup_resources(self) -> None:
         """Cleans up non-VTK resources before application exit."""
-        # Terminate any running background threads
-        for thread_attr in ("_loader_thread", "_image_loader_thread"):
-            thread = getattr(self, thread_attr, None)
-            if thread is not None:
-                try:
-                    if thread.isRunning():
-                        logger.info(f"Terminating {thread_attr}...")
-                        thread.terminate()
-                        thread.wait(1000)  # Wait up to 1 second
-                except (RuntimeError, AttributeError) as e:
-                    logger.warning(f"Error terminating {thread_attr}: {e}")
+        self._cancel_background_workers(wait_ms=0)
 
         # Clear memory-mapped image cache
         if self.anatomical_mmap_image is not None:
@@ -3011,6 +3322,11 @@ class MainWindow(QMainWindow):
 
         # Close TRX memmap file reference (releases temp directory)
         self._close_trx_file()
+        file_io._release_deferred_trx_owners(self)
+        self._background_workers.clear()
+        self._loader_thread = None
+        self._image_loader_thread = None
+        self._medoid_thread = None
 
         # Clear large data arrays to help garbage collection
         self.tractogram_data = None
@@ -3018,6 +3334,32 @@ class MainWindow(QMainWindow):
         self.anatomical_image_data = None
         self.odf_data = None
         self.parcellation_data = None
+
+    def _cancel_background_workers(self, wait_ms: int = 0) -> bool:
+        """Request cancellation and report whether every worker has stopped."""
+        workers = list(getattr(self, "_background_workers", ()))
+        for attr in ("_loader_thread", "_image_loader_thread", "_medoid_thread"):
+            worker = getattr(self, attr, None)
+            if worker is not None and worker not in workers:
+                workers.append(worker)
+
+        all_stopped = True
+        for worker in workers:
+            try:
+                cancel = getattr(worker, "cancel", None)
+                if callable(cancel):
+                    cancel()
+                if worker.isRunning():
+                    worker.wait(wait_ms)
+                if worker.isRunning() or getattr(worker, "is_consuming_result", False):
+                    all_stopped = False
+                elif self._shutdown_requested:
+                    discard = getattr(worker, "discard_pending_result", None)
+                    if callable(discard):
+                        discard()
+            except (RuntimeError, AttributeError) as exc:
+                logger.warning("Error stopping background worker: %s", exc)
+        return all_stopped
 
     def _cleanup_vtk(self) -> None:
         """Safely cleans up VTK resources for all 4 views."""

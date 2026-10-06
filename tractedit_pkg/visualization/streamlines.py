@@ -14,7 +14,7 @@ scalar bar management, and highlight actors for selected streamlines.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, Set
 
 import numpy as np
 import vtk
@@ -42,9 +42,6 @@ class StreamlinesManager:
     and highlight actors for selected streamlines.
     """
 
-    # Threshold for incremental vs full rebuild
-    INCREMENTAL_THRESHOLD = 50
-
     def __init__(self, vtk_panel: "VTKPanel") -> None:
         """
         Initialize the streamlines manager.
@@ -53,11 +50,6 @@ class StreamlinesManager:
             vtk_panel: Reference to the parent VTKPanel instance.
         """
         self.panel = vtk_panel
-        # Cache for incremental highlight updates
-        self._last_selected_indices: Set[int] = set()
-        # Deferred update state
-        self._pending_highlight_update: bool = False
-        self._update_timer = None
 
     def update_highlight(self) -> None:
         """Updates the actor for highlighted/selected streamlines."""
@@ -91,7 +83,6 @@ class StreamlinesManager:
                 except (ValueError, AttributeError):
                     pass
                 self.panel.highlight_actor = None
-            self._last_selected_indices = set()
             if self.panel.main_window:
                 self.panel.main_window._update_action_states()
             return
@@ -261,59 +252,6 @@ class StreamlinesManager:
         # Update UI action states
         if self.panel.main_window:
             self.panel.main_window._update_action_states()
-
-        # Cache current selection for future comparison
-        self._last_selected_indices = (
-            selected_indices.copy() if selected_indices else set()
-        )
-
-    def schedule_highlight_update(self, delay_ms: int = 30) -> None:
-        """
-        Schedule a deferred highlight update with debouncing.
-
-        Multiple calls within the delay period will be coalesced into
-        a single update, preventing redundant rebuilds during rapid
-        selection operations.
-
-        Args:
-            delay_ms: Delay in milliseconds before executing the update.
-        """
-        from PyQt6.QtCore import QTimer
-
-        self._pending_highlight_update = True
-
-        # Cancel existing timer if any
-        if self._update_timer is not None:
-            self._update_timer.stop()
-            self._update_timer.deleteLater()
-
-        # Create new timer
-        self._update_timer = QTimer()
-        self._update_timer.setSingleShot(True)
-        self._update_timer.timeout.connect(self._execute_deferred_highlight)
-        self._update_timer.start(delay_ms)
-
-    def _execute_deferred_highlight(self) -> None:
-        """Execute the deferred highlight update."""
-        self._pending_highlight_update = False
-        self._update_timer = None
-        self.update_highlight()
-
-    def has_selection_changed_significantly(self) -> bool:
-        """
-        Check if the selection has changed significantly enough to warrant rebuild.
-
-        Returns:
-            True if selection changed by more than INCREMENTAL_THRESHOLD items.
-        """
-        if not self.panel.main_window:
-            return True
-
-        current = self.panel.main_window.selected_streamline_indices or set()
-        added = current - self._last_selected_indices
-        removed = self._last_selected_indices - current
-
-        return len(added) + len(removed) > self.INCREMENTAL_THRESHOLD
 
     def update_roi_highlight_actor(self) -> None:
         """
@@ -508,90 +446,6 @@ class StreamlinesManager:
             logger.error("Error creating invert contour actor: %s", e)
             self.panel.invert_contour_actor = None
 
-    def calculate_scalar_colors(
-        self,
-        streamlines_gen,
-        scalar_gen,
-        vmin: float,
-        vmax: float,
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Calculates vertex colors based on a list of scalar arrays per streamline,
-        using the provided vmin and vmax for the colormap range.
-        Returns a single concatenated (TotalPoints, 3) numpy array for FURY.
-
-        Args:
-            streamlines_gen: Generator/iterable of streamline arrays.
-            scalar_gen: Generator/iterable of scalar arrays (one per streamline).
-            vmin: Minimum value for colormap.
-            vmax: Maximum value for colormap.
-
-        Returns:
-            Dictionary with 'colors', 'opacity', 'linewidth', 'lut' keys, or None.
-        """
-
-        # Create the LUT
-        try:
-            lut = vtk.vtkLookupTable()
-            table_min = vmin - 0.5 if vmin == vmax else vmin
-            table_max = vmax + 0.5 if vmin == vmax else vmax
-
-            lut.SetTableRange(table_min, table_max)
-            lut.SetHueRange(0.667, 0.0)  # Blue to Red (standard)
-            lut.Build()
-        except (RuntimeError, ValueError) as e:
-            logger.error(f"Error creating scalar LUT: {e}. Defaulting to grey.")
-            return None  # Fallback to grey
-
-        # Build the list of color arrays (one per *non-empty* streamline)
-        default_color_rgb = np.array([128, 128, 128], dtype=np.uint8)
-        vertex_colors_list: List[np.ndarray] = []  # List to hold individual np.arrays
-        rgb_output: List[float] = [0.0, 0.0, 0.0]
-
-        for sl, sl_scalars in zip(streamlines_gen, scalar_gen):
-            num_points = len(sl) if sl is not None else 0
-            if num_points == 0:  # Skip empty streamlines
-                continue
-
-            sl_colors_rgb = np.empty((num_points, 3), dtype=np.uint8)
-
-            # Check if this (non-empty) streamline has valid scalar data
-            has_valid_scalar_for_this_sl = False
-            if (
-                sl_scalars is not None
-                and hasattr(sl_scalars, "size")
-                and len(sl_scalars) == num_points
-            ):
-                try:
-                    for j in range(num_points):
-                        lut.GetColor(sl_scalars[j], rgb_output)
-                        sl_colors_rgb[j] = [int(c * 255) for c in rgb_output]
-                    has_valid_scalar_for_this_sl = True
-                except (TypeError, ValueError, IndexError):
-                    has_valid_scalar_for_this_sl = False  # e.g., non-numeric data
-
-            if not has_valid_scalar_for_this_sl:
-                sl_colors_rgb[:] = default_color_rgb  # Fill with default color
-
-            vertex_colors_list.append(sl_colors_rgb)
-
-        if not vertex_colors_list:
-            return None
-
-        # Concatenate all color arrays into one big array
-        try:
-            concatenated_colors = np.concatenate(vertex_colors_list, axis=0)
-        except ValueError as ve:
-            logger.error(f"Failed to concatenate color arrays: {ve}")
-            return None  # Fallback to grey
-
-        return {
-            "colors": concatenated_colors,
-            "opacity": 0.8,
-            "linewidth": 3,
-            "lut": lut,
-        }
-
     def update_scalar_bar(self, lut: vtk.vtkLookupTable, title: str) -> None:
         """Creates or updates the scalar bar actor with improved UX, title positioning, and precision."""
         if not self.panel.scene:
@@ -669,6 +523,9 @@ class StreamlinesManager:
         visible_indices = self.panel.main_window.visible_indices
 
         if not visible_indices:
+            self.panel.main_window._rendered_streamline_indices = np.empty(
+                0, dtype=np.int64
+            )
             params["streamlines_list"] = []
             return params
 
@@ -678,6 +535,13 @@ class StreamlinesManager:
         # Apply STRIDE (Skip Logic)
         stride = self.panel.main_window.render_stride
         subset_indices = visible_indices_arr[::stride]  # Only pick 1 every N
+        mw = self.panel.main_window
+        override = getattr(mw, "_session_render_override", None)
+        if override is not None:
+            if override[:2] == (mw._visibility_version, stride):
+                subset_indices = override[2]
+            else:
+                mw._session_render_override = None
 
         if len(subset_indices) == 0:
             params["streamlines_list"] = []
@@ -701,6 +565,7 @@ class StreamlinesManager:
             # Filter out zero-length streamlines
             valid_mask = subset_lengths > 0
             subset_indices = subset_indices[valid_mask]
+            mw._rendered_streamline_indices = subset_indices
             subset_lengths = subset_lengths[valid_mask]
 
             if len(subset_indices) == 0:
@@ -756,6 +621,7 @@ class StreamlinesManager:
             ]
         else:
             # SLOW PATH: Fall back to individual indexing
+            mw._rendered_streamline_indices = subset_indices.copy()
             visible_streamlines_list = [
                 tractogram[i].astype(np.float32, copy=False) for i in subset_indices
             ]

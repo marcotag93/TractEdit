@@ -90,6 +90,7 @@ class ToolbarsManager:
         mw = self.mw
 
         mw.main_toolbar = QToolBar("Main Tools", mw)
+        mw.main_toolbar.setObjectName("MainToolbar")
         mw.addToolBar(Qt.ToolBarArea.TopToolBarArea, mw.main_toolbar)
 
         # Container for Toolbar Widgets

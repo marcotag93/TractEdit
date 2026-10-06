@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING, Set, Optional, List
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Optional, Set
 
 import numpy as np
 import nibabel as nib
@@ -31,6 +32,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..utils import AUTO_SKIP_THRESHOLD, TARGET_RENDER_COUNT
+from ..transactional_io import transactional_save
 
 if TYPE_CHECKING:
     from ..main_window import MainWindow
@@ -44,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 
 # _check_streamline_roi_intersection — AOT-compiled (see _numba_aot/build_aot.py)
-from tractedit_pkg._numba_aot import (
+from tractedit_pkg._numba_aot import (  # noqa: E402
     check_streamline_roi_intersection as _check_streamline_roi_intersection,
 )
 
@@ -85,6 +87,12 @@ class ROIManager:
         if not mw.tractogram_data or roi_path not in mw.roi_layers:
             return False
 
+        parametric = self._compute_parametric_intersection(roi_path)
+        if parametric is not None:
+            mw.roi_intersection_cache[roi_path] = parametric
+            mw.vtk_panel.update_status(f"Intersection done. Found {len(parametric)}.")
+            return True
+
         # Ensure we have bounding boxes
         if mw.streamline_bboxes is None:
             mw.streamline_bboxes = np.array(
@@ -102,18 +110,26 @@ class ROIManager:
             roi_data = mw.roi_layers[roi_path]["data"]
             roi_affine = mw.roi_layers[roi_path]["affine"]
             inv_affine = mw.roi_layers[roi_path]["inv_affine"]
-            dims = roi_data.shape
 
             # BROAD PHASE: Bounding Box Filter
-            roi_indices = np.argwhere(roi_data > 0)
+            foreground = roi_data > 0
+            roi_indices = np.argwhere(foreground)
 
             if roi_indices.size == 0:
                 mw.roi_intersection_cache[roi_path] = set()
-                mw.vtk_panel.update_status(f"ROI is empty. Found 0.")
+                mw.vtk_panel.update_status("ROI is empty. Found 0.")
                 return True
 
-            v_min = np.min(roi_indices, axis=0)
-            v_max = np.max(roi_indices, axis=0) + 1
+            if roi_data.dtype == np.uint8:
+                roi_data_c = np.ascontiguousarray(roi_data)
+            else:
+                roi_data_c = np.ascontiguousarray(foreground).view(np.uint8)
+            del foreground
+
+            # The native query rounds to the nearest voxel center. Include
+            # the entire half-voxel cell before applying rotation/shear.
+            v_min = np.min(roi_indices, axis=0) - 0.5
+            v_max = np.max(roi_indices, axis=0) + 0.5
 
             # Create the 8 corners of the ROI BBox in Voxel Space
             corners_vox = np.array(
@@ -150,12 +166,9 @@ class ROIManager:
 
             # Pre-fetch affine components for AOT kernel (ensure contiguous float64)
             T = np.ascontiguousarray(inv_affine[:3, 3], dtype=np.float64)
-            R = np.ascontiguousarray(inv_affine[:3, :3], dtype=np.float64)
-            dims_arr = np.array(dims[:3], dtype=np.int64)
-
-            # AOT kernel expects uint8[:,:,::1]; loaded NIfTI ROIs may
-            # arrive as float64 or other dtypes — cast to uint8 safely.
-            roi_data_c = np.ascontiguousarray(roi_data, dtype=np.uint8)
+            # The compiled kernel multiplies world row vectors by R.
+            R = np.ascontiguousarray(inv_affine[:3, :3].T, dtype=np.float64)
+            dims_arr = np.array(roi_data.shape[:3], dtype=np.int64)
 
             n_candidates = len(candidate_indices)
             for i, idx in enumerate(candidate_indices):
@@ -185,6 +198,45 @@ class ROIManager:
         finally:
             mw.vtk_panel.update_progress_bar(0, 0, visible=False)
 
+    def _compute_parametric_intersection(self, roi_name: str) -> Optional[Set[int]]:
+        """Return live analytic ROI membership, or None for voxel-mask ROIs."""
+        mw = self.mw
+        panel = mw.vtk_panel
+        if panel is None:
+            return None
+
+        sphere_registry = getattr(panel, "sphere_params_per_roi", None)
+        sphere_params = (
+            sphere_registry.get(roi_name)
+            if isinstance(sphere_registry, Mapping)
+            else None
+        )
+        if sphere_params:
+            center = np.asarray(sphere_params.get("center"), dtype=np.float64)
+            radius = float(sphere_params.get("radius", 0.0))
+            if center.shape == (3,) and np.all(np.isfinite(center)) and radius > 0:
+                return panel._find_streamlines_in_radius(center, radius, check_all=True)
+
+        rectangle_registry = getattr(panel, "rectangle_params_per_roi", None)
+        rectangle_params = (
+            rectangle_registry.get(roi_name)
+            if isinstance(rectangle_registry, Mapping)
+            else None
+        )
+        if rectangle_params:
+            voxel_min = rectangle_params.get("voxel_min")
+            voxel_max = rectangle_params.get("voxel_max")
+            if voxel_min is not None and voxel_max is not None:
+                affine = mw.roi_layers[roi_name]["affine"]
+                return panel._find_streamlines_in_oriented_box(
+                    affine,
+                    np.asarray(voxel_min, dtype=np.int64),
+                    np.asarray(voxel_max, dtype=np.int64),
+                    check_all=True,
+                )
+
+        return None
+
     def update_sphere_roi_intersection(
         self, roi_name: str, center: np.ndarray, radius: float
     ) -> None:
@@ -209,7 +261,10 @@ class ROIManager:
         self.apply_logic_filters()
 
     def update_rectangle_roi_intersection(
-        self, roi_name: str, min_point: np.ndarray, max_point: np.ndarray
+        self,
+        roi_name: str,
+        min_point: Optional[np.ndarray] = None,
+        max_point: Optional[np.ndarray] = None,
     ) -> None:
         """
         Fast update of ROI intersection for rectangular ROIs during interaction.
@@ -219,10 +274,16 @@ class ROIManager:
         if not mw.vtk_panel:
             return
 
-        # Fast Geometric Check
-        intersecting_indices = mw.vtk_panel._find_streamlines_in_box(
-            min_point, max_point, check_all=True
-        )
+        intersecting_indices = self._compute_parametric_intersection(roi_name)
+        if intersecting_indices is None:
+            if min_point is not None and max_point is not None:
+                intersecting_indices = mw.vtk_panel._find_streamlines_in_box(
+                    min_point, max_point, check_all=True
+                )
+            elif not self.compute_roi_intersection(roi_name):
+                return
+            else:
+                intersecting_indices = mw.roi_intersection_cache[roi_name]
 
         # Update Cache
         mw.roi_intersection_cache[roi_name] = intersecting_indices
@@ -289,8 +350,13 @@ class ROIManager:
         # Collect parcellation filters
         parc_states = getattr(mw, "parcellation_region_states", {})
         parc_cache = getattr(mw, "parcellation_region_intersection_cache", {})
-        parc_includes = [l for l, s in parc_states.items() if s.get("include")]
-        parc_excludes = [l for l, s in parc_states.items() if s.get("exclude")]
+        parc_includes = [
+            label for label, state in parc_states.items() if state.get("include")
+        ]
+        parc_excludes = [
+            label for label, state in parc_states.items() if state.get("exclude")
+        ]
+        connectivity_manager = vars(mw).get("connectivity_manager")
 
         # OPTIMIZATION: Only copy if we have filters to apply
         has_filters = (
@@ -310,6 +376,16 @@ class ROIManager:
             for p in active_excludes:
                 excl = mw.roi_intersection_cache.get(p, set())
                 final_indices.difference_update(excl)
+
+            if (
+                connectivity_manager is not None
+                and (parc_includes or parc_excludes)
+                and connectivity_manager.ensure_region_intersections(
+                    parc_includes + parc_excludes,
+                    final_indices,
+                )
+            ):
+                parc_cache = mw.parcellation_region_intersection_cache
 
             # Apply Parcellation Region Includes
             for label in parc_includes:
@@ -367,9 +443,7 @@ class ROIManager:
                 mw._skip_user_disabled = False
                 approx_visible = len(mw.manual_visible_indices)
                 if approx_visible > TARGET_RENDER_COUNT:
-                    mw.render_stride = max(
-                        1, approx_visible // TARGET_RENDER_COUNT
-                    )
+                    mw.render_stride = max(1, approx_visible // TARGET_RENDER_COUNT)
                 else:
                     mw.render_stride = 1
 
@@ -401,77 +475,105 @@ class ROIManager:
         mw = self.mw
 
         try:
-            # Normalize path to ensure matching
             if old_path not in mw.roi_layers:
-                norm_path = os.path.normpath(old_path)
-                if norm_path in mw.roi_layers:
-                    old_path = norm_path
-                else:
+                old_identity = os.path.normcase(
+                    os.path.abspath(os.path.normpath(old_path))
+                )
+                matching_path = next(
+                    (
+                        path
+                        for path in mw.roi_layers
+                        if os.path.normcase(os.path.abspath(os.path.normpath(path)))
+                        == old_identity
+                    ),
+                    None,
+                )
+                if matching_path is None:
                     logger.warning(f"ROI not found: {old_path}")
                     return
+                old_path = matching_path
 
             current_name = os.path.basename(old_path)
             new_name, ok = QInputDialog.getText(
                 mw, "Rename ROI", "Enter new name:", text=current_name
             )
 
-            if not ok or not new_name or new_name == current_name:
+            if not ok or not new_name.strip() or new_name == current_name:
                 return
 
-            # Create new path with new name
             old_dir = os.path.dirname(old_path) if os.path.dirname(old_path) else ""
-            new_path = os.path.join(old_dir, new_name) if old_dir else new_name
+            new_path = os.path.normpath(
+                os.path.join(old_dir, new_name) if old_dir else new_name
+            )
 
-            # Collect values under old key before mutating any dictionary.
-            # This collect-then-swap pattern ensures that a mid-rename error
-            # does not leave some dictionaries updated and others stale.
+            new_identity = os.path.normcase(os.path.abspath(new_path))
+            has_collision = any(
+                path != old_path
+                and os.path.normcase(os.path.abspath(os.path.normpath(path)))
+                == new_identity
+                for path in mw.roi_layers
+            )
+            if has_collision:
+                QMessageBox.warning(
+                    mw,
+                    "Rename ROI",
+                    f"An ROI named '{new_name}' already exists.",
+                )
+                return
+
+            if new_path == old_path:
+                return
+
+            # History uses layer keys, so a destination retained by another
+            # layer's history must not become an alias for this layer.
+            for stack_name in ("unified_undo_stack", "unified_redo_stack"):
+                for action in getattr(mw, stack_name, ()):
+                    history_path = action.get("roi_name")
+                    if (
+                        history_path
+                        and history_path != old_path
+                        and os.path.normcase(os.path.abspath(os.path.normpath(history_path)))
+                        == new_identity
+                    ):
+                        QMessageBox.warning(
+                            mw,
+                            "Rename ROI",
+                            f"The name '{new_name}' is still referenced by another ROI's history.",
+                        )
+                        return
+
             layer_data = mw.roi_layers[old_path]
             layer_data["display_name"] = new_name
 
-            vis = mw.roi_visibility.get(old_path)
-            opa = mw.roi_opacities.get(old_path)
-            state = mw.roi_states.get(old_path)
-            cache = mw.roi_intersection_cache.get(old_path)
-
-            vtk_slice = None
-            vtk_sphere = None
-            vtk_rect = None
-            if mw.vtk_panel:
-                vtk_slice = mw.vtk_panel.roi_slice_actors.get(old_path)
-                vtk_sphere = mw.vtk_panel.sphere_params_per_roi.get(old_path)
-                vtk_rect = mw.vtk_panel.rectangle_params_per_roi.get(old_path)
-
-            # Swap phase: insert new key, then remove old key
             mw.roi_layers[new_path] = layer_data
-            if vis is not None:
-                mw.roi_visibility[new_path] = vis
-            if opa is not None:
-                mw.roi_opacities[new_path] = opa
-            if state is not None:
-                mw.roi_states[new_path] = state
-            if cache is not None:
-                mw.roi_intersection_cache[new_path] = cache
+            mw.roi_layers.pop(old_path)
+
+            if old_path in mw.roi_visibility:
+                mw.roi_visibility[new_path] = mw.roi_visibility.pop(old_path)
+            if old_path in mw.roi_opacities:
+                mw.roi_opacities[new_path] = mw.roi_opacities.pop(old_path)
+            if old_path in mw.roi_states:
+                mw.roi_states[new_path] = mw.roi_states.pop(old_path)
+            if old_path in mw.roi_intersection_cache:
+                mw.roi_intersection_cache[new_path] = mw.roi_intersection_cache.pop(
+                    old_path
+                )
 
             if mw.vtk_panel:
-                if vtk_slice is not None:
-                    mw.vtk_panel.roi_slice_actors[new_path] = vtk_slice
-                if vtk_sphere is not None:
-                    mw.vtk_panel.sphere_params_per_roi[new_path] = vtk_sphere
-                if vtk_rect is not None:
-                    mw.vtk_panel.rectangle_params_per_roi[new_path] = vtk_rect
+                actor_mappings = (
+                    mw.vtk_panel.roi_slice_actors,
+                    mw.vtk_panel.sphere_params_per_roi,
+                    mw.vtk_panel.rectangle_params_per_roi,
+                )
+                for mapping in actor_mappings:
+                    if old_path in mapping:
+                        mapping[new_path] = mapping.pop(old_path)
 
-            # Remove old keys only after all new keys are in place
-            mw.roi_layers.pop(old_path, None)
-            mw.roi_visibility.pop(old_path, None)
-            mw.roi_opacities.pop(old_path, None)
-            mw.roi_states.pop(old_path, None)
-            mw.roi_intersection_cache.pop(old_path, None)
-            if mw.vtk_panel:
-                mw.vtk_panel.roi_slice_actors.pop(old_path, None)
-                mw.vtk_panel.sphere_params_per_roi.pop(old_path, None)
-                mw.vtk_panel.rectangle_params_per_roi.pop(old_path, None)
+            for stack_name in ("unified_undo_stack", "unified_redo_stack"):
+                for action in getattr(mw, stack_name, ()):
+                    if action.get("roi_name") == old_path:
+                        action["roi_name"] = new_path
 
-            # Update current_drawing_roi if it was the renamed ROI
             if mw.current_drawing_roi == old_path:
                 mw.current_drawing_roi = new_path
 
@@ -512,7 +614,8 @@ class ROIManager:
             return
 
         try:
-            nib.save(nib.Nifti1Image(roi_data, roi_affine), save_path)
+            image = nib.Nifti1Image(roi_data, roi_affine)
+            transactional_save(save_path, lambda path: nib.save(image, path))
             if mw.vtk_panel:
                 mw.vtk_panel.update_status(f"Saved ROI to: {save_path}")
         except (OSError, ValueError) as e:
@@ -532,6 +635,14 @@ class ROIManager:
 
         # Remove from data structures
         del mw.roi_layers[path]
+
+        # Removal cannot be undone. Drop only this layer's obsolete snapshots
+        # before its key can be reused, retaining other actions and their order.
+        for stack_name in ("unified_undo_stack", "unified_redo_stack"):
+            stack = getattr(mw, stack_name, None)
+            if stack is not None:
+                stack[:] = [action for action in stack if action.get("roi_name") != path]
+        mw._update_action_states()
 
         if path in mw.roi_visibility:
             del mw.roi_visibility[path]

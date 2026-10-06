@@ -4,7 +4,7 @@
 Thread-based parallel dispatch for AOT-compiled chunk kernels.
 
 AOT-compiled functions release the GIL, so ``ThreadPoolExecutor`` achieves
-true parallelism without the overhead of process-based approaches.
+true parallelism without the copying overhead of process-based approaches.
 
 The module provides:
 - ``parallel_chunks``: distributes a chunk kernel across a reusable pool.
@@ -17,42 +17,103 @@ from __future__ import annotations
 import atexit
 import os
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from typing import Tuple
 
 import numpy as np
 
-# Match the core count available to the process.
-_N_WORKERS: int = os.cpu_count() or 4
+_CPU_COUNT: int = max(1, os.cpu_count() or 4)
+_MAX_WORKERS: int = 8
+_N_WORKERS: int = min(_CPU_COUNT, _MAX_WORKERS)
+_MIN_PARALLEL_ITEMS: int = 2_048
+_MIN_PARALLEL_MDF_ROWS: int = 256
 
 # Module-level reusable thread pool (lazy-initialized).
 _pool: ThreadPoolExecutor | None = None
 _pool_lock: threading.Lock = threading.Lock()
+_pool_condition = threading.Condition(_pool_lock)
+_active_dispatches = 0
+_pool_stopping = False
 
 
 def _get_pool(n_workers: int | None = None) -> ThreadPoolExecutor:
-    """Return a reusable thread pool, creating one if needed.
-
-    Thread-safe: uses a lock to prevent concurrent callers from
-    creating duplicate pools (and leaking threads).
-    """
-    global _pool  # noqa: PLW0603
-    workers = n_workers or _N_WORKERS
-    with _pool_lock:
-        if _pool is None or _pool._max_workers != workers:
-            if _pool is not None:
-                _pool.shutdown(wait=False)
-            _pool = ThreadPoolExecutor(max_workers=workers)
+    """Lease the stable eight-thread pool until ``_release_pool`` is called."""
+    global _pool, _active_dispatches  # noqa: PLW0603
+    workers = _N_WORKERS if n_workers is None else n_workers
+    if workers < 1:
+        raise ValueError("Worker count must be positive.")
+    with _pool_condition:
+        if _pool_stopping:
+            raise RuntimeError("AOT worker pool is shutting down.")
+        if _pool is None:
+            _pool = ThreadPoolExecutor(
+                max_workers=_MAX_WORKERS,
+                thread_name_prefix="tractedit-aot",
+            )
+        _active_dispatches += 1
         return _pool
 
 
+def _release_pool() -> None:
+    global _active_dispatches  # noqa: PLW0603
+    with _pool_condition:
+        _active_dispatches -= 1
+        _pool_condition.notify_all()
+
+
+def _submit_and_drain(pool: ThreadPoolExecutor, calls) -> None:
+    """Propagate the first error only after every accepted task has stopped."""
+    futures = []
+    try:
+        for function, arguments in calls:
+            futures.append(pool.submit(function, *arguments))
+        done, pending = wait(futures, return_when=FIRST_EXCEPTION)
+        for future in futures:
+            if future in done:
+                future.result()
+        for future in pending:
+            future.result()
+    except BaseException:
+        for future in futures:
+            future.cancel()
+        wait(futures)
+        raise
+
+
+def _worker_count(
+    n_items: int,
+    n_workers: int | None,
+    min_parallel_items: int,
+) -> int:
+    """Return a bounded worker count, using serial execution for small work."""
+    requested = _N_WORKERS if n_workers is None else n_workers
+    if requested < 1:
+        raise ValueError("Worker count must be positive.")
+    if n_items < min_parallel_items:
+        return 1
+    return min(requested, _MAX_WORKERS, n_items)
+
+
 def _shutdown_pool() -> None:
-    """Shut down the module-level thread pool on interpreter exit."""
-    global _pool  # noqa: PLW0603
-    with _pool_lock:
-        if _pool is not None:
-            _pool.shutdown(wait=True)
+    """Reject new dispatches, drain accepted work, then stop the pool."""
+    global _pool, _pool_stopping  # noqa: PLW0603
+    with _pool_condition:
+        if _pool_stopping:
+            while _pool_stopping:
+                _pool_condition.wait()
+            return
+        _pool_stopping = True
+        while _active_dispatches:
+            _pool_condition.wait()
+        pool = _pool
+    try:
+        if pool is not None:
+            pool.shutdown(wait=True)
+    finally:
+        with _pool_condition:
             _pool = None
+            _pool_stopping = False
+            _pool_condition.notify_all()
 
 
 atexit.register(_shutdown_pool)
@@ -84,7 +145,7 @@ def parallel_chunks(
     if n_items == 0:
         return
 
-    workers = n_workers or _N_WORKERS
+    workers = _worker_count(n_items, n_workers, _MIN_PARALLEL_ITEMS)
     chunk_size = max(1, (n_items + workers - 1) // workers)
 
     # Fast path: single chunk — skip pool overhead entirely.
@@ -93,12 +154,16 @@ def parallel_chunks(
         return
 
     pool = _get_pool(workers)
-    futures = []
-    for start in range(0, n_items, chunk_size):
-        end = min(start + chunk_size, n_items)
-        futures.append(pool.submit(kernel_fn, *args, start, end))
-    for future in futures:
-        future.result()  # Propagate exceptions immediately.
+    try:
+        _submit_and_drain(
+            pool,
+            (
+                (kernel_fn, (*args, start, min(start + chunk_size, n_items)))
+                for start in range(0, n_items, chunk_size)
+            ),
+        )
+    finally:
+        _release_pool()
 
 
 def parallel_chunks_range(
@@ -132,7 +197,7 @@ def parallel_chunks_range(
     if n_items <= 0:
         return
 
-    workers = n_workers or _N_WORKERS
+    workers = _worker_count(n_items, n_workers, _MIN_PARALLEL_MDF_ROWS)
     chunk_size = max(1, (n_items + workers - 1) // workers)
 
     # Fast path: single chunk — skip pool overhead.
@@ -141,12 +206,62 @@ def parallel_chunks_range(
         return
 
     pool = _get_pool(workers)
-    futures = []
-    for start in range(start_offset, end_offset, chunk_size):
-        end = min(start + chunk_size, end_offset)
-        futures.append(pool.submit(kernel_fn, *args, start, end))
-    for future in futures:
-        future.result()
+    try:
+        _submit_and_drain(
+            pool,
+            (
+                (kernel_fn, (*args, start, min(start + chunk_size, end_offset)))
+                for start in range(start_offset, end_offset, chunk_size)
+            ),
+        )
+    finally:
+        _release_pool()
+
+
+def accumulate_mdf_totals_range(
+    resampled: np.ndarray,
+    start_offset: int,
+    end_offset: int,
+    n_workers: int | None = None,
+) -> np.ndarray:
+    """Accumulate exact MDF totals for an upper-triangle row range."""
+    from . import accumulate_mdf_totals_chunk
+
+    count = end_offset - start_offset
+    totals = np.zeros(resampled.shape[0], dtype=np.float64)
+    if count <= 0:
+        return totals
+
+    workers = _worker_count(count, n_workers, _MIN_PARALLEL_MDF_ROWS)
+    chunk_size = max(1, (count + workers - 1) // workers)
+    ranges = [
+        (start, min(start + chunk_size, end_offset))
+        for start in range(start_offset, end_offset, chunk_size)
+    ]
+    partial_totals = np.zeros((len(ranges), resampled.shape[0]), dtype=np.float64)
+
+    if len(ranges) == 1:
+        accumulate_mdf_totals_chunk(
+            resampled, partial_totals[0], ranges[0][0], ranges[0][1]
+        )
+    else:
+        pool = _get_pool(workers)
+        try:
+            _submit_and_drain(
+                pool,
+                (
+                    (
+                        accumulate_mdf_totals_chunk,
+                        (resampled, partial_totals[index], start, end),
+                    )
+                    for index, (start, end) in enumerate(ranges)
+                ),
+            )
+        finally:
+            _release_pool()
+
+    np.sum(partial_totals, axis=0, out=totals)
+    return totals
 
 
 # ====================================================================
@@ -154,10 +269,44 @@ def parallel_chunks_range(
 # ====================================================================
 
 
+def _packed_arrays(
+    flat_data: np.ndarray,
+    offsets: np.ndarray,
+    lengths: np.ndarray,
+    data_dtype: np.dtype = np.dtype(np.float32),
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    flat_data = np.asarray(flat_data)
+    offsets = np.asarray(offsets)
+    lengths = np.asarray(lengths)
+    if flat_data.ndim != 2 or flat_data.shape[1] != 3:
+        raise ValueError("Streamline coordinates must have shape (N, 3).")
+    if offsets.ndim != 1 or lengths.ndim != 1 or len(offsets) != len(lengths):
+        raise ValueError("Streamline offsets and lengths must be aligned vectors.")
+    if not np.issubdtype(offsets.dtype, np.integer) or not np.issubdtype(
+        lengths.dtype, np.integer
+    ):
+        raise ValueError("Streamline offsets and lengths must be integers.")
+    if np.any(offsets < 0) or np.any(offsets > len(flat_data)):
+        raise ValueError("A streamline offset is outside the coordinate buffer.")
+    offsets = np.asarray(offsets, dtype=np.int64)
+    lengths = np.asarray(lengths, dtype=np.int64)
+    if np.any(lengths < 0) or np.any(lengths > len(flat_data) - offsets):
+        raise ValueError("A streamline length exceeds the coordinate buffer.")
+    if len(offsets) > 1 and np.any(offsets[1:] < offsets[:-1] + lengths[:-1]):
+        raise ValueError("Streamline offsets overlap or are not ordered.")
+    return (
+        np.ascontiguousarray(flat_data, dtype=data_dtype),
+        np.ascontiguousarray(offsets, dtype=np.int64),
+        np.ascontiguousarray(lengths, dtype=np.int64),
+    )
+
+
 def compute_bboxes(
     flat_data: np.ndarray,
     offsets: np.ndarray,
     lengths: np.ndarray,
+    *,
+    _validated: bool = False,
 ) -> np.ndarray:
     """Compute bounding boxes for all streamlines (parallel).
 
@@ -172,14 +321,59 @@ def compute_bboxes(
     """
     from . import compute_bboxes_chunk
 
-    flat_data = np.ascontiguousarray(flat_data, dtype=np.float32)
-    offsets = np.ascontiguousarray(offsets, dtype=np.int64)
-    lengths = np.ascontiguousarray(lengths, dtype=np.int64)
+    if _validated:
+        flat_data = np.ascontiguousarray(flat_data, dtype=np.float32)
+        offsets = np.ascontiguousarray(offsets, dtype=np.int64)
+        lengths = np.ascontiguousarray(lengths, dtype=np.int64)
+    else:
+        flat_data, offsets, lengths = _packed_arrays(flat_data, offsets, lengths)
 
     n = len(lengths)
     bboxes = np.zeros((n, 2, 3), dtype=np.float32)
     parallel_chunks(compute_bboxes_chunk, n, flat_data, offsets, lengths, bboxes)
     return bboxes
+
+
+def compute_bboxes_prevalidated(
+    flat_data: np.ndarray,
+    offsets: np.ndarray,
+    lengths: np.ndarray,
+) -> np.ndarray:
+    """Compute boxes after the ingestion boundary validated packed arrays."""
+    return compute_bboxes(
+        flat_data,
+        offsets,
+        lengths,
+        _validated=True,
+    )
+
+
+def validate_streamlines(
+    flat_data: np.ndarray,
+    offsets: np.ndarray,
+    lengths: np.ndarray,
+    *,
+    _validated: bool = False,
+) -> np.ndarray:
+    """Return per-streamline coordinate status without recomputing boxes."""
+    from . import validate_streamlines_chunk
+
+    if _validated:
+        flat_data = np.ascontiguousarray(flat_data, dtype=np.float32)
+        offsets = np.ascontiguousarray(offsets, dtype=np.int64)
+        lengths = np.ascontiguousarray(lengths, dtype=np.int64)
+    else:
+        flat_data, offsets, lengths = _packed_arrays(flat_data, offsets, lengths)
+    status = np.zeros(len(lengths), dtype=np.uint8)
+    parallel_chunks(
+        validate_streamlines_chunk,
+        len(lengths),
+        flat_data,
+        offsets,
+        lengths,
+        status,
+    )
+    return status
 
 
 def batch_check_sphere_intersection(
@@ -240,6 +434,33 @@ def batch_check_box_intersection(
     return results
 
 
+def batch_check_oriented_box_intersection(
+    streamline_data: np.ndarray,
+    streamline_offsets: np.ndarray,
+    world_to_voxel_linear: np.ndarray,
+    world_to_voxel_offset: np.ndarray,
+    box_min: np.ndarray,
+    box_max: np.ndarray,
+) -> np.ndarray:
+    """Batch check streamline intersection with a voxel-oriented box."""
+    from . import check_oriented_box_chunk
+
+    n = len(streamline_offsets) - 1
+    results = np.zeros(n, dtype=np.bool_)
+    parallel_chunks(
+        check_oriented_box_chunk,
+        n,
+        streamline_data,
+        streamline_offsets,
+        world_to_voxel_linear,
+        world_to_voxel_offset,
+        box_min,
+        box_max,
+        results,
+    )
+    return results
+
+
 def copy_streamlines_parallel(
     src_data: np.ndarray,
     dst_data: np.ndarray,
@@ -277,6 +498,18 @@ def resample_batch(
     """
     from . import resample_batch_chunk
 
+    flat_data, offsets, lengths = _packed_arrays(
+        flat_data,
+        offsets,
+        lengths,
+        np.dtype(np.float64),
+    )
+    if np.any(lengths < 1):
+        raise ValueError("Cannot resample an empty streamline.")
+    if nb_points < 2:
+        raise ValueError("Resampling requires at least two output points.")
+    if not np.all(np.isfinite(flat_data)):
+        raise ValueError("Streamline coordinates must be finite.")
     n = len(lengths)
     result = np.empty((n, nb_points, 3), dtype=np.float64)
     parallel_chunks(
@@ -289,50 +522,6 @@ def resample_batch(
         result,
     )
     return result
-
-
-def compute_mdf_distance_matrix(
-    resampled: np.ndarray,
-) -> np.ndarray:
-    """Compute full MDF distance matrix (parallel).
-
-    Returns
-    -------
-    np.ndarray
-        Symmetric matrix of shape ``(N, N)``.
-    """
-    from . import compute_mdf_rows_chunk
-
-    n = resampled.shape[0]
-    dist_matrix = np.zeros((n, n), dtype=np.float64)
-    parallel_chunks(compute_mdf_rows_chunk, n, resampled, dist_matrix)
-    return dist_matrix
-
-
-def compute_distances_to_samples(
-    resampled: np.ndarray,
-    sample_indices: np.ndarray,
-) -> np.ndarray:
-    """Compute MDF distances from all streamlines to sampled subset (parallel).
-
-    Returns
-    -------
-    np.ndarray
-        Shape ``(N, k)`` distance array.
-    """
-    from . import compute_distances_chunk
-
-    n = resampled.shape[0]
-    k = len(sample_indices)
-    distances = np.zeros((n, k), dtype=np.float64)
-    parallel_chunks(
-        compute_distances_chunk,
-        n,
-        resampled,
-        sample_indices,
-        distances,
-    )
-    return distances
 
 
 def compute_endpoint_labels(

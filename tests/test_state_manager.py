@@ -95,10 +95,12 @@ class TestStreamlineUndoRedo:
         mock_main_window.manual_visible_indices = {0, 2, 4}
 
         # Push action onto undo stack
-        mock_main_window.unified_undo_stack.append({
-            "action_type": ActionType.STREAMLINE_DELETION,
-            "deleted_indices": deleted.copy(),
-        })
+        mock_main_window.unified_undo_stack.append(
+            {
+                "action_type": ActionType.STREAMLINE_DELETION,
+                "deleted_indices": deleted.copy(),
+            }
+        )
 
         state_manager.perform_undo()
 
@@ -116,10 +118,12 @@ class TestStreamlineUndoRedo:
         mock_main_window.manual_visible_indices = {0, 1, 2, 3, 4}
 
         # Push action onto redo stack
-        mock_main_window.unified_redo_stack.append({
-            "action_type": ActionType.STREAMLINE_DELETION,
-            "deleted_indices": deleted.copy(),
-        })
+        mock_main_window.unified_redo_stack.append(
+            {
+                "action_type": ActionType.STREAMLINE_DELETION,
+                "deleted_indices": deleted.copy(),
+            }
+        )
 
         state_manager.perform_redo()
 
@@ -131,17 +135,13 @@ class TestStreamlineUndoRedo:
         """Undoing with empty stack shows status message."""
         state_manager.perform_undo()
 
-        mock_main_window.vtk_panel.update_status.assert_called_with(
-            "Nothing to undo."
-        )
+        mock_main_window.vtk_panel.update_status.assert_called_with("Nothing to undo.")
 
     def test_redo_empty_stack(self, state_manager, mock_main_window):
         """Redoing with empty stack shows status message."""
         state_manager.perform_redo()
 
-        mock_main_window.vtk_panel.update_status.assert_called_with(
-            "Nothing to redo."
-        )
+        mock_main_window.vtk_panel.update_status.assert_called_with("Nothing to redo.")
 
     def test_undo_preserves_skip_override_for_small_tractogram(
         self, state_manager, mock_main_window
@@ -296,9 +296,7 @@ class TestRadiusAdjustment:
 
         assert mock_main_window.selection_radius_3d == MIN_SELECTION_RADIUS
 
-    def test_radius_no_change_without_tractogram(
-        self, state_manager, mock_main_window
-    ):
+    def test_radius_no_change_without_tractogram(self, state_manager, mock_main_window):
         """Radius operations do nothing when no tractogram is loaded."""
         mock_main_window.tractogram_data = None
         initial = mock_main_window.selection_radius_3d
@@ -319,7 +317,7 @@ class TestROIUndoRedo:
     """Tests for ROI modification undo/redo."""
 
     def test_save_roi_state(self, state_manager, mock_main_window):
-        """Saving ROI state creates a snapshot on the undo stack."""
+        """Changing ROI state creates an exact patch on the undo stack."""
         roi_data = np.ones((10, 10, 10), dtype=np.uint8)
         mock_main_window.roi_layers["test_roi"] = {
             "data": roi_data,
@@ -328,21 +326,20 @@ class TestROIUndoRedo:
         mock_main_window.vtk_panel.sphere_params_per_roi = {}
         mock_main_window.vtk_panel.rectangle_params_per_roi = {}
 
-        state_manager.save_roi_state_for_undo("test_roi")
+        with state_manager.roi_modification("test_roi"):
+            roi_data[1, 2, 3] = 0
 
         assert len(mock_main_window.unified_undo_stack) == 1
         action = mock_main_window.unified_undo_stack[0]
         assert action["action_type"] == ActionType.ROI_MODIFICATION
         assert action["roi_name"] == "test_roi"
-        # Data snapshot should be a copy, not the same reference
-        assert action["data_snapshot"] is not roi_data
-        np.testing.assert_array_equal(action["data_snapshot"], roi_data)
+        np.testing.assert_array_equal(action["voxel_indices"], [123])
+        np.testing.assert_array_equal(action["voxel_values"], [1])
 
-    def test_save_roi_state_nonexistent_roi(
-        self, state_manager, mock_main_window
-    ):
+    def test_save_roi_state_nonexistent_roi(self, state_manager, mock_main_window):
         """Saving state for a non-existent ROI does nothing."""
-        state_manager.save_roi_state_for_undo("nonexistent_roi")
+        with state_manager.roi_modification("nonexistent_roi"):
+            pass
 
         assert len(mock_main_window.unified_undo_stack) == 0
 
@@ -357,13 +354,15 @@ class TestROIUndoRedo:
         mock_main_window.vtk_panel.sphere_params_per_roi = {}
         mock_main_window.vtk_panel.rectangle_params_per_roi = {}
 
-        mock_main_window.unified_undo_stack.append({
-            "action_type": ActionType.ROI_MODIFICATION,
-            "roi_name": "test_roi",
-            "data_snapshot": old_data.copy(),
-            "sphere_params": None,
-            "rectangle_params": None,
-        })
+        mock_main_window.unified_undo_stack.append(
+            {
+                "action_type": ActionType.ROI_MODIFICATION,
+                "roi_name": "test_roi",
+                "data_snapshot": old_data.copy(),
+                "sphere_params": None,
+                "rectangle_params": None,
+            }
+        )
 
         state_manager.perform_undo()
 
@@ -376,13 +375,15 @@ class TestROIUndoRedo:
 
     def test_undo_roi_for_deleted_roi(self, state_manager, mock_main_window):
         """Undoing an ROI action when the ROI no longer exists skips gracefully."""
-        mock_main_window.unified_undo_stack.append({
-            "action_type": ActionType.ROI_MODIFICATION,
-            "roi_name": "deleted_roi",
-            "data_snapshot": np.zeros((5, 5, 5)),
-            "sphere_params": None,
-            "rectangle_params": None,
-        })
+        mock_main_window.unified_undo_stack.append(
+            {
+                "action_type": ActionType.ROI_MODIFICATION,
+                "roi_name": "deleted_roi",
+                "data_snapshot": np.zeros((5, 5, 5)),
+                "sphere_params": None,
+                "rectangle_params": None,
+            }
+        )
 
         state_manager.perform_undo()
 

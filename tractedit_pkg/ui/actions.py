@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from PyQt6.QtWidgets import QMenuBar, QMenu
+from PyQt6.QtWidgets import QMenuBar
 from PyQt6.QtGui import QAction, QKeySequence, QActionGroup
 
 from ..utils import ColorMode, RADIUS_INCREMENT
@@ -55,6 +55,11 @@ class ActionsManager:
         mw = self.mw
 
         # File Actions
+        mw.open_session_action = QAction("Open Session...", mw)
+        mw.open_session_action.triggered.connect(mw._open_session)
+        mw.save_session_action = QAction("Save Session", mw)
+        mw.save_session_action.triggered.connect(mw._save_session)
+
         mw.load_file_action = QAction("&Load trk/tck/trx/vtk/vtp...", mw)
         mw.load_file_action.setStatusTip("Load a trk, tck or trx streamline file")
         mw.load_file_action.triggered.connect(mw._trigger_load_streamlines)
@@ -420,6 +425,9 @@ class ActionsManager:
         file_menu.addAction(mw.load_odf_action)
         file_menu.addAction(mw.load_parcellation_action)
 
+        file_menu.addSeparator()
+        file_menu.addAction(mw.open_session_action)
+        file_menu.addAction(mw.save_session_action)
         file_menu.addSeparator()
         file_menu.addAction(mw.calc_centroid_action)
         file_menu.addAction(mw.calc_medoid_action)

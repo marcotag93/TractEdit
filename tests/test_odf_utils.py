@@ -127,46 +127,71 @@ class TestComputeShBasis:
         dc_values = B[:, 0]
         assert np.std(dc_values) < 0.01  # Should be nearly constant
 
-    def test_sh_basis_regression_values(self):
-        """SH basis values must match golden reference (guards sph_harm_y migration).
 
-        Golden values were captured from the verified sph_harm implementation
-        using axis-aligned unit vectors and one normalized diagonal vertex at
-        SH order 4 (15 coefficients covering l=0, 2, 4).
-        """
-        vertices = np.array([
-            [0.0, 0.0, 1.0],                                      # +Z pole
-            [1.0, 0.0, 0.0],                                      # +X equator
-            [0.0, 1.0, 0.0],                                      # +Y equator
-            [1.0 / np.sqrt(3), 1.0 / np.sqrt(3), 1.0 / np.sqrt(3)],  # diagonal
-        ], dtype=np.float64)
+    def test_order_two_matches_cartesian_polynomials(self):
+        """All order-two columns should match independent real SH formulas."""
+        vertices = np.array(
+            [[1.0, 2.0, 3.0], [-2.0, 1.0, 4.0], [3.0, -4.0, 2.0]],
+            dtype=np.float64,
+        )
+        vertices /= np.linalg.norm(vertices, axis=1, keepdims=True)
+        x, y, z = vertices.T
 
-        B = compute_sh_basis(vertices, sh_order=4)
+        expected = np.column_stack(
+            [
+                np.full(len(vertices), 1.0 / (2.0 * np.sqrt(np.pi))),
+                np.sqrt(15.0 / (4.0 * np.pi)) * x * y,
+                -np.sqrt(15.0 / (4.0 * np.pi)) * y * z,
+                np.sqrt(5.0 / (16.0 * np.pi)) * (3.0 * z**2 - 1.0),
+                -np.sqrt(15.0 / (4.0 * np.pi)) * x * z,
+                np.sqrt(15.0 / (16.0 * np.pi)) * (x**2 - y**2),
+            ]
+        )
 
-        # Significant (non-near-zero) golden values per row.
-        # Near-zero entries (~1e-16) are verified separately via atol only.
-        golden = np.array([
-            [0.28209479177387814, 0.0, 0.0, 0.63078313050504,
-             0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-             0.8462843753216345, 0.0, 0.0, 0.0, 0.0],
-            [0.28209479177387814, 0.0, 0.0, -0.31539156525252,
-             0.0, 0.5462742152960396, 0.0, 0.0, 0.0, 0.0,
-             0.3173566407456129, 0.0, -0.47308734787878, 0.0,
-             0.6258357354491761],
-            [0.28209479177387814, 0.0, 0.0, -0.31539156525252,
-             0.0, -0.5462742152960396, 0.0, 0.0, 0.0, 0.0,
-             0.3173566407456129, 0.0, 0.47308734787878, 0.0,
-             0.6258357354491761],
-            [0.28209479177387814, -0.36418281019735976,
-             -0.3641828101973598, 0.0, -0.3641828101973598, 0.0,
-             0.0, -0.3933623932844291, -0.42052208700336025,
-             0.1486770096793974, -0.32911059040285784,
-             0.1486770096793974, 0.0, 0.3933623932844291,
-             -0.27814921575518947],
-        ])
+        basis = compute_sh_basis(vertices, sh_order=2)
 
-        assert B.shape == golden.shape
-        np.testing.assert_allclose(B, golden, atol=1e-10)
+        np.testing.assert_allclose(basis, expected, rtol=1e-12, atol=1e-12)
+
+    def test_order_two_m2_has_expected_directional_lobes(self):
+        """The positive m=2 component should distinguish X and Y directions."""
+        directions = np.array(
+            [
+                [1.0, 0.0, 0.0],
+                [-1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, -1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+        coefficients = np.zeros(6)
+        coefficients[5] = 1.0
+
+        amplitudes = compute_sh_basis(directions, 2) @ coefficients
+
+        assert amplitudes[0] == pytest.approx(amplitudes[1])
+        assert amplitudes[2] == pytest.approx(amplitudes[3])
+        assert amplitudes[0] > amplitudes[4] > amplitudes[2]
+
+    def test_mrtrix3_alias_matches_tournier07(self):
+        """The explicit MRtrix3 name should select the Tournier07 basis."""
+        vertices = generate_symmetric_sphere(subdivisions=1).vertices
+
+        tournier = compute_sh_basis(vertices, 4, basis_type="tournier07")
+        mrtrix3 = compute_sh_basis(vertices, 4, basis_type="mrtrix3")
+
+        np.testing.assert_array_equal(mrtrix3, tournier)
+
+    @pytest.mark.parametrize("basis_type", ["legacy", "descoteaux07", "unknown"])
+    def test_unsupported_basis_is_rejected(self, basis_type):
+        """Unsupported conventions must not silently use Tournier07."""
+        with pytest.raises(ValueError, match="Unsupported SH basis"):
+            compute_sh_basis(np.array([[0.0, 0.0, 1.0]]), 2, basis_type)
+
+    @pytest.mark.parametrize("sh_order", [-2, 1, 3, 2.5])
+    def test_invalid_symmetric_order_is_rejected(self, sh_order):
+        """The symmetric basis accepts only non-negative even orders."""
+        with pytest.raises(ValueError, match="non-negative even integer"):
+            compute_sh_basis(np.array([[0.0, 0.0, 1.0]]), sh_order)
 
 
 class TestCalculateShOrder:
@@ -192,19 +217,11 @@ class TestCalculateShOrder:
         """45 coefficients -> order 8."""
         assert calculate_sh_order(45) == 8
 
-    def test_invalid_coefficient_count(self):
-        """Invalid coefficient count should raise ValueError or return unexpected order."""
-        # Valid counts: 1, 6, 15, 28, 45, ...
-        try:
-            result = calculate_sh_order(10)
-            assert isinstance(result, (int, float))
-        except ValueError:
-            pass  # Expected behavior
-
-    def test_invalid_coefficient_count_2(self):
-        """Another invalid coefficient count."""
+    @pytest.mark.parametrize("n_coeffs", [0, 2, 3, 5, 10, 16, -1, 6.5])
+    def test_invalid_coefficient_count(self, n_coeffs):
+        """Unsupported coefficient counts should be rejected."""
         with pytest.raises(ValueError):
-            calculate_sh_order(5)
+            calculate_sh_order(n_coeffs)
 
 
 class TestCreateTunnelMask:
@@ -213,9 +230,7 @@ class TestCreateTunnelMask:
     def test_output_shape(self, sample_streamlines, sample_affine, sample_volume_shape):
         """Mask should match volume shape."""
         mask = create_tunnel_mask(
-            sample_streamlines,
-            sample_affine,
-            sample_volume_shape
+            sample_streamlines, sample_affine, sample_volume_shape
         )
 
         assert mask.shape == sample_volume_shape
@@ -223,20 +238,17 @@ class TestCreateTunnelMask:
     def test_output_dtype(self, sample_streamlines, sample_affine, sample_volume_shape):
         """Mask should be boolean."""
         mask = create_tunnel_mask(
-            sample_streamlines,
-            sample_affine,
-            sample_volume_shape
+            sample_streamlines, sample_affine, sample_volume_shape
         )
 
         assert mask.dtype == bool
 
-    def test_mask_contains_true(self, sample_streamlines, sample_affine,
-                                sample_volume_shape):
+    def test_mask_contains_true(
+        self, sample_streamlines, sample_affine, sample_volume_shape
+    ):
         """Mask should contain True values where streamlines pass."""
         mask = create_tunnel_mask(
-            sample_streamlines,
-            sample_affine,
-            sample_volume_shape
+            sample_streamlines, sample_affine, sample_volume_shape
         )
 
         assert np.any(mask)
@@ -244,9 +256,7 @@ class TestCreateTunnelMask:
     def test_dilation_expands_mask(self, sample_affine):
         """Higher dilation should expand the mask."""
         # Create a simple streamline through the center
-        streamlines = ArraySequence([
-            np.array([[32, 32, 32]], dtype=np.float32)
-        ])
+        streamlines = ArraySequence([np.array([[32, 32, 32]], dtype=np.float32)])
         volume_shape = (64, 64, 64)
 
         mask_small = create_tunnel_mask(
@@ -260,9 +270,7 @@ class TestCreateTunnelMask:
 
     def test_no_dilation(self, sample_affine):
         """Zero dilation should mark only occupied voxels."""
-        streamlines = ArraySequence([
-            np.array([[10, 10, 10]], dtype=np.float32)
-        ])
+        streamlines = ArraySequence([np.array([[10, 10, 10]], dtype=np.float32)])
         volume_shape = (64, 64, 64)
 
         mask = create_tunnel_mask(
@@ -275,9 +283,7 @@ class TestCreateTunnelMask:
 
     def test_out_of_bounds_streamlines(self, sample_affine):
         """Streamlines outside volume should be ignored."""
-        streamlines = ArraySequence([
-            np.array([[-100, -100, -100]], dtype=np.float32)
-        ])
+        streamlines = ArraySequence([np.array([[-100, -100, -100]], dtype=np.float32)])
         volume_shape = (64, 64, 64)
 
         mask = create_tunnel_mask(
@@ -290,9 +296,7 @@ class TestCreateTunnelMask:
     def test_scaled_affine(self, sample_affine_scaled):
         """Mask should work with non-identity affine."""
         # With 2mm voxels, world coord (4,4,4) -> voxel (2,2,2)
-        streamlines = ArraySequence([
-            np.array([[4.0, 4.0, 4.0]], dtype=np.float32)
-        ])
+        streamlines = ArraySequence([np.array([[4.0, 4.0, 4.0]], dtype=np.float32)])
         volume_shape = (10, 10, 10)
 
         mask = create_tunnel_mask(

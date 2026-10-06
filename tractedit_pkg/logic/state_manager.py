@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import contextmanager
+from copy import deepcopy
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Any, Dict, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, Iterator, Optional, Set
 
 import numpy as np
 from PyQt6.QtWidgets import QMessageBox
@@ -53,6 +55,51 @@ class ActionType(Enum):
 
     STREAMLINE_DELETION = auto()
     ROI_MODIFICATION = auto()
+
+
+_ROI_HISTORY_SCAN_ITEMS = 262144
+
+
+def _different_elements(first: np.ndarray, second: np.ndarray) -> np.ndarray:
+    first = np.asarray(first)
+    second = np.asarray(second)
+    if first.dtype != second.dtype or first.shape != second.shape:
+        raise ValueError("ROI history arrays must have matching shape and dtype.")
+    if first.dtype.kind == "f":
+        unsigned_dtype = np.dtype(f"u{first.dtype.itemsize}")
+        return np.not_equal(
+            first.reshape(-1).view(unsigned_dtype),
+            second.reshape(-1).view(unsigned_dtype),
+        )
+    if first.dtype.kind == "c":
+        first_bytes = np.ascontiguousarray(first).view(np.uint8)
+        second_bytes = np.ascontiguousarray(second).view(np.uint8)
+        first_bytes = first_bytes.reshape(-1, first.dtype.itemsize)
+        second_bytes = second_bytes.reshape(-1, second.dtype.itemsize)
+        return np.any(first_bytes != second_bytes, axis=1)
+    return np.not_equal(first, second).reshape(-1)
+
+
+def _parameters_equal(first: Any, second: Any) -> bool:
+    if isinstance(first, np.ndarray) or isinstance(second, np.ndarray):
+        if not isinstance(first, np.ndarray) or not isinstance(second, np.ndarray):
+            return False
+        return (
+            first.dtype == second.dtype
+            and first.shape == second.shape
+            and not np.any(_different_elements(first.ravel(), second.ravel()))
+        )
+    if isinstance(first, dict) or isinstance(second, dict):
+        if not isinstance(first, dict) or not isinstance(second, dict):
+            return False
+        return first.keys() == second.keys() and all(
+            _parameters_equal(first[key], second[key]) for key in first
+        )
+    if isinstance(first, (list, tuple)) or isinstance(second, (list, tuple)):
+        if type(first) is not type(second) or len(first) != len(second):
+            return False
+        return all(_parameters_equal(a, b) for a, b in zip(first, second))
+    return first == second
 
 
 # ============================================================================
@@ -231,220 +278,205 @@ class StateManager:
             )
 
     def _undo_roi_action(self, action: Dict[str, Any]) -> None:
-        """
-        Undoes an ROI modification action.
-
-        Args:
-            action: The action record containing ROI state snapshot.
-        """
-        mw = self.mw
-
-        roi_name = action.get("roi_name")
-        old_data = action.get("data_snapshot")
-        old_sphere_params = action.get("sphere_params")
-        old_rectangle_params = action.get("rectangle_params")
-
-        if not roi_name or old_data is None:
-            return
-
-        # Check if ROI still exists
-        if roi_name not in mw.roi_layers:
-            if mw.vtk_panel:
-                mw.vtk_panel.update_status(
-                    f"ROI {roi_name} no longer exists, skipping undo."
-                )
-            return
-
-        # Save current state for redo
-        current_data = mw.roi_layers[roi_name]["data"].copy()
-
-        current_sphere_params = None
-        if mw.vtk_panel and hasattr(mw.vtk_panel, "sphere_params_per_roi"):
-            if roi_name in mw.vtk_panel.sphere_params_per_roi:
-                current_sphere_params = mw.vtk_panel.sphere_params_per_roi[
-                    roi_name
-                ].copy()
-
-        current_rectangle_params = None
-        if mw.vtk_panel and hasattr(mw.vtk_panel, "rectangle_params_per_roi"):
-            if roi_name in mw.vtk_panel.rectangle_params_per_roi:
-                current_rectangle_params = mw.vtk_panel.rectangle_params_per_roi[
-                    roi_name
-                ].copy()
-
-        redo_action = {
-            "action_type": ActionType.ROI_MODIFICATION,
-            "roi_name": roi_name,
-            "data_snapshot": current_data,
-            "sphere_params": current_sphere_params,
-            "rectangle_params": current_rectangle_params,
-        }
-        mw.unified_redo_stack.append(redo_action)
-
-        # Limit redo stack size
-        if len(mw.unified_redo_stack) > MAX_STACK_LEVELS:
-            mw.unified_redo_stack.pop(0)
-
-        # Restore old state
-        mw.roi_layers[roi_name]["data"][:] = old_data
-
-        # Restore sphere params
-        if mw.vtk_panel:
-            if old_sphere_params:
-                mw.vtk_panel.sphere_params_per_roi[roi_name] = old_sphere_params
-            elif roi_name in mw.vtk_panel.sphere_params_per_roi:
-                del mw.vtk_panel.sphere_params_per_roi[roi_name]
-
-        # Restore rectangle params
-        if mw.vtk_panel:
-            if old_rectangle_params:
-                mw.vtk_panel.rectangle_params_per_roi[roi_name] = old_rectangle_params
-            elif roi_name in mw.vtk_panel.rectangle_params_per_roi:
-                del mw.vtk_panel.rectangle_params_per_roi[roi_name]
-
-        # Update visualization
-        if mw.vtk_panel:
-            roi_affine = mw.roi_layers[roi_name]["affine"]
-            mw.vtk_panel.update_roi_layer(roi_name, old_data, roi_affine)
-            mw.vtk_panel.update_status(
-                f"ROI operation undone on {os.path.basename(roi_name)}"
-            )
-
-        # Re-calculate Intersection and Logic
-        mw.roi_manager.compute_roi_intersection(roi_name)
-        mw.roi_manager.update_roi_visual_selection()
-        mw.roi_manager.apply_logic_filters()
+        """Undo one ROI modification."""
+        self._apply_roi_action(
+            action,
+            self.mw.unified_redo_stack,
+            "undone",
+        )
 
     def _redo_roi_action(self, action: Dict[str, Any]) -> None:
-        """
-        Redoes an ROI modification action.
+        """Redo one ROI modification."""
+        self._apply_roi_action(
+            action,
+            self.mw.unified_undo_stack,
+            "redone",
+        )
 
-        Args:
-            action: The action record containing ROI state snapshot.
-        """
-        mw = self.mw
+    def _roi_parameters(self, roi_name: str) -> tuple[Any, Any]:
+        panel = self.mw.vtk_panel
+        if panel is None:
+            return None, None
+        sphere = getattr(panel, "sphere_params_per_roi", {}).get(roi_name)
+        rectangle = getattr(panel, "rectangle_params_per_roi", {}).get(roi_name)
+        return deepcopy(sphere), deepcopy(rectangle)
 
-        roi_name = action.get("roi_name")
-        redo_data = action.get("data_snapshot")
-        redo_sphere_params = action.get("sphere_params")
-        redo_rectangle_params = action.get("rectangle_params")
-
-        if not roi_name or redo_data is None:
-            return
-
-        # Check if ROI still exists
-        if roi_name not in mw.roi_layers:
-            if mw.vtk_panel:
-                mw.vtk_panel.update_status(
-                    f"ROI {roi_name} no longer exists, skipping redo."
-                )
-            return
-
-        # Save current state to undo stack
-        current_data = mw.roi_layers[roi_name]["data"].copy()
-
-        current_sphere_params = None
-        if mw.vtk_panel and hasattr(mw.vtk_panel, "sphere_params_per_roi"):
-            if roi_name in mw.vtk_panel.sphere_params_per_roi:
-                current_sphere_params = mw.vtk_panel.sphere_params_per_roi[
-                    roi_name
-                ].copy()
-
-        current_rectangle_params = None
-        if mw.vtk_panel and hasattr(mw.vtk_panel, "rectangle_params_per_roi"):
-            if roi_name in mw.vtk_panel.rectangle_params_per_roi:
-                current_rectangle_params = mw.vtk_panel.rectangle_params_per_roi[
-                    roi_name
-                ].copy()
-
-        undo_action = {
-            "action_type": ActionType.ROI_MODIFICATION,
-            "roi_name": roi_name,
-            "data_snapshot": current_data,
-            "sphere_params": current_sphere_params,
-            "rectangle_params": current_rectangle_params,
+    def _capture_roi_baseline(self, roi_name: str) -> Optional[Dict[str, Any]]:
+        if roi_name not in self.mw.roi_layers:
+            return None
+        data = self.mw.roi_layers[roi_name]["data"]
+        sphere, rectangle = self._roi_parameters(roi_name)
+        return {
+            "data_snapshot": data.copy(),
+            "sphere_params": sphere,
+            "rectangle_params": rectangle,
         }
-        mw.unified_undo_stack.append(undo_action)
 
-        # Limit undo stack size
-        if len(mw.unified_undo_stack) > MAX_STACK_LEVELS:
-            mw.unified_undo_stack.pop(0)
+    def _materialize_roi_action(
+        self,
+        roi_name: str,
+        baseline: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if roi_name not in self.mw.roi_layers:
+            return None
+        data = self.mw.roi_layers[roi_name]["data"]
+        old_sphere = baseline.get("sphere_params")
+        old_rectangle = baseline.get("rectangle_params")
+        sphere, rectangle = self._roi_parameters(roi_name)
+        parameters_changed = not _parameters_equal(
+            old_sphere, sphere
+        ) or not _parameters_equal(old_rectangle, rectangle)
 
-        # Restore redo state
-        mw.roi_layers[roi_name]["data"][:] = redo_data
-
-        # Restore sphere params
-        if mw.vtk_panel:
-            if redo_sphere_params:
-                mw.vtk_panel.sphere_params_per_roi[roi_name] = redo_sphere_params
-            elif roi_name in mw.vtk_panel.sphere_params_per_roi:
-                del mw.vtk_panel.sphere_params_per_roi[roi_name]
-
-        # Restore rectangle params
-        if mw.vtk_panel:
-            if redo_rectangle_params:
-                mw.vtk_panel.rectangle_params_per_roi[roi_name] = redo_rectangle_params
-            elif roi_name in mw.vtk_panel.rectangle_params_per_roi:
-                del mw.vtk_panel.rectangle_params_per_roi[roi_name]
-
-        # Update visualization
-        if mw.vtk_panel:
-            roi_affine = mw.roi_layers[roi_name]["affine"]
-            mw.vtk_panel.update_roi_layer(roi_name, redo_data, roi_affine)
-            mw.vtk_panel.update_status(
-                f"ROI operation redone on {os.path.basename(roi_name)}"
+        old_snapshot = baseline.get("data_snapshot")
+        if old_snapshot is None:
+            return None
+        patch_item_bytes = np.dtype(np.int64).itemsize + data.dtype.itemsize
+        use_snapshot = False
+        if data.flags.c_contiguous:
+            different = _different_elements(old_snapshot.ravel(), data.reshape(-1))
+            changed_count = int(np.count_nonzero(different))
+            use_snapshot = changed_count * patch_item_bytes >= data.nbytes
+            changed_indices = (
+                np.empty(0, dtype=np.int64)
+                if use_snapshot
+                else np.flatnonzero(different).astype(np.int64, copy=False)
+            )
+        else:
+            changed_parts = []
+            changed_count = 0
+            for start in range(0, data.size, _ROI_HISTORY_SCAN_ITEMS):
+                stop = min(start + _ROI_HISTORY_SCAN_ITEMS, data.size)
+                previous = np.asarray(old_snapshot.flat[start:stop])
+                current = np.asarray(data.flat[start:stop])
+                local = np.flatnonzero(_different_elements(previous, current))
+                if local.size:
+                    changed_count += len(local)
+                    if changed_count * patch_item_bytes >= data.nbytes:
+                        use_snapshot = True
+                        changed_parts.clear()
+                        break
+                    changed_parts.append(local.astype(np.int64) + start)
+            changed_indices = (
+                np.concatenate(changed_parts)
+                if changed_parts
+                else np.empty(0, dtype=np.int64)
             )
 
-        # Re-calculate Intersection and Logic
-        mw.roi_manager.compute_roi_intersection(roi_name)
-        mw.roi_manager.update_roi_visual_selection()
-        mw.roi_manager.apply_logic_filters()
-
-    def save_roi_state_for_undo(self, roi_name: str) -> None:
-        """
-        Saves the current ROI state to the unified undo stack before modification.
-
-        Args:
-            roi_name: The name/path of the ROI being modified.
-        """
-        mw = self.mw
-
-        if roi_name not in mw.roi_layers:
-            return
-
-        # Create a deep copy of the ROI data
-        roi_data_copy = mw.roi_layers[roi_name]["data"].copy()
-
-        # Save sphere params if available
-        sphere_params = None
-        if mw.vtk_panel and hasattr(mw.vtk_panel, "sphere_params_per_roi"):
-            if roi_name in mw.vtk_panel.sphere_params_per_roi:
-                sphere_params = mw.vtk_panel.sphere_params_per_roi[roi_name].copy()
-
-        # Save rectangle params if available
-        rectangle_params = None
-        if mw.vtk_panel and hasattr(mw.vtk_panel, "rectangle_params_per_roi"):
-            if roi_name in mw.vtk_panel.rectangle_params_per_roi:
-                rectangle_params = mw.vtk_panel.rectangle_params_per_roi[
-                    roi_name
-                ].copy()
-
-        # Save to unified undo stack with action type
+        if changed_count == 0 and not parameters_changed:
+            return None
         action = {
             "action_type": ActionType.ROI_MODIFICATION,
             "roi_name": roi_name,
-            "data_snapshot": roi_data_copy,
-            "sphere_params": sphere_params,
-            "rectangle_params": rectangle_params,
+            "sphere_params": deepcopy(old_sphere),
+            "rectangle_params": deepcopy(old_rectangle),
         }
-        mw.unified_undo_stack.append(action)
+        if not use_snapshot:
+            old_values = np.asarray(old_snapshot.flat[changed_indices]).copy()
+            action.update(
+                {
+                    "voxel_indices": changed_indices,
+                    "voxel_values": old_values,
+                    "data_shape": data.shape,
+                }
+            )
+        else:
+            action["data_snapshot"] = old_snapshot
+        return action
 
-        # Clear redo stack (new action invalidates redo history)
-        mw.unified_redo_stack.clear()
+    @contextmanager
+    def roi_modification(self, roi_name: str) -> Iterator[None]:
+        """Record one exact, memory-bounded ROI modification."""
+        baseline = self._capture_roi_baseline(roi_name)
+        try:
+            yield
+        finally:
+            if baseline is not None:
+                action = self._materialize_roi_action(roi_name, baseline)
+                if action is not None:
+                    self.mw.unified_undo_stack.append(action)
+                    self.mw.unified_redo_stack.clear()
+                    if len(self.mw.unified_undo_stack) > MAX_STACK_LEVELS:
+                        self.mw.unified_undo_stack.pop(0)
 
-        # Limit stack size
-        if len(mw.unified_undo_stack) > MAX_STACK_LEVELS:
-            mw.unified_undo_stack.pop(0)
+    def _apply_roi_action(
+        self,
+        action: Dict[str, Any],
+        destination_stack: list[Dict[str, Any]],
+        operation: str,
+    ) -> None:
+        mw = self.mw
+        roi_name = action.get("roi_name")
+        if not roi_name or roi_name not in mw.roi_layers:
+            if roi_name and mw.vtk_panel:
+                mw.vtk_panel.update_status(
+                    f"ROI {roi_name} no longer exists, skipping {operation}."
+                )
+            return
+
+        data = mw.roi_layers[roi_name]["data"]
+        sphere, rectangle = self._roi_parameters(roi_name)
+        inverse = {
+            "action_type": ActionType.ROI_MODIFICATION,
+            "roi_name": roi_name,
+            "sphere_params": sphere,
+            "rectangle_params": rectangle,
+        }
+
+        if "data_snapshot" in action:
+            inverse["data_snapshot"] = data.copy()
+            data[:] = action["data_snapshot"]
+        else:
+            indices = action.get("voxel_indices")
+            values = action.get("voxel_values")
+            if indices is None or values is None:
+                return
+            inverse.update(
+                {
+                    "voxel_indices": indices.copy(),
+                    "voxel_values": np.asarray(data.flat[indices]).copy(),
+                    "data_shape": data.shape,
+                }
+            )
+            data.flat[indices] = values
+
+        destination_stack.append(inverse)
+        if len(destination_stack) > MAX_STACK_LEVELS:
+            destination_stack.pop(0)
+        self._restore_roi_parameters(
+            roi_name,
+            action.get("sphere_params"),
+            action.get("rectangle_params"),
+        )
+
+        if mw.vtk_panel:
+            roi_affine = mw.roi_layers[roi_name]["affine"]
+            mw.vtk_panel.update_roi_layer(roi_name, data, roi_affine)
+            mw.vtk_panel.update_status(
+                f"ROI operation {operation} on {os.path.basename(roi_name)}"
+            )
+        mw.roi_manager.compute_roi_intersection(roi_name)
+        mw.roi_manager.update_roi_visual_selection()
+        mw.roi_manager.apply_logic_filters()
+
+    def _restore_roi_parameters(
+        self,
+        roi_name: str,
+        sphere: Any,
+        rectangle: Any,
+    ) -> None:
+        panel = self.mw.vtk_panel
+        if panel is None:
+            return
+        sphere_parameters = getattr(panel, "sphere_params_per_roi", {})
+        rectangle_parameters = getattr(panel, "rectangle_params_per_roi", {})
+        if sphere is None:
+            sphere_parameters.pop(roi_name, None)
+        else:
+            sphere_parameters[roi_name] = deepcopy(sphere)
+        if rectangle is None:
+            rectangle_parameters.pop(roi_name, None)
+        else:
+            rectangle_parameters[roi_name] = deepcopy(rectangle)
 
     def save_streamline_deletion_for_undo(self, deleted_indices: Set[int]) -> None:
         """
@@ -547,7 +579,7 @@ class StateManager:
 
         mw.roi_manager.apply_logic_filters()
 
-        # Recalculate stride so the now-smaller visible set is rendered at the correct density.
+        # Recalculate stride for the smaller visible set.
         mw._auto_calculate_skip_level()
 
         mw._update_action_states()

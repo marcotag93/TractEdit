@@ -44,6 +44,9 @@ from tractedit_pkg._numba_aot._parallel_wrappers import (
 from tractedit_pkg._numba_aot._parallel_wrappers import (
     batch_check_box_intersection as _batch_check_box_intersection,
 )
+from tractedit_pkg._numba_aot._parallel_wrappers import (
+    batch_check_oriented_box_intersection as _batch_check_oriented_box_intersection,
+)
 
 
 from ..utils import MAX_HIGHLIGHT_STREAMLINES
@@ -574,6 +577,64 @@ class SelectionManager:
         indices_in_box = set(valid_candidates[final_mask].tolist())
 
         return indices_in_box
+
+    def find_streamlines_in_oriented_box(
+        self,
+        voxel_to_world: np.ndarray,
+        voxel_min: np.ndarray,
+        voxel_max: np.ndarray,
+        check_all: bool = False,
+    ) -> Set[int]:
+        """Find streamlines intersecting an affine-oriented voxel box."""
+        if (
+            not self.panel.main_window
+            or not self.panel.main_window.tractogram_data
+            or self.panel.main_window.streamline_bboxes is None
+        ):
+            return set()
+
+        tractogram = self.panel.main_window.tractogram_data
+        bboxes = self.panel.main_window.streamline_bboxes
+        voxel_min = np.asarray(voxel_min, dtype=np.float64) - 0.5
+        voxel_max = np.asarray(voxel_max, dtype=np.float64) + 0.5
+        corners = np.array(
+            [
+                [x, y, z]
+                for x in (voxel_min[0], voxel_max[0])
+                for y in (voxel_min[1], voxel_max[1])
+                for z in (voxel_min[2], voxel_max[2])
+            ]
+        )
+        homogeneous = np.column_stack((corners, np.ones(8)))
+        world_corners = (np.asarray(voxel_to_world) @ homogeneous.T).T[:, :3]
+        world_min = world_corners.min(axis=0)
+        world_max = world_corners.max(axis=0)
+        overlap = np.all(bboxes[:, 1] >= world_min, axis=1) & np.all(
+            bboxes[:, 0] <= world_max, axis=1
+        )
+        candidates = np.flatnonzero(overlap)
+        candidates = self._filter_visible_candidates(candidates, check_all)
+        if len(candidates) == 0:
+            return set()
+
+        streamline_data, offsets, valid_mask = _prepare_batch_data_fast(
+            tractogram, candidates
+        )
+        if streamline_data.shape[0] == 0:
+            return set()
+
+        world_to_voxel = np.linalg.inv(voxel_to_world)
+        linear = np.ascontiguousarray(world_to_voxel[:3, :3].T, dtype=np.float64)
+        offset = np.ascontiguousarray(world_to_voxel[:3, 3], dtype=np.float64)
+        results = _batch_check_oriented_box_intersection(
+            streamline_data,
+            offsets,
+            linear,
+            offset,
+            np.ascontiguousarray(voxel_min),
+            np.ascontiguousarray(voxel_max),
+        )
+        return set(candidates[valid_mask & results].tolist())
 
     def apply_selection(
         self, indices_in_sphere: Set[int], deselect: bool = False

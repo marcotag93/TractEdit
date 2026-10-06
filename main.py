@@ -33,7 +33,6 @@ import importlib.resources
 import ctypes
 from PyQt6.QtWidgets import QApplication, QSplashScreen
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont
-import argparse
 from PyQt6.QtCore import Qt, QRect, QTimer
 
 # Configure Logging
@@ -120,9 +119,11 @@ class LoadingSplash(QSplashScreen):
 # ============================================================================
 
 
-def _read_vtk_streamlines(input_path: str) -> "list":
+def _read_vtk_tractogram_data(
+    input_path: str, include_metadata: bool = True
+) -> "tuple":
     """
-    Reads streamlines from a VTK (.vtk) or VTP (.vtp) polydata file.
+    Reads geometry and numeric metadata from a VTK or VTP polydata file.
 
     Uses VTK 9.x's CSR cell-array API (GetOffsetsArray / GetConnectivityArray)
     together with numpy vectorised operations.
@@ -131,7 +132,7 @@ def _read_vtk_streamlines(input_path: str) -> "list":
         input_path: Absolute path to the .vtk or .vtp file.
 
     Returns:
-        List of (N, 3) float32 numpy arrays, one per streamline.
+        Streamlines, per-point data, and per-streamline data.
 
     Raises:
         ValueError: If the file contains no valid streamline data.
@@ -173,11 +174,32 @@ def _read_vtk_streamlines(input_path: str) -> "list":
     # np.split with the interior offset positions yields per-streamline views
     # with no additional data copy.
     streamlines = np.split(flat_coords, offsets_arr[1:-1])
+    if not include_metadata:
+        return streamlines, {}, {}
 
+    from tractedit_pkg.tractogram_metadata import extract_vtk_metadata
+
+    lengths = np.diff(offsets_arr).astype(np.intp)
+    data_per_point, data_per_streamline = extract_vtk_metadata(
+        polydata,
+        connectivity_arr,
+        offsets_arr.astype(np.intp, copy=False),
+        lengths,
+    )
+    return streamlines, data_per_point, data_per_streamline
+
+
+def _read_vtk_streamlines(input_path: str) -> "list":
+    """Read only streamline geometry from a VTK or VTP file."""
+    streamlines, _, _ = _read_vtk_tractogram_data(
+        input_path, include_metadata=False
+    )
     return streamlines
 
 
-def _run_headless_conversion(input_path: str, output_path: str) -> None:
+def _run_headless_conversion(
+    input_path: str, output_path: str, *, _announce: bool = True
+) -> None:
     """
     Performs headless format conversion without initializing the GUI.
 
@@ -227,13 +249,52 @@ def _run_headless_conversion(input_path: str, output_path: str) -> None:
         print(f"Supported formats: {', '.join(valid_output_exts)}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Converting: {input_path} -> {output_path}")
-    logger.info(f"Headless conversion: {input_path} -> {output_path}")
+    if _announce:
+        print(f"Converting: {input_path} -> {output_path}")
+        logger.info("Headless conversion: %s -> %s", input_path, output_path)
+    same_path = (
+        pathlib.Path(input_path).resolve() == pathlib.Path(output_path).resolve()
+    )
 
     try:
+        if same_path:
+            import shutil
+            import tempfile
+
+            descriptor, snapshot_path = tempfile.mkstemp(
+                dir=pathlib.Path(input_path).parent,
+                prefix=".tractedit-source-",
+                suffix=input_ext,
+            )
+            os.close(descriptor)
+            try:
+                shutil.copyfile(input_path, snapshot_path)
+                _run_headless_conversion(snapshot_path, output_path, _announce=False)
+            finally:
+                try:
+                    os.unlink(snapshot_path)
+                except OSError:
+                    logger.warning(
+                        "Could not remove conversion source snapshot: %s",
+                        snapshot_path,
+                    )
+                    print(
+                        f"Warning: Temporary source remains at {snapshot_path}",
+                        file=sys.stderr,
+                    )
+            print(f"Successfully saved: {output_path}")
+            return
+
         import nibabel as nib
         from nibabel.streamlines import Field
         import trx.trx_file_memmap as tbx
+        from tractedit_pkg.tractogram_metadata import (
+            add_vtk_metadata,
+            ensure_metadata_supported,
+        )
+        from tractedit_pkg.reference_grid import ReferenceGrid
+        from tractedit_pkg.transactional_io import staged_output
+        from tractedit_pkg.input_validation import validate_tractogram_data
 
         # Suppress verbose INFO logs from trx library
         root_logger = logging.getLogger()
@@ -244,16 +305,35 @@ def _run_headless_conversion(input_path: str, output_path: str) -> None:
         streamlines = None
         header = None
         affine = None
+        data_per_point = {}
+        data_per_streamline = {}
+        groups = {}
+        data_per_group = {}
+        trx_file = None
+        trx_obj = None
+        reference_grid = None
 
         if input_ext == ".trk":
             trk = nib.streamlines.load(input_path)
             streamlines = list(trk.streamlines)
             header = dict(trk.header)
             affine = trk.affine
+            reference_grid = ReferenceGrid.from_header(
+                header,
+                provenance="bundle:.trk",
+            )
+            data_per_point = dict(trk.tractogram.data_per_point)
+            data_per_streamline = dict(
+                trk.tractogram.data_per_streamline
+            )
 
         elif input_ext == ".tck":
             tck = nib.streamlines.load(input_path)
             streamlines = list(tck.streamlines)
+            data_per_point = dict(tck.tractogram.data_per_point)
+            data_per_streamline = dict(
+                tck.tractogram.data_per_streamline
+            )
             # TCK doesn't have affine, use identity
             affine = np.eye(4)
 
@@ -261,114 +341,135 @@ def _run_headless_conversion(input_path: str, output_path: str) -> None:
             trx_file = tbx.load(input_path)
             streamlines = list(trx_file.streamlines)
             affine = trx_file.header.get("VOXEL_TO_RASMM", np.eye(4))
-            if hasattr(trx_file, "header") and "DIMENSIONS" in trx_file.header:
-                header = {"dimensions": trx_file.header["DIMENSIONS"]}
-
+            header = dict(trx_file.header)
+            reference_grid = ReferenceGrid.from_header(
+                header,
+                provenance="bundle:.trx",
+            )
+            data_per_point = dict(trx_file.data_per_vertex)
+            data_per_streamline = dict(trx_file.data_per_streamline)
+            groups = dict(trx_file.groups)
+            data_per_group = dict(trx_file.data_per_group)
         elif input_ext in (".vtk", ".vtp"):
-            streamlines = _read_vtk_streamlines(input_path)
+            streamlines, data_per_point, data_per_streamline = (
+                _read_vtk_tractogram_data(input_path)
+            )
             affine = np.eye(4)
 
         if not streamlines:
             raise ValueError("No streamlines loaded from input file.")
+        validate_tractogram_data(
+            streamlines, data_per_point, data_per_streamline
+        )
 
         print(f"Loaded {len(streamlines)} streamlines.")
 
-        # Save output file
-        if output_ext == ".trk":
-            # Create TRK tractogram
-            tractogram = nib.streamlines.Tractogram(
-                streamlines=streamlines, affine_to_rasmm=np.eye(4)
+        if reference_grid is None and output_ext in {".trk", ".trx"}:
+            all_points = np.concatenate(streamlines)
+            reference_grid = ReferenceGrid.from_points(
+                all_points,
+                affine=affine,
+                provenance=f"synthetic:{input_ext}:bounds",
             )
-            # Use header dimensions if available
-            if header and "dimensions" in header:
-                dimensions = header["dimensions"]
-            else:
-                # Compute from streamlines
-                all_pts = np.concatenate(streamlines)
-                dimensions = np.ceil(np.max(all_pts, axis=0) + 1).astype(int)
 
-            trk_header = {
-                Field.VOXEL_TO_RASMM: affine,
-                Field.DIMENSIONS: dimensions,
-                Field.VOXEL_SIZES: np.abs(np.diag(affine)[:3]),
+        output_data_per_streamline = data_per_streamline
+        if output_ext != ".trx":
+            output_data_per_streamline = {
+                key: values
+                for key, values in data_per_streamline.items()
+                if key != "_tractedit_bboxes"
             }
-            trk_file = nib.streamlines.TrkFile(tractogram, header=trk_header)
-            nib.streamlines.save(trk_file, output_path)
+        ensure_metadata_supported(
+            output_ext,
+            data_per_point,
+            output_data_per_streamline,
+            groups,
+            data_per_group,
+        )
+        tractogram = nib.streamlines.Tractogram(
+            streamlines=streamlines,
+            data_per_point=data_per_point or None,
+            data_per_streamline=output_data_per_streamline or None,
+            affine_to_rasmm=np.eye(4),
+        )
 
-        elif output_ext == ".tck":
-            tractogram = nib.streamlines.Tractogram(
-                streamlines=streamlines, affine_to_rasmm=np.eye(4)
-            )
-            tck_file = nib.streamlines.TckFile(tractogram)
-            nib.streamlines.save(tck_file, output_path)
+        with staged_output(output_path) as staged_path:
+            staged_output = str(staged_path)
+            try:
+                if output_ext == ".trk":
+                    trk_header = {
+                        Field.VOXEL_TO_RASMM: reference_grid.affine,
+                        Field.DIMENSIONS: reference_grid.shape,
+                        Field.VOXEL_SIZES: reference_grid.voxel_sizes,
+                        Field.VOXEL_ORDER: reference_grid.voxel_order,
+                    }
+                    trk_file = nib.streamlines.TrkFile(
+                        tractogram, header=trk_header
+                    )
+                    nib.streamlines.save(trk_file, staged_output)
 
-        elif output_ext == ".trx":
-            # TRX requires a reference NIfTI image that defines the space
-            # Get reference dimensions
-            if header and "dimensions" in header:
-                dimensions = tuple(np.array(header["dimensions"]).astype(int))
-            else:
-                all_pts = np.concatenate(streamlines)
-                dimensions = tuple(np.ceil(np.max(all_pts, axis=0) + 1).astype(int))
+                elif output_ext == ".tck":
+                    tck_file = nib.streamlines.TckFile(tractogram)
+                    nib.streamlines.save(tck_file, staged_output)
 
-            voxel_sizes = np.abs(np.diag(affine)[:3])
-            if np.all(voxel_sizes == 0):
-                voxel_sizes = np.array([1.0, 1.0, 1.0])
+                elif output_ext == ".trx":
+                    trx_reference = reference_grid.trx_reference(
+                        nb_vertices=len(tractogram.streamlines._data),
+                        nb_streamlines=len(tractogram.streamlines),
+                    )
+                    trx_obj = tbx.TrxFile.from_lazy_tractogram(
+                        tractogram,
+                        trx_reference,
+                    )
+                    trx_obj.groups.update(groups)
+                    trx_obj.data_per_group.update(data_per_group)
+                    tbx.save(trx_obj, staged_output)
 
-            # Create a dummy NIfTI reference image
-            nifti_header = nib.Nifti1Header()
-            nifti_header.set_data_shape(dimensions)
-            nifti_header.set_zooms(voxel_sizes)
-            nifti_header.set_qform(affine)
-            nifti_header.set_sform(affine)
+                elif output_ext in (".vtk", ".vtp"):
+                    import vtk
+                    from tractedit_pkg.utils import write_vtk_polydata
 
-            dummy_data = np.empty(dimensions, dtype=np.int8)
-            reference_img = nib.Nifti1Image(dummy_data, affine, header=nifti_header)
+                    vtk_points = vtk.vtkPoints()
+                    vtk_lines = vtk.vtkCellArray()
 
-            # Create tractogram and TRX object
-            tractogram = nib.streamlines.Tractogram(
-                streamlines=streamlines, affine_to_rasmm=np.eye(4)
-            )
-            trx_obj = tbx.TrxFile.from_lazy_tractogram(tractogram, reference_img)
+                    point_id = 0
+                    for sl in streamlines:
+                        n_pts = len(sl)
+                        vtk_lines.InsertNextCell(n_pts)
+                        for pt in sl:
+                            vtk_points.InsertNextPoint(pt[0], pt[1], pt[2])
+                            vtk_lines.InsertCellPoint(point_id)
+                            point_id += 1
 
-            # Save TRX file (no header argument)
-            tbx.save(trx_obj, output_path)
+                    polydata = vtk.vtkPolyData()
+                    polydata.SetPoints(vtk_points)
+                    polydata.SetLines(vtk_lines)
+                    add_vtk_metadata(polydata, tractogram)
 
-        elif output_ext in (".vtk", ".vtp"):
-            import vtk
+                    if output_ext == ".vtk":
+                        writer = vtk.vtkPolyDataWriter()
+                        writer.SetFileTypeToASCII()
+                    else:
+                        writer = vtk.vtkXMLPolyDataWriter()
 
-            # Create VTK polydata
-            vtk_points = vtk.vtkPoints()
-            vtk_lines = vtk.vtkCellArray()
-
-            point_id = 0
-            for sl in streamlines:
-                n_pts = len(sl)
-                vtk_lines.InsertNextCell(n_pts)
-                for pt in sl:
-                    vtk_points.InsertNextPoint(pt[0], pt[1], pt[2])
-                    vtk_lines.InsertCellPoint(point_id)
-                    point_id += 1
-
-            polydata = vtk.vtkPolyData()
-            polydata.SetPoints(vtk_points)
-            polydata.SetLines(vtk_lines)
-
-            if output_ext == ".vtk":
-                writer = vtk.vtkPolyDataWriter()
-                writer.SetFileTypeToASCII()
-            else:
-                writer = vtk.vtkXMLPolyDataWriter()
-
-            writer.SetFileName(output_path)
-            writer.SetInputData(polydata)
-            writer.Write()
+                    write_vtk_polydata(writer, polydata, staged_output)
+            finally:
+                for name in ("trx_obj", "trx_file"):
+                    resource = locals().get(name)
+                    if resource is not None:
+                        resource.close()
+                        if name == "trx_obj":
+                            trx_obj = None
+                        else:
+                            trx_file = None
+                resource = None
 
         # Restore original logging level
         root_logger.setLevel(original_level)
 
-        print(f"Successfully saved: {output_path}")
-        logger.info(f"Conversion complete: {output_path}")
+        if _announce:
+            print(f"Successfully saved: {output_path}")
+            logger.info("Conversion complete: %s", output_path)
 
     except Exception as e:
         # Restore logging level on error
@@ -379,10 +480,14 @@ def _run_headless_conversion(input_path: str, output_path: str) -> None:
         logger.error(f"Conversion failed: {e}", exc_info=True)
         print(f"Error: Conversion failed: {e}", file=sys.stderr)
         sys.exit(1)
+    finally:
+        for trx_resource in (locals().get("trx_obj"), locals().get("trx_file")):
+            if trx_resource is not None:
+                trx_resource.close()
 
 
 def _run_headless_density_map(
-    input_path: str, output_path: str, anat_path: str = None
+    input_path: str, output_path: str, anat_path: str | None = None
 ) -> None:
     """
     Computes and saves a track density imaging (TDI) map without GUI.
@@ -418,26 +523,40 @@ def _run_headless_density_map(
         print("Error: Output file must be .nii.gz or .nii format.", file=sys.stderr)
         sys.exit(1)
 
+    if anat_path is not None and not os.path.isfile(anat_path):
+        logger.error(f"Error: Anatomical reference not found: {anat_path}")
+        print(
+            f"Error: Anatomical reference not found: {anat_path}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     print(f"Computing density map: {input_path} -> {output_path}")
     logger.info(f"Headless density map: {input_path} -> {output_path}")
 
     try:
         import nibabel as nib
         import trx.trx_file_memmap as tbx
+        from tractedit_pkg.reference_grid import ReferenceGrid
+        from tractedit_pkg.transactional_io import transactional_save
+        from tractedit_pkg.input_validation import validate_tractogram_data
 
         # Load streamlines
         input_ext = os.path.splitext(input_path)[1].lower()
         streamlines = None
         affine = None
         shape = None
+        reference_grid = None
 
         if input_ext == ".trk":
             trk = nib.streamlines.load(input_path)
             streamlines = list(trk.streamlines)
             if hasattr(trk, "affine"):
                 affine = trk.affine
-            if hasattr(trk.header, "get") and "dimensions" in dict(trk.header):
-                shape = tuple(int(d) for d in trk.header["dimensions"][:3])
+            reference_grid = ReferenceGrid.from_header(
+                dict(trk.header),
+                provenance="bundle:.trk",
+            )
 
         elif input_ext == ".tck":
             tck = nib.streamlines.load(input_path)
@@ -448,8 +567,10 @@ def _run_headless_density_map(
             streamlines = list(trx_file.streamlines)
             if "VOXEL_TO_RASMM" in trx_file.header:
                 affine = trx_file.header["VOXEL_TO_RASMM"]
-            if "DIMENSIONS" in trx_file.header:
-                shape = tuple(int(d) for d in trx_file.header["DIMENSIONS"][:3])
+            reference_grid = ReferenceGrid.from_header(
+                trx_file.header,
+                provenance="bundle:.trx",
+            )
 
         elif input_ext in (".vtk", ".vtp"):
             streamlines = _read_vtk_streamlines(input_path)
@@ -460,6 +581,8 @@ def _run_headless_density_map(
 
         if not streamlines:
             raise ValueError("No streamlines loaded from input file.")
+        # A finite one-point fiber contributes one TDI count by design.
+        validate_tractogram_data(streamlines, allow_singleton=True)
 
         print(f"Loaded {len(streamlines)} streamlines.")
 
@@ -467,12 +590,16 @@ def _run_headless_density_map(
         # Priority A: Use anatomical image if provided
         if anat_path and os.path.isfile(anat_path):
             print(f"Using anatomical reference: {anat_path}")
-            anat_img = nib.load(anat_path)
-            affine = anat_img.affine
-            shape = anat_img.shape[:3]
+            from tractedit_pkg.reference_grid import canonicalize_nifti
+
+            anat_img = canonicalize_nifti(nib.load(anat_path))
+            reference_grid = ReferenceGrid.from_nifti(
+                anat_img,
+                provenance=f"anatomical:{anat_path}",
+            )
 
         # Priority B: Use header info from bundle
-        elif affine is not None and shape is not None:
+        elif reference_grid is not None:
             print("Using grid from bundle header.")
 
         # Priority C: Compute from streamline bounds
@@ -494,6 +621,14 @@ def _run_headless_density_map(
             affine = np.eye(4)
             affine[:3, :3] = np.diag(voxel_size)
             affine[:3, 3] = min_coord
+            reference_grid = ReferenceGrid(
+                affine=affine,
+                shape=shape,
+                provenance=f"synthetic:{input_ext}:tdi-bounds",
+            )
+
+        affine = reference_grid.affine
+        shape = reference_grid.shape
 
         # Compute density map
         print("Computing density...")
@@ -526,18 +661,9 @@ def _run_headless_density_map(
         )
 
         # Save NIfTI
-        nifti_img = nib.Nifti1Image(density_data.astype(np.float32), affine)
+        nifti_img = reference_grid.create_nifti(density_data.astype(np.float32))
 
-        # Copy header info from anatomical if available
-        if anat_path and os.path.isfile(anat_path):
-            try:
-                ref_img = nib.load(anat_path)
-                nifti_img.header.set_zooms(ref_img.header.get_zooms()[:3])
-                nifti_img.header.set_xyzt_units(*ref_img.header.get_xyzt_units())
-            except Exception:
-                pass
-
-        nib.save(nifti_img, output_path)
+        transactional_save(output_path, lambda path: nib.save(nifti_img, path))
 
         max_density = np.max(density_data)
         print(f"Successfully saved: {output_path}")
@@ -548,6 +674,10 @@ def _run_headless_density_map(
         logger.error(f"Density map failed: {e}", exc_info=True)
         print(f"Error: Density map failed: {e}", file=sys.stderr)
         sys.exit(1)
+    finally:
+        trx_resource = locals().get("trx_file")
+        if trx_resource is not None:
+            trx_resource.close()
 
 
 # ============================================================================
@@ -579,47 +709,9 @@ def main() -> None:
         print(_sep)
         sys.exit(0)
 
-    parser = argparse.ArgumentParser(description="TractEdit - GUI")
-    parser.add_argument(
-        "bundle",
-        nargs="?",
-        help="Path to the bundle file (.trk, .tck, .trx, .vtk, .vtp)",
-    )
-    parser.add_argument("--anat", help="Path to the anatomical image (T1w)")
-    parser.add_argument(
-        "--load-roi",
-        action="append",
-        dest="roi_paths",
-        help="Path to ROI image(s). Can be used multiple times.",
-    )
-    parser.add_argument(
-        "--roi",
-        nargs=3,
-        type=float,
-        action="append",
-        metavar=("X", "Y", "Z"),
-        help="Create a sphere ROI at these coordinates (X Y Z). Can be used multiple times.",
-    )
-    parser.add_argument(
-        "--radius",
-        type=float,
-        action="append",
-        help="Radius of the sphere ROI (default: 5mm). Can be used multiple times.",
-    )
-    parser.add_argument(
-        "--convert-to",
-        dest="convert_to",
-        metavar="OUTPUT",
-        help="Headless conversion: convert bundle to OUTPUT file format without GUI. "
-        "Supported formats: .trk, .tck, .trx, .vtk, .vtp",
-    )
-    parser.add_argument(
-        "--density-map",
-        dest="density_map",
-        metavar="OUTPUT",
-        help="Headless export: compute and save density map as NIfTI (.nii.gz) without GUI. "
-        "Use --anat to align to anatomical image grid.",
-    )
+    from tractedit_pkg.cli import build_argument_parser
+
+    parser = build_argument_parser()
     args = parser.parse_args()
 
     # Handle headless conversion mode

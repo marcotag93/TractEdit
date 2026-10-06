@@ -1,108 +1,93 @@
-# -*- coding: utf-8 -*-
+"""Bounded, offline HTML export for TractEdit visualizations.
 
-"""
-HTML Export Module for TractEdit.
-
-This is **EXPERIMENTAL** and may not work as expected. Currently it can handle the bundle and the 2D slices.
-In the future updates it will be able to use a less heavy resampling and to handle the 3D slices and the ROIs.
-
-Exports the current visualization (streamlines, anatomical slices, ROIs)
-to a self-contained interactive HTML file using three.js for WebGL rendering.
-
-Data is subsampled to keep file sizes reasonable for web viewing.
+The exported scene is intended for visual sharing. Streamlines and ROI meshes
+may be reduced to keep the single-file artifact safe for a web browser.
 """
 
-# ============================================================================
-# Imports
-# ============================================================================
+from __future__ import annotations
 
-import os
+import base64
 import io
 import json
-import base64
 import logging
-import gzip
-from typing import TYPE_CHECKING, Optional, List, Dict, Any, Tuple
+from typing import TYPE_CHECKING, Any, Optional
+
+import nibabel as nib
 import numpy as np
+
+from ..reference_grid import validate_volume_geometry
+from ..transactional_io import staged_output
 
 if TYPE_CHECKING:
     from ..main_window import MainWindow
 
 logger = logging.getLogger(__name__)
 
-
-# ============================================================================
-# Default Options
-# ============================================================================
-
-# Default export options
 DEFAULT_OPTIONS = {
-    "max_streamlines": 1000,  # Maximum streamlines to export
-    "streamline_step": 2,  # Keep every Nth point along streamline
-    "image_quality": 85,  # JPEG quality for slices
-    "include_slices": True,  # Include 2D slice images
-    "include_rois": True,  # Include ROI visualizations
+    "max_streamlines": 1000,
+    "streamline_step": 2,
+    "max_streamline_points": 256,
+    "image_quality": 85,
+    "max_slice_size": 512,
+    "include_slices": True,
+    "include_rois": True,
+    "max_rois": 64,
+    "max_roi_triangles": 20_000,
+    "max_total_roi_triangles": 50_000,
+    "max_roi_voxels": 4_000_000,
 }
-
-
-# ============================================================================
-# Export Functions
-# ============================================================================
 
 
 def export_to_html(
     main_window: "MainWindow",
     output_path: str,
-    options: Optional[Dict[str, Any]] = None,
+    options: Optional[dict[str, Any]] = None,
 ) -> bool:
-    """
-    Exports the current visualization to an interactive HTML file.
-
-    Args:
-        main_window: Reference to the MainWindow instance.
-        output_path: Path for the output HTML file.
-        options: Optional dictionary of export options.
-
-    Returns:
-        True if export was successful, False otherwise.
-    """
+    """Export the current bounded visualization to one offline HTML file."""
     opts = {**DEFAULT_OPTIONS, **(options or {})}
 
     try:
-        logger.info(f"Starting HTML export to: {output_path}")
-
-        # Collect data
+        _validate_options(opts)
         data = _collect_visualization_data(main_window, opts)
-
-        if not data["streamlines"] and not data["slices"]:
-            logger.warning("No data to export.")
+        if not any((data["streamlines"], data["slices"], data["rois"])):
+            logger.warning("No visible data to export.")
             return False
 
-        # Generate HTML
-        html_content = _generate_html(data, opts)
-
-        # Write to file
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(html_content)
-
-        logger.info(f"HTML export complete: {output_path}")
-        return True
-
-    except (OSError, ValueError, KeyError, AttributeError) as e:
-        logger.error(f"HTML export failed: {e}", exc_info=True)
+        with staged_output(output_path) as staged_path:
+            with open(staged_path, "w", encoding="utf-8") as output_file:
+                output_file.write(_generate_html(data, opts))
+    except (OSError, ValueError, KeyError, AttributeError, RuntimeError) as error:
+        logger.error("HTML export failed: %s", error, exc_info=True)
         return False
+
+    logger.info("HTML export complete: %s", output_path)
+    return True
+
+
+def _validate_options(options: dict[str, Any]) -> None:
+    for name in (
+        "max_streamlines",
+        "streamline_step",
+        "max_streamline_points",
+        "max_slice_size",
+        "max_rois",
+        "max_roi_triangles",
+        "max_total_roi_triangles",
+        "max_roi_voxels",
+    ):
+        value = options.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"HTML export option {name!r} must be a positive integer.")
+    if options["max_streamline_points"] < 2:
+        raise ValueError("HTML export requires at least two points per streamline.")
+    if options["max_roi_voxels"] < 27:
+        raise ValueError("HTML export requires a ROI voxel budget of at least 27.")
 
 
 def _collect_visualization_data(
-    main_window: "MainWindow", options: Dict[str, Any]
-) -> Dict[str, Any]:
-    """
-    Collects and subsamples visualization data for export.
-
-    Returns:
-        Dictionary containing streamlines, slices, and ROI data.
-    """
-    data = {
+    main_window: "MainWindow", options: dict[str, Any]
+) -> dict[str, Any]:
+    data: dict[str, Any] = {
         "streamlines": [],
         "streamline_colors": [],
         "slices": {},
@@ -111,743 +96,513 @@ def _collect_visualization_data(
         "metadata": {},
     }
 
-    # Collect streamlines
-    if main_window.tractogram_data and main_window.visible_indices:
-        data["streamlines"], data["streamline_colors"] = _subsample_streamlines(
-            main_window, options
-        )
-        data["metadata"]["num_streamlines"] = len(data["streamlines"])
-        data["metadata"]["total_streamlines"] = len(main_window.visible_indices)
+    visible_indices = getattr(main_window, "visible_indices", set())
+    if (
+        getattr(main_window, "tractogram_data", None) is not None
+        and visible_indices
+        and getattr(main_window, "bundle_is_visible", True)
+    ):
+        streamlines, colors = _subsample_streamlines(main_window, options)
+        data["streamlines"] = streamlines
+        data["streamline_colors"] = colors
+        data["metadata"]["num_streamlines"] = len(streamlines)
+        data["metadata"]["total_streamlines"] = len(visible_indices)
 
-    # Collect slice images and positions
-    if options.get("include_slices", True) and main_window.vtk_panel:
-        data["slices"], data["slice_positions"] = _capture_slice_images(
-            main_window, options
-        )
+    if (
+        options.get("include_slices", True)
+        and getattr(main_window, "vtk_panel", None)
+        and getattr(main_window, "image_is_visible", True)
+    ):
+        slices, positions = _capture_slice_images(main_window, options)
+        data["slices"] = slices
+        data["slice_positions"] = positions
 
-    # Collect ROI data
-    if options.get("include_rois", True) and main_window.roi_layers:
+    roi_layers = getattr(main_window, "roi_layers", {})
+    if options.get("include_rois", True) and roi_layers:
         data["rois"] = _collect_roi_data(main_window, options)
+        data["metadata"]["num_rois"] = len(data["rois"])
 
     return data
 
 
 def _subsample_streamlines(
-    main_window: "MainWindow", options: Dict[str, Any]
-) -> Tuple[List[List[List[float]]], List[List[int]]]:
-    """
-    Subsamples streamlines for web export.
+    main_window: "MainWindow", options: dict[str, Any]
+) -> tuple[list[list[list[float]]], list[list[int]]]:
+    """Return a deterministic, endpoint-preserving bounded subset."""
+    max_streamlines = options.get("max_streamlines", 1000)
+    point_step = options.get("streamline_step", 2)
+    max_points = options.get("max_streamline_points", 256)
+    visible_indices = sorted(main_window.visible_indices)
 
-    Returns:
-        Tuple of (streamlines, colors) where each streamline is a list of [x,y,z] points.
-    """
-    max_sl = options.get("max_streamlines", 1000)
-    step = options.get("streamline_step", 2)
-
-    visible_indices = list(main_window.visible_indices)
-    tractogram = main_window.tractogram_data
-
-    # Subsample indices
-    if len(visible_indices) > max_sl:
-        # Uniform sampling
-        indices = np.linspace(0, len(visible_indices) - 1, max_sl, dtype=int)
-        selected_indices = [visible_indices[i] for i in indices]
+    if len(visible_indices) > max_streamlines:
+        positions = np.linspace(
+            0, len(visible_indices) - 1, max_streamlines, dtype=np.int64
+        )
+        selected_indices = [visible_indices[position] for position in positions]
     else:
         selected_indices = visible_indices
 
-    streamlines = []
-    colors = []
-
-    for idx in selected_indices:
-        sl = tractogram[idx]
-        if sl is None or len(sl) < 2:
+    streamlines: list[list[list[float]]] = []
+    colors: list[list[int]] = []
+    for index in selected_indices:
+        original = np.asarray(main_window.tractogram_data[index])
+        if original.ndim != 2 or original.shape[1] != 3 or len(original) < 2:
             continue
 
-        # Subsample points along streamline
-        if step > 1:
-            sl = sl[::step]
+        point_indices = np.arange(0, len(original), point_step, dtype=np.int64)
+        if point_indices[-1] != len(original) - 1:
+            point_indices = np.append(point_indices, len(original) - 1)
+        if len(point_indices) > max_points:
+            keep = np.linspace(0, len(point_indices) - 1, max_points, dtype=np.int64)
+            point_indices = point_indices[keep]
+        streamline = original[point_indices]
+        streamlines.append(streamline.tolist())
 
-        # Convert to list for JSON serialization
-        streamlines.append(sl.tolist())
-
-        # Generate color (direction-based RGB)
-        if len(sl) >= 2:
-            direction = sl[-1] - sl[0]
-            direction = np.abs(direction)
-            norm = np.linalg.norm(direction)
-            if norm > 0:
-                direction = direction / norm
-            color = [int(c * 255) for c in direction]
+        direction = np.abs(original[-1] - original[0]).astype(np.float64)
+        norm = np.linalg.norm(direction)
+        if norm > 0:
+            direction /= norm
+            colors.append(np.rint(direction * 255).astype(int).tolist())
         else:
-            color = [200, 200, 200]
-        colors.append(color)
+            colors.append([200, 200, 200])
 
     return streamlines, colors
 
 
+def _slice_plane_corners(
+    affine: np.ndarray,
+    shape: tuple[int, int, int],
+    axis: int,
+    index: int,
+) -> list[list[float]]:
+    lower = np.full(3, -0.5, dtype=np.float64)
+    upper = np.asarray(shape, dtype=np.float64) - 0.5
+    if axis == 2:
+        voxels = np.array(
+            [
+                [lower[0], lower[1], index],
+                [upper[0], lower[1], index],
+                [upper[0], upper[1], index],
+                [lower[0], upper[1], index],
+            ]
+        )
+    elif axis == 1:
+        voxels = np.array(
+            [
+                [lower[0], index, lower[2]],
+                [upper[0], index, lower[2]],
+                [upper[0], index, upper[2]],
+                [lower[0], index, upper[2]],
+            ]
+        )
+    else:
+        voxels = np.array(
+            [
+                [index, lower[1], lower[2]],
+                [index, upper[1], lower[2]],
+                [index, upper[1], upper[2]],
+                [index, lower[1], upper[2]],
+            ]
+        )
+    return nib.affines.apply_affine(affine, voxels).tolist()
+
+
+def _slice_to_data_url(
+    slice_data: np.ndarray,
+    image_quality: int,
+    max_size: int,
+) -> str:
+    from PIL import Image
+
+    array = np.asarray(slice_data, dtype=np.float32)
+    row_step = max(1, int(np.ceil(array.shape[0] / max_size)))
+    column_step = max(1, int(np.ceil(array.shape[1] / max_size)))
+    array = array[::row_step, ::column_step]
+    finite = np.isfinite(array)
+    if finite.any():
+        values = array[finite]
+        lower, upper = np.percentile(values, (1.0, 99.0))
+        if upper <= lower:
+            lower = float(values.min())
+            upper = float(values.max())
+        if upper > lower:
+            scaled = np.clip((array - lower) / (upper - lower), 0.0, 1.0)
+        else:
+            scaled = np.zeros_like(array)
+    else:
+        scaled = np.zeros_like(array)
+    scaled[~finite] = 0.0
+    pixels = np.rint(scaled * 255).astype(np.uint8)
+
+    buffer = io.BytesIO()
+    Image.fromarray(pixels).save(
+        buffer,
+        format="JPEG",
+        quality=int(np.clip(image_quality, 1, 100)),
+    )
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
 def _capture_slice_images(
-    main_window: "MainWindow", options: Dict[str, Any]
-) -> Tuple[Dict[str, str], Dict[str, Any]]:
-    """
-    Captures current slice images as base64 encoded PNGs.
+    main_window: "MainWindow", options: dict[str, Any]
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """Encode current anatomical planes without mutating or rendering the GUI."""
+    image_data = getattr(main_window, "anatomical_image_data", None)
+    affine = getattr(main_window, "anatomical_image_affine", None)
+    if image_data is None or affine is None:
+        return {}, {}
+    validate_volume_geometry(image_data, affine, "Anatomical image")
 
-    Returns:
-        Tuple of (slices dict, slice_positions dict).
-    """
-    slices = {}
-    slice_positions = {}
+    shape = tuple(int(value) for value in image_data.shape)
+    current = getattr(main_window.vtk_panel, "current_slice_indices", {})
+    indices = {
+        "sagittal": int(current.get("x", shape[0] // 2)),
+        "coronal": int(current.get("y", shape[1] // 2)),
+        "axial": int(current.get("z", shape[2] // 2)),
+    }
+    indices["sagittal"] = int(np.clip(indices["sagittal"], 0, shape[0] - 1))
+    indices["coronal"] = int(np.clip(indices["coronal"], 0, shape[1] - 1))
+    indices["axial"] = int(np.clip(indices["axial"], 0, shape[2] - 1))
 
-    try:
-        from PIL import Image
+    planes = {
+        "axial": np.asarray(image_data[:, :, indices["axial"]]).T,
+        "coronal": np.asarray(image_data[:, indices["coronal"], :]).T,
+        "sagittal": np.asarray(image_data[indices["sagittal"], :, :]).T,
+    }
+    axes = {"axial": 2, "coronal": 1, "sagittal": 0}
+    slices = {
+        name: _slice_to_data_url(
+            plane,
+            options.get("image_quality", 85),
+            options.get("max_slice_size", 512),
+        )
+        for name, plane in planes.items()
+    }
+    positions = {
+        name: {
+            "corners": _slice_plane_corners(
+                np.asarray(affine, dtype=np.float64),
+                shape,
+                axes[name],
+                indices[name],
+            ),
+            "index": indices[name],
+        }
+        for name in planes
+    }
+    return slices, positions
 
-        vtk_panel = main_window.vtk_panel
-        if not vtk_panel:
-            return slices, slice_positions
 
-        quality = options.get("image_quality", 85)
+def _foreground_bounds(
+    data: np.ndarray,
+    block_bytes: int = 4 * 1024 * 1024,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    lower = np.asarray(data.shape, dtype=np.int64)
+    upper = np.full(3, -1, dtype=np.int64)
+    plane_voxels = max(1, int(data.shape[1]) * int(data.shape[2]))
+    block_width = max(1, block_bytes // plane_voxels)
+    for start in range(0, data.shape[0], block_width):
+        stop = min(start + block_width, data.shape[0])
+        foreground = np.asarray(data[start:stop]) > 0
+        occupied = (
+            np.flatnonzero(np.any(foreground, axis=(1, 2))),
+            np.flatnonzero(np.any(foreground, axis=(0, 2))),
+            np.flatnonzero(np.any(foreground, axis=(0, 1))),
+        )
+        if occupied[0].size:
+            lower[0] = min(lower[0], start + occupied[0][0])
+            upper[0] = max(upper[0], start + occupied[0][-1])
+        for axis in (1, 2):
+            if occupied[axis].size:
+                lower[axis] = min(lower[axis], occupied[axis][0])
+                upper[axis] = max(upper[axis], occupied[axis][-1])
+    if np.any(upper < lower):
+        return None
+    return lower, upper + 1
 
-        # Get current slice positions and image bounds
-        if (
-            main_window.anatomical_image_data is not None
-            and main_window.anatomical_image_affine is not None
-        ):
-            affine = main_window.anatomical_image_affine
-            shape = main_window.anatomical_image_data.shape[:3]
-            current_indices = vtk_panel.current_slice_indices
 
-            # Compute world coordinates for each slice
-            x_idx = current_indices.get("x", shape[0] // 2)
-            y_idx = current_indices.get("y", shape[1] // 2)
-            z_idx = current_indices.get("z", shape[2] // 2)
+def _bounded_roi_mask(
+    data: np.ndarray,
+    max_voxels: int,
+) -> tuple[np.ndarray, np.ndarray, int] | None:
+    if max_voxels < 27:
+        raise ValueError("A padded ROI surface requires at least 27 voxels.")
+    bounds = _foreground_bounds(data)
+    if bounds is None:
+        return None
+    lower, upper = bounds
+    shape = upper - lower
+    step = 1
+    while np.prod((shape + step - 1) // step + 2) > max_voxels:
+        step += 1
+    coarse_shape = (shape + step - 1) // step
+    mask = np.zeros(tuple(coarse_shape + 2), dtype=np.uint8)
 
-            # Compute world bounds by transforming all 8 corners
-            corners_vox = np.array(
-                [
-                    [0, 0, 0, 1],
-                    [shape[0] - 1, 0, 0, 1],
-                    [0, shape[1] - 1, 0, 1],
-                    [0, 0, shape[2] - 1, 1],
-                    [shape[0] - 1, shape[1] - 1, 0, 1],
-                    [shape[0] - 1, 0, shape[2] - 1, 1],
-                    [0, shape[1] - 1, shape[2] - 1, 1],
-                    [shape[0] - 1, shape[1] - 1, shape[2] - 1, 1],
+    # Source tiles bound temporary predicates and index arrays. Every positive
+    # voxel marks its containing coarse cell, regardless of stride residue.
+    tile_budget = 100_000
+    tile_z = min(int(shape[2]), tile_budget)
+    tile_y = min(int(shape[1]), max(1, tile_budget // tile_z))
+    tile_x = min(int(shape[0]), max(1, tile_budget // (tile_y * tile_z)))
+    for x in range(int(lower[0]), int(upper[0]), tile_x):
+        for y in range(int(lower[1]), int(upper[1]), tile_y):
+            for z in range(int(lower[2]), int(upper[2]), tile_z):
+                source = data[
+                    x : min(x + tile_x, int(upper[0])),
+                    y : min(y + tile_y, int(upper[1])),
+                    z : min(z + tile_z, int(upper[2])),
                 ]
-            )
-            corners_world = np.array([np.dot(affine, c)[:3] for c in corners_vox])
+                occupied = np.nonzero(np.asarray(source) > 0)
+                if occupied[0].size:
+                    mask[
+                        (occupied[0] + x - lower[0]) // step + 1,
+                        (occupied[1] + y - lower[1]) // step + 1,
+                        (occupied[2] + z - lower[2]) // step + 1,
+                    ] = 1
+    voxel_to_source = np.eye(4)
+    voxel_to_source[:3, :3] *= step
+    voxel_to_source[:3, 3] = lower - (step + 1) / 2
+    return mask, voxel_to_source, step
 
-            # Get actual min/max across all corners
-            world_min = corners_world.min(axis=0)
-            world_max = corners_world.max(axis=0)
 
-            # Axial slice position (fixed Z)
-            z_vox = np.array([shape[0] / 2, shape[1] / 2, z_idx, 1])
-            z_world = np.dot(affine, z_vox)[:3]
-            slice_positions["axial"] = {
-                "position": float(z_world[2]),
-                "axis": "z",
-                "bounds": {
-                    "minX": float(world_min[0]),
-                    "maxX": float(world_max[0]),
-                    "minY": float(world_min[1]),
-                    "maxY": float(world_max[1]),
-                },
-            }
+def _polydata_triangles(polydata: Any) -> tuple[np.ndarray, np.ndarray]:
+    from vtk.util.numpy_support import vtk_to_numpy
 
-            # Coronal slice position (fixed Y)
-            y_vox = np.array([shape[0] / 2, y_idx, shape[2] / 2, 1])
-            y_world = np.dot(affine, y_vox)[:3]
-            slice_positions["coronal"] = {
-                "position": float(y_world[1]),
-                "axis": "y",
-                "bounds": {
-                    "minX": float(world_min[0]),
-                    "maxX": float(world_max[0]),
-                    "minZ": float(world_min[2]),
-                    "maxZ": float(world_max[2]),
-                },
-            }
+    if polydata.GetNumberOfPoints() == 0 or polydata.GetNumberOfPolys() == 0:
+        return np.empty((0, 3)), np.empty((0, 3), dtype=np.int64)
+    points = vtk_to_numpy(polydata.GetPoints().GetData())
+    polygons = polydata.GetPolys()
+    connectivity = vtk_to_numpy(polygons.GetConnectivityArray())
+    offsets = vtk_to_numpy(polygons.GetOffsetsArray())
+    lengths = np.diff(offsets)
+    if len(lengths) and not np.all(lengths == 3):
+        raise ValueError("ROI surface contains non-triangular cells.")
+    return points, connectivity.reshape(-1, 3)
 
-            # Sagittal slice position (fixed X)
-            x_vox = np.array([x_idx, shape[1] / 2, shape[2] / 2, 1])
-            x_world = np.dot(affine, x_vox)[:3]
-            slice_positions["sagittal"] = {
-                "position": float(x_world[0]),
-                "axis": "x",
-                "bounds": {
-                    "minY": float(world_min[1]),
-                    "maxY": float(world_max[1]),
-                    "minZ": float(world_min[2]),
-                    "maxZ": float(world_max[2]),
-                },
-            }
 
-            # Add volume center for proper positioning
-            slice_positions["volume_center"] = {
-                "x": float((world_min[0] + world_max[0]) / 2),
-                "y": float((world_min[1] + world_max[1]) / 2),
-                "z": float((world_min[2] + world_max[2]) / 2),
-            }
+def _build_roi_mesh(
+    roi_data: np.ndarray,
+    affine: np.ndarray,
+    max_triangles: int,
+    max_voxels: int,
+) -> dict[str, Any] | None:
+    """Build a bounded surface mesh from the physical ROI voxel support."""
+    import vtk
+    from vtk.util.numpy_support import numpy_to_vtk
 
-            # Add full volume bounds for consistent slice sizing
-            slice_positions["fullBounds"] = {
-                "minX": float(world_min[0]),
-                "maxX": float(world_max[0]),
-                "minY": float(world_min[1]),
-                "maxY": float(world_max[1]),
-                "minZ": float(world_min[2]),
-                "maxZ": float(world_max[2]),
-            }
+    crop = _bounded_roi_mask(np.asarray(roi_data), max_voxels)
+    if crop is None:
+        return None
+    mask, voxel_to_source, voxel_stride = crop
 
-        # Capture each 2D view
-        views = [
-            ("axial", vtk_panel.axial_scene),
-            ("coronal", vtk_panel.coronal_scene),
-            ("sagittal", vtk_panel.sagittal_scene),
-        ]
+    image = vtk.vtkImageData()
+    image.SetDimensions(*mask.shape)
+    scalars = numpy_to_vtk(
+        np.ascontiguousarray(mask, dtype=np.uint8).ravel(order="F"),
+        deep=True,
+    )
+    image.GetPointData().SetScalars(scalars)
 
-        for name, scene in views:
-            if scene is None:
-                continue
+    surface = vtk.vtkFlyingEdges3D()
+    surface.SetInputData(image)
+    surface.SetValue(0, 0.5)
+    surface.ComputeNormalsOff()
+    surface.Update()
 
-            try:
-                # Render to array
-                render_window = scene.GetRenderWindow()
-                if render_window is None:
-                    continue
+    triangulate = vtk.vtkTriangleFilter()
+    triangulate.SetInputConnection(surface.GetOutputPort())
+    triangulate.Update()
+    polydata = triangulate.GetOutput()
+    initial_triangles = polydata.GetNumberOfPolys()
+    if initial_triangles == 0 or polydata.GetNumberOfPoints() == 0:
+        raise ValueError("Occupied ROI produced no surface for HTML export.")
+    decimated = voxel_stride > 1 or initial_triangles > max_triangles
+    if initial_triangles > max_triangles:
+        reduction = 1.0 - (max_triangles / initial_triangles)
+        simplify = vtk.vtkQuadricDecimation()
+        simplify.SetInputData(polydata)
+        simplify.SetTargetReduction(float(np.clip(reduction, 0.0, 0.999)))
+        simplify.Update()
+        if simplify.GetOutput().GetNumberOfPolys() > 0:
+            polydata = simplify.GetOutput()
 
-                render_window.Render()
+    points, triangles = _polydata_triangles(polydata)
+    if len(triangles) == 0:
+        raise ValueError("Occupied ROI surface disappeared during simplification.")
+    if len(triangles) > max_triangles:
+        keep = np.linspace(0, len(triangles) - 1, max_triangles, dtype=np.int64)
+        triangles = triangles[keep]
+        decimated = True
 
-                # Get image from render window
-                import vtk
-                from vtk.util import numpy_support
+    used_points = np.unique(triangles)
+    remap = np.full(len(points), -1, dtype=np.int64)
+    remap[used_points] = np.arange(len(used_points), dtype=np.int64)
+    points = points[used_points]
+    triangles = remap[triangles]
 
-                w2i = vtk.vtkWindowToImageFilter()
-                w2i.SetInput(render_window)
-                w2i.ReadFrontBufferOff()
-                w2i.Update()
+    world_points = nib.affines.apply_affine(affine @ voxel_to_source, points)
+    return {
+        "points": world_points.tolist(),
+        "triangles": triangles.astype(np.int64, copy=False).tolist(),
+        "decimated": decimated,
+        "voxel_stride": voxel_stride,
+        "occupied_cell_aggregation": voxel_stride > 1,
+    }
 
-                vtk_image = w2i.GetOutput()
-                dims = vtk_image.GetDimensions()
 
-                if dims[0] == 0 or dims[1] == 0:
-                    continue
-
-                # Convert to numpy
-                scalars = vtk_image.GetPointData().GetScalars()
-                if scalars is None:
-                    continue
-
-                arr = numpy_support.vtk_to_numpy(scalars)
-                n_components = vtk_image.GetNumberOfScalarComponents()
-                arr = arr.reshape(dims[1], dims[0], n_components)
-                arr = np.flipud(arr)
-
-                # Convert to PIL Image
-                if n_components == 4:
-                    img = Image.fromarray(arr, mode="RGBA")
-                elif n_components == 3:
-                    img = Image.fromarray(arr, mode="RGB")
-                else:
-                    continue
-
-                # Resize if too large
-                max_size = 512
-                if img.width > max_size or img.height > max_size:
-                    img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-
-                # Convert to JPEG base64
-                buffer = io.BytesIO()
-                img.convert("RGB").save(buffer, format="JPEG", quality=quality)
-                b64_data = base64.b64encode(buffer.getvalue()).decode("ascii")
-                slices[name] = f"data:image/jpeg;base64,{b64_data}"
-
-            except (RuntimeError, ValueError, AttributeError, OSError) as e:
-                logger.warning(f"Failed to capture {name} slice: {e}")
-
-    except ImportError:
-        logger.warning("PIL not available, skipping slice capture.")
-
-    return slices, slice_positions
+def _roi_color(layer: dict[str, Any]) -> list[int]:
+    color = np.asarray(layer.get("color", (1.0, 0.0, 0.0)), dtype=np.float64)
+    if color.shape[0] < 3 or not np.all(np.isfinite(color[:3])):
+        raise ValueError("ROI color must contain three finite values.")
+    return np.rint(np.clip(color[:3], 0.0, 1.0) * 255).astype(int).tolist()
 
 
 def _collect_roi_data(
-    main_window: "MainWindow", options: Dict[str, Any]
-) -> List[Dict[str, Any]]:
-    """
-    Collects ROI visualization data.
+    main_window: "MainWindow", options: dict[str, Any]
+) -> list[dict[str, Any]]:
+    visible_names = [
+        name
+        for name in main_window.roi_layers
+        if getattr(main_window, "roi_visibility", {}).get(name, True)
+    ]
+    if len(visible_names) > options.get("max_rois", 64):
+        raise ValueError(
+            f"HTML export has {len(visible_names)} visible ROIs; "
+            f"the configured limit is {options.get('max_rois', 64)}."
+        )
 
-    Returns:
-        List of ROI data dictionaries with simplified geometry.
-    """
-    rois = []
+    panel = getattr(main_window, "vtk_panel", None)
+    sphere_params = getattr(panel, "sphere_params_per_roi", {})
+    rectangle_params = getattr(panel, "rectangle_params_per_roi", {})
+    remaining_triangles = options.get("max_total_roi_triangles", 50_000)
+    per_roi_limit = options.get("max_roi_triangles", 20_000)
+    max_roi_voxels = options.get("max_roi_voxels", 4_000_000)
+    rois: list[dict[str, Any]] = []
 
-    for roi_name, roi_layer in main_window.roi_layers.items():
-        try:
-            roi_data = roi_layer["data"]
-            roi_affine = roi_layer["affine"]
+    for name in visible_names:
+        layer = main_window.roi_layers[name]
+        data = np.asarray(layer["data"])
+        affine = np.asarray(layer["affine"], dtype=np.float64)
+        validate_volume_geometry(data, affine, f"ROI {name!r}")
+        color = _roi_color(layer)
+        if name in sphere_params:
+            params = sphere_params[name]
+            center = np.asarray(params["center"], dtype=np.float64)
+            radius = float(params["radius"])
+            if center.shape != (3,) or not np.all(np.isfinite(center)):
+                raise ValueError(f"ROI {name!r} has an invalid sphere center.")
+            if not np.isfinite(radius) or radius <= 0:
+                raise ValueError(f"ROI {name!r} has an invalid sphere radius.")
+            rois.append(
+                {
+                    "name": name,
+                    "type": "sphere",
+                    "center": center.tolist(),
+                    "radius": radius,
+                    "color": color,
+                }
+            )
+            continue
 
-            # Get ROI color
-            color = main_window.roi_colors.get(roi_name, (1.0, 0.0, 0.0))
-            color_rgb = [int(c * 255) for c in color[:3]]
+        if (
+            name in rectangle_params
+            and rectangle_params[name].get("corners") is not None
+        ):
+            params = rectangle_params[name]
+            corners = np.asarray(params["corners"], dtype=np.float64)
+            if corners.shape != (4, 3) or not np.all(np.isfinite(corners)):
+                raise ValueError(f"ROI {name!r} has invalid rectangle corners.")
+            rois.append(
+                {
+                    "name": name,
+                    "type": "polygon",
+                    "corners": corners.tolist(),
+                    "color": color,
+                }
+            )
+            continue
 
-            # Check if it's a sphere ROI
-            if (
-                main_window.vtk_panel
-                and hasattr(main_window.vtk_panel, "sphere_params_per_roi")
-                and roi_name in main_window.vtk_panel.sphere_params_per_roi
-            ):
-                params = main_window.vtk_panel.sphere_params_per_roi[roi_name]
-                rois.append(
-                    {
-                        "name": roi_name,
-                        "type": "sphere",
-                        "center": params["center"].tolist(),
-                        "radius": params["radius"],
-                        "color": color_rgb,
-                    }
-                )
-
-            # Check if it's a rectangle ROI
-            elif (
-                main_window.vtk_panel
-                and hasattr(main_window.vtk_panel, "rectangle_params_per_roi")
-                and roi_name in main_window.vtk_panel.rectangle_params_per_roi
-            ):
-                params = main_window.vtk_panel.rectangle_params_per_roi[roi_name]
-                rois.append(
-                    {
-                        "name": roi_name,
-                        "type": "box",
-                        "start": np.array(params["start"]).tolist(),
-                        "end": np.array(params["end"]).tolist(),
-                        "color": color_rgb,
-                    }
-                )
-
-            else:
-                # Generic ROI - compute center of mass
-                if np.any(roi_data > 0):
-                    coords = np.argwhere(roi_data > 0)
-                    center_vox = np.mean(coords, axis=0)
-                    # Transform to world coordinates
-                    center_world = np.dot(roi_affine, np.append(center_vox, 1.0))[:3]
-                    min_coords = np.min(coords, axis=0)
-                    max_coords = np.max(coords, axis=0)
-                    size = max_coords - min_coords
-                    avg_radius = np.mean(size) / 2
-
-                    rois.append(
-                        {
-                            "name": roi_name,
-                            "type": "sphere",
-                            "center": center_world.tolist(),
-                            "radius": float(avg_radius),
-                            "color": color_rgb,
-                        }
-                    )
-
-        except (ValueError, IndexError, KeyError, AttributeError) as e:
-            logger.warning(f"Failed to export ROI {roi_name}: {e}")
+        if remaining_triangles < 1:
+            raise ValueError("Visible ROI surfaces exceed the HTML triangle budget.")
+        mesh = _build_roi_mesh(
+            data,
+            affine,
+            min(per_roi_limit, remaining_triangles),
+            max_roi_voxels,
+        )
+        if mesh is None:
+            continue
+        remaining_triangles -= len(mesh["triangles"])
+        rois.append(
+            {
+                "name": name,
+                "type": "mesh",
+                "color": color,
+                **mesh,
+            }
+        )
 
     return rois
 
 
-def _generate_html(data: Dict[str, Any], options: Dict[str, Any]) -> str:
-    """
-    Generates the complete HTML file with embedded three.js visualization.
+def _json_for_script(value: Any) -> str:
+    return (
+        json.dumps(value, separators=(",", ":"), allow_nan=False)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
 
-    Returns:
-        Complete HTML content as a string.
-    """
-    # Compress streamline data
-    streamlines_json = json.dumps(data["streamlines"])
-    colors_json = json.dumps(data["streamline_colors"])
-    rois_json = json.dumps(data["rois"])
-    slices_json = json.dumps(data["slices"])
-    slice_positions_json = json.dumps(data.get("slice_positions", {}))
 
-    # Optionally compress large data
-    if len(streamlines_json) > 100000:
-        # Use gzip compression and base64 encoding
-        compressed = gzip.compress(streamlines_json.encode("utf-8"))
-        streamlines_data = f'"{base64.b64encode(compressed).decode("ascii")}"'
-        use_compression = True
-    else:
-        streamlines_data = streamlines_json
-        use_compression = False
+def _generate_html(data: dict[str, Any], options: dict[str, Any]) -> str:
+    """Return a dependency-free WebGL document containing the scene payload."""
+    del options
+    return _HTML_TEMPLATE.replace("__SCENE_DATA__", _json_for_script(data))
 
-    ## TODO - to refactor
-    # Generate HTML content
-    html = f"""<!DOCTYPE html>
+
+_HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TractEdit</title>
-    <style>
-        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #1a1a2e;
-            color: #eee;
-            overflow: hidden;
-        }}
-        #container {{
-            width: 100vw;
-            height: 100vh;
-            display: flex;
-        }}
-        #viewer {{
-            flex: 1;
-            position: relative;
-        }}
-        #sidebar {{
-            width: 280px;
-            background: #16213e;
-            padding: 20px;
-            overflow-y: auto;
-            border-left: 1px solid #0f3460;
-        }}
-        h1 {{
-            font-size: 1.2em;
-            margin-bottom: 20px;
-            color: #e94560;
-        }}
-        .section {{
-            margin-bottom: 20px;
-            padding-bottom: 15px;
-            border-bottom: 1px solid #0f3460;
-        }}
-        .section h2 {{
-            font-size: 0.9em;
-            color: #888;
-            margin-bottom: 10px;
-            text-transform: uppercase;
-        }}
-        label {{
-            display: flex;
-            align-items: center;
-            margin-bottom: 8px;
-            cursor: pointer;
-        }}
-        input[type="checkbox"] {{
-            margin-right: 10px;
-        }}
-        input[type="range"] {{
-            width: 100%;
-            margin: 5px 0;
-        }}
-        .info {{
-            font-size: 0.8em;
-            color: #666;
-            margin-top: 10px;
-        }}
-        #slices {{
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-        }}
-        #slices img {{
-            width: 100%;
-            border-radius: 5px;
-            border: 1px solid #0f3460;
-        }}
-        .slice-label {{
-            font-size: 0.75em;
-            color: #888;
-            text-transform: uppercase;
-        }}
-        #loading {{
-            position: absolute;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            text-align: center;
-        }}
-        .spinner {{
-            width: 40px;
-            height: 40px;
-            border: 3px solid #0f3460;
-            border-top-color: #e94560;
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-            margin: 0 auto 15px;
-        }}
-        @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TractEdit offline visual export</title>
+<style>
+*{box-sizing:border-box}html,body{height:100%;margin:0;background:#1a1a2e;color:#eee;font:14px system-ui,sans-serif}#layout{height:100%;display:flex}#viewer{min-width:0;flex:1;position:relative}canvas{display:block;width:100%;height:100%}#side{width:290px;padding:18px;background:#16213e;overflow:auto}h1{font-size:18px;color:#e94560;margin:0 0 18px}.section{border-bottom:1px solid #315078;padding:0 0 14px;margin:0 0 14px}label{display:block;margin:8px 0}.note{color:#b5bfd0;font-size:12px;line-height:1.45}input{margin-right:8px}#error{position:absolute;inset:20px auto auto 20px;color:#ff8b8b}</style>
 </head>
-<body>
-    <div id="container">
-        <div id="viewer">
-            <div id="loading">
-                <div class="spinner"></div>
-                <div>Loading visualization...</div>
-            </div>
-        </div>
-        <div id="sidebar">
-            <h1>🧠 TractEdit </h1>
-            
-            <div class="section">
-                <h2>Display</h2>
-                <label>
-                    <input type="checkbox" id="showStreamlines" checked>
-                    Show Streamlines
-                </label>
-                <label>
-                    <input type="checkbox" id="showROIs" checked>
-                    Show ROIs
-                </label>
-
-            </div>
-
-            
-            <div class="section">
-                <h2>Streamline Opacity</h2>
-                <input type="range" id="opacitySlider" min="0" max="100" value="80">
-            </div>
-            
-            <div class="section" id="slicesSection">
-                <h2>Orthogonal Slices</h2>
-                <div id="slices"></div>
-            </div>
-            
-            <div class="info">
-                <strong>Controls:</strong><br>
-                Left-drag: Rotate<br>
-                Right-drag: Pan<br>
-                Scroll: Zoom
-            </div>
-            
-            <div class="info" style="margin-top: 20px">
-                Exported from TractEdit
-            </div>
-        </div>
-    </div>
-    
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
-    <script>
-        // Data
-        const COMPRESSED = {'true' if use_compression else 'false'};
-        const streamlinesData = {streamlines_data};
-        const colorsData = {colors_json};
-        const roisData = {rois_json};
-        const slicesData = {slices_json};
-        const slicePositionsData = {slice_positions_json};
-        
-        // Decompress if needed
-        async function decompressData(b64data) {{
-            const compressed = Uint8Array.from(atob(b64data), c => c.charCodeAt(0));
-            const ds = new DecompressionStream('gzip');
-            const stream = new Blob([compressed]).stream().pipeThrough(ds);
-            const text = await new Response(stream).text();
-            return JSON.parse(text);
-        }}
-        
-        // Three.js setup
-        let scene, camera, renderer, controls;
-        let streamlineGroup, roiGroup;
-        
-        async function init() {{
-            // Get streamlines data
-            let streamlines;
-            if (COMPRESSED) {{
-
-                streamlines = await decompressData(streamlinesData);
-            }} else {{
-                streamlines = streamlinesData;
-            }}
-            
-            // Scene
-            scene = new THREE.Scene();
-            scene.background = new THREE.Color(0x1a1a2e);
-            
-            // Camera
-            const viewer = document.getElementById('viewer');
-            camera = new THREE.PerspectiveCamera(
-                60, viewer.clientWidth / viewer.clientHeight, 0.1, 10000
-            );
-            
-            // Compute center and size from streamlines for rotation
-            let centerX, centerY, centerZ, size;
-            
-            // Always use streamline bounds for rotation center
-            let minX = Infinity, minY = Infinity, minZ = Infinity;
-            let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
-            
-            for (const sl of streamlines) {{
-                for (const pt of sl) {{
-                    minX = Math.min(minX, pt[0]);
-                    minY = Math.min(minY, pt[1]);
-                    minZ = Math.min(minZ, pt[2]);
-                    maxX = Math.max(maxX, pt[0]);
-                    maxY = Math.max(maxY, pt[1]);
-                    maxZ = Math.max(maxZ, pt[2]);
-                }}
-            }}
-            
-            centerX = (minX + maxX) / 2;
-            centerY = (minY + maxY) / 2;
-            centerZ = (minZ + maxZ) / 2;
-            size = Math.max(maxX - minX, maxY - minY, maxZ - minZ);
-            
-            // Use streamline center for rotation target
-            let targetX = centerX, targetY = centerY, targetZ = centerZ;
-            
-            // Set camera up vector to Z (medical imaging RAS convention)
-            camera.up.set(0, 0, 1);
-            camera.position.set(targetX, targetY - size * 1.5, targetZ + size * 0.5);
-            camera.lookAt(targetX, targetY, targetZ);
-            
-            // Renderer
-            renderer = new THREE.WebGLRenderer({{ antialias: true }});
-            renderer.setSize(viewer.clientWidth, viewer.clientHeight);
-            renderer.setPixelRatio(window.devicePixelRatio);
-            viewer.appendChild(renderer.domElement);
-            
-            // Controls
-            controls = new THREE.OrbitControls(camera, renderer.domElement);
-            controls.target.set(targetX, targetY, targetZ);
-            controls.enableDamping = true;
-            controls.dampingFactor = 0.05;
-            controls.update();
-            
-            // Lighting
-            const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
-            scene.add(ambientLight);
-            const directionalLight = new THREE.DirectionalLight(0xffffff, 0.4);
-            directionalLight.position.set(1, 1, 1);
-            scene.add(directionalLight);
-            
-            // Create streamlines
-            streamlineGroup = new THREE.Group();
-            
-            for (let i = 0; i < streamlines.length; i++) {{
-                const sl = streamlines[i];
-                const color = colorsData[i] || [200, 200, 200];
-                
-                const geometry = new THREE.BufferGeometry();
-                const positions = new Float32Array(sl.length * 3);
-                
-                for (let j = 0; j < sl.length; j++) {{
-                    positions[j * 3] = sl[j][0];
-                    positions[j * 3 + 1] = sl[j][1];
-                    positions[j * 3 + 2] = sl[j][2];
-                }}
-                
-                geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-                
-                const material = new THREE.LineBasicMaterial({{
-                    color: new THREE.Color(color[0]/255, color[1]/255, color[2]/255),
-                    transparent: true,
-                    opacity: 0.8
-                }});
-                
-                const line = new THREE.Line(geometry, material);
-                streamlineGroup.add(line);
-            }}
-            
-            scene.add(streamlineGroup);
-            
-            // Create ROIs
-            roiGroup = new THREE.Group();
-            
-            for (const roi of roisData) {{
-                const color = new THREE.Color(roi.color[0]/255, roi.color[1]/255, roi.color[2]/255);
-                
-                if (roi.type === 'sphere') {{
-                    const geometry = new THREE.SphereGeometry(roi.radius, 16, 16);
-                    const material = new THREE.MeshPhongMaterial({{
-                        color: color,
-                        transparent: true,
-                        opacity: 0.5,
-                        side: THREE.DoubleSide
-                    }});
-                    const mesh = new THREE.Mesh(geometry, material);
-                    mesh.position.set(roi.center[0], roi.center[1], roi.center[2]);
-                    roiGroup.add(mesh);
-                }} else if (roi.type === 'box') {{
-                    const size = [
-                        Math.abs(roi.end[0] - roi.start[0]),
-                        Math.abs(roi.end[1] - roi.start[1]),
-                        Math.abs(roi.end[2] - roi.start[2])
-                    ];
-                    const center = [
-                        (roi.start[0] + roi.end[0]) / 2,
-                        (roi.start[1] + roi.end[1]) / 2,
-                        (roi.start[2] + roi.end[2]) / 2
-                    ];
-                    const geometry = new THREE.BoxGeometry(size[0], size[1], size[2]);
-                    const material = new THREE.MeshPhongMaterial({{
-                        color: color,
-                        transparent: true,
-                        opacity: 0.5,
-                        side: THREE.DoubleSide
-                    }});
-                    const mesh = new THREE.Mesh(geometry, material);
-                    mesh.position.set(center[0], center[1], center[2]);
-                    roiGroup.add(mesh);
-                }}
-            }}
-            
-            scene.add(roiGroup);
-            
-            
-            // Add slices to sidebar
-            const slicesContainer = document.getElementById('slices');
-            for (const [name, src] of Object.entries(slicesData)) {{
-                const label = document.createElement('div');
-                label.className = 'slice-label';
-                label.textContent = name;
-                slicesContainer.appendChild(label);
-                
-                const img = document.createElement('img');
-                img.src = src;
-                img.alt = name + ' slice';
-                slicesContainer.appendChild(img);
-            }}
-            
-            // Hide loading
-            document.getElementById('loading').style.display = 'none';
-            
-            // Controls
-            document.getElementById('showStreamlines').addEventListener('change', (e) => {{
-                streamlineGroup.visible = e.target.checked;
-            }});
-            
-            document.getElementById('showROIs').addEventListener('change', (e) => {{
-                roiGroup.visible = e.target.checked;
-            }});
-            
-
-            
-            document.getElementById('opacitySlider').addEventListener('input', (e) => {{
-                const opacity = e.target.value / 100;
-                streamlineGroup.children.forEach(line => {{
-                    line.material.opacity = opacity;
-                }});
-            }});
-
-            
-            // Handle resize
-            window.addEventListener('resize', () => {{
-                camera.aspect = viewer.clientWidth / viewer.clientHeight;
-                camera.updateProjectionMatrix();
-                renderer.setSize(viewer.clientWidth, viewer.clientHeight);
-            }});
-            
-            // Animation loop
-            function animate() {{
-                requestAnimationFrame(animate);
-                controls.update();
-                renderer.render(scene, camera);
-            }}
-            animate();
-        }}
-        
-        init();
-    </script>
-</body>
-</html>"""
-
-    return html
+<body><div id="layout"><div id="viewer"><canvas id="canvas"></canvas><div id="error"></div></div><aside id="side">
+<h1>TractEdit</h1><div class="section"><label><input id="streamlines" type="checkbox" checked>Streamlines</label><label><input id="rois" type="checkbox" checked>ROIs</label><label><input id="slices" type="checkbox" checked>Anatomical slices</label></div>
+<div class="section"><label>Streamline opacity <input id="opacity" type="range" min="0" max="100" value="80"></label></div>
+<div class="section note">Left drag: rotate<br>Right drag: pan<br>Wheel: zoom</div>
+<div class="note"><strong>Offline visual export.</strong> No external JavaScript libraries or network access are required. This is not a quantitative scientific export: streamlines and textures may be downsampled; occupied ROI voxels are grouped into bounded cells and surfaces may be decimated. Coarse ROI cell boundaries can extend beyond source voxels. Source coordinates and affine-transformed plane geometry are retained.</div>
+</aside></div>
+<script>
+'use strict';
+const sceneData=__SCENE_DATA__;
+const canvas=document.getElementById('canvas');
+const gl=canvas.getContext('webgl',{alpha:false,antialias:true});
+if(!gl){document.getElementById('error').textContent='WebGL is unavailable in this browser.';throw new Error('WebGL unavailable');}
+const vertexSource='attribute vec3 p;attribute vec2 uv;uniform mat4 vp;varying vec2 t;void main(){t=uv;gl_Position=vp*vec4(p,1.0);}';
+const fragmentSource='precision mediump float;varying vec2 t;uniform vec4 color;uniform sampler2D image;uniform bool textured;void main(){gl_FragColor=textured?texture2D(image,t)*color:color;}';
+function shader(type,source){const value=gl.createShader(type);gl.shaderSource(value,source);gl.compileShader(value);if(!gl.getShaderParameter(value,gl.COMPILE_STATUS))throw new Error(gl.getShaderInfoLog(value));return value;}
+const program=gl.createProgram();gl.attachShader(program,shader(gl.VERTEX_SHADER,vertexSource));gl.attachShader(program,shader(gl.FRAGMENT_SHADER,fragmentSource));gl.linkProgram(program);gl.useProgram(program);
+const loc={p:gl.getAttribLocation(program,'p'),uv:gl.getAttribLocation(program,'uv'),vp:gl.getUniformLocation(program,'vp'),color:gl.getUniformLocation(program,'color'),image:gl.getUniformLocation(program,'image'),textured:gl.getUniformLocation(program,'textured')};
+function buffer(values,size){const result=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,result);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(values),gl.STATIC_DRAW);return {value:result,size:size,count:values.length/size};}
+function normalize(v){const n=Math.hypot(...v)||1;return v.map(x=>x/n);}
+function cross(a,b){return [a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];}
+function dot(a,b){return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];}
+function multiply(a,b){const out=new Array(16).fill(0);for(let c=0;c<4;c++)for(let r=0;r<4;r++)for(let k=0;k<4;k++)out[c*4+r]+=a[k*4+r]*b[c*4+k];return out;}
+function perspective(fovy,aspect,near,far){const f=1/Math.tan(fovy/2),nf=1/(near-far);return [f/aspect,0,0,0,0,f,0,0,0,0,(far+near)*nf,-1,0,0,2*far*near*nf,0];}
+function lookAt(eye,target,up){const z=normalize(eye.map((v,i)=>v-target[i])),x=normalize(cross(up,z)),y=cross(z,x);return [x[0],y[0],z[0],0,x[1],y[1],z[1],0,x[2],y[2],z[2],0,-dot(x,eye),-dot(y,eye),-dot(z,eye),1];}
+const objects=[];const bounds=[Infinity,Infinity,Infinity,-Infinity,-Infinity,-Infinity];
+function include(point){for(let i=0;i<3;i++){bounds[i]=Math.min(bounds[i],point[i]);bounds[i+3]=Math.max(bounds[i+3],point[i]);}}
+function add(vertices,mode,color,group,texcoords=null,texture=null){vertices.forEach(include);objects.push({positions:buffer(vertices.flat(),3),uv:buffer((texcoords||vertices.map(()=>[0,0])).flat(),2),mode:mode,color:color.map(x=>x/255),group:group,texture:texture});}
+sceneData.streamlines.forEach((line,index)=>{const segments=[];for(let i=1;i<line.length;i++)segments.push(line[i-1],line[i]);add(segments,gl.LINES,[...(sceneData.streamline_colors[index]||[200,200,200]),204],'streamlines');});
+function sphere(center,radius){const points=[],triangles=[],rows=12,cols=20;for(let r=0;r<=rows;r++){const phi=Math.PI*r/rows;for(let c=0;c<=cols;c++){const theta=2*Math.PI*c/cols;points.push([center[0]+radius*Math.sin(phi)*Math.cos(theta),center[1]+radius*Math.sin(phi)*Math.sin(theta),center[2]+radius*Math.cos(phi)]);}}for(let r=0;r<rows;r++)for(let c=0;c<cols;c++){const a=r*(cols+1)+c,b=a+cols+1;triangles.push(points[a],points[b],points[a+1],points[a+1],points[b],points[b+1]);}return triangles;}
+sceneData.rois.forEach(roi=>{let vertices=[];if(roi.type==='sphere')vertices=sphere(roi.center,roi.radius);else if(roi.type==='polygon')vertices=[roi.corners[0],roi.corners[1],roi.corners[2],roi.corners[0],roi.corners[2],roi.corners[3]];else roi.triangles.forEach(t=>vertices.push(roi.points[t[0]],roi.points[t[1]],roi.points[t[2]]));add(vertices,gl.TRIANGLES,[...roi.color,128],'rois');});
+Object.entries(sceneData.slices).forEach(([name,source])=>{const info=sceneData.slice_positions[name];if(!info)return;const c=info.corners,vertices=[c[0],c[1],c[2],c[0],c[2],c[3]],uv=[[0,0],[1,0],[1,1],[0,0],[1,1],[0,1]],texture=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,texture);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,1,1,0,gl.RGBA,gl.UNSIGNED_BYTE,new Uint8Array([80,80,80,255]));const image=new Image();image.onload=()=>{gl.bindTexture(gl.TEXTURE_2D,texture);gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,image);draw();};image.src=source;add(vertices,gl.TRIANGLES,[255,255,255,190],'slices',uv,texture);});
+if(!Number.isFinite(bounds[0]))bounds.splice(0,6,-1,-1,-1,1,1,1);let target=[(bounds[0]+bounds[3])/2,(bounds[1]+bounds[4])/2,(bounds[2]+bounds[5])/2],distance=Math.max(bounds[3]-bounds[0],bounds[4]-bounds[1],bounds[5]-bounds[2],1)*1.8,yaw=-Math.PI/2,pitch=.3;
+gl.enable(gl.DEPTH_TEST);gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);gl.clearColor(.102,.102,.18,1);
+function draw(){const ratio=Math.min(devicePixelRatio||1,2),width=Math.max(1,Math.floor(canvas.clientWidth*ratio)),height=Math.max(1,Math.floor(canvas.clientHeight*ratio));if(canvas.width!==width||canvas.height!==height){canvas.width=width;canvas.height=height;}gl.viewport(0,0,width,height);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);const cp=Math.cos(pitch),eye=[target[0]+distance*cp*Math.cos(yaw),target[1]+distance*cp*Math.sin(yaw),target[2]+distance*Math.sin(pitch)],vp=multiply(perspective(Math.PI/3,width/height,.01,Math.max(10000,distance*20)),lookAt(eye,target,[0,0,1]));gl.uniformMatrix4fv(loc.vp,false,new Float32Array(vp));for(const item of objects){if(!document.getElementById(item.group).checked)continue;gl.bindBuffer(gl.ARRAY_BUFFER,item.positions.value);gl.enableVertexAttribArray(loc.p);gl.vertexAttribPointer(loc.p,3,gl.FLOAT,false,0,0);gl.bindBuffer(gl.ARRAY_BUFFER,item.uv.value);gl.enableVertexAttribArray(loc.uv);gl.vertexAttribPointer(loc.uv,2,gl.FLOAT,false,0,0);const alpha=item.group==='streamlines'?Number(document.getElementById('opacity').value)/100:item.color[3];gl.uniform4f(loc.color,item.color[0],item.color[1],item.color[2],alpha);gl.uniform1i(loc.textured,item.texture?1:0);if(item.texture){gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,item.texture);gl.uniform1i(loc.image,0);}gl.drawArrays(item.mode,0,item.positions.count);}}
+let drag=null;canvas.addEventListener('contextmenu',event=>event.preventDefault());canvas.addEventListener('pointerdown',event=>{drag={x:event.clientX,y:event.clientY,button:event.button};canvas.setPointerCapture(event.pointerId);});canvas.addEventListener('pointerup',()=>drag=null);canvas.addEventListener('pointermove',event=>{if(!drag)return;const dx=event.clientX-drag.x,dy=event.clientY-drag.y;drag.x=event.clientX;drag.y=event.clientY;if(drag.button===0){yaw-=dx*.008;pitch=Math.max(-1.5,Math.min(1.5,pitch+dy*.008));}else{const scale=distance*.0015,right=[-Math.sin(yaw),Math.cos(yaw),0],up=normalize(cross(right,[Math.cos(pitch)*Math.cos(yaw),Math.cos(pitch)*Math.sin(yaw),Math.sin(pitch)]));for(let i=0;i<3;i++)target[i]+=(-dx*right[i]+dy*up[i])*scale;}draw();});canvas.addEventListener('wheel',event=>{event.preventDefault();distance*=Math.exp(event.deltaY*.001);distance=Math.max(distance,.01);draw();},{passive:false});['streamlines','rois','slices','opacity'].forEach(id=>document.getElementById(id).addEventListener('input',draw));window.addEventListener('resize',draw);draw();
+</script></body></html>"""

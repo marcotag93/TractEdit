@@ -9,15 +9,17 @@ and loading anatomical image files (NIfTI).
 # Imports
 # ============================================================================
 
-import os
+import hashlib
 import logging
+import os
+import zlib
 import numpy as np
 import nibabel as nib
 from scipy.ndimage import gaussian_filter
 import trx.trx_file_memmap as tbx
 import vtk
 from vtk.util import numpy_support
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QFileDialog,
     QMessageBox,
@@ -25,16 +27,224 @@ from PyQt6.QtWidgets import (
     QProgressDialog,
     QWidget,
 )
-from .utils import ColorMode
-from typing import Optional, List, Dict, Any, Tuple, Type, Union
+from .utils import ColorMode, write_vtk_polydata
+from .tractogram_metadata import (
+    add_vtk_metadata,
+    ensure_metadata_supported,
+    extract_vtk_metadata,
+)
+from .reference_grid import (
+    ReferenceGrid,
+    validate_affine as _validate_affine,
+    validate_volume_geometry as _validate_volume_geometry,
+)
+from .transactional_io import transactional_save
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Type, Union
+
+if TYPE_CHECKING:
+    from .data_contracts import AnatomicalImageLoadResult, StreamlineLoadResult
 
 logger = logging.getLogger(__name__)
 
 
-##TODO - This will be updated. Fury doesn't support memmap images
-# so to handle anatomical images in 3D main view we'll need to replace entirely Fury with VTK
-# We tried an hybrid approach by maintaining 2D high-res for 2D panels and downsampled images for the 3D view but it is messy
-# For now we avoid crashes with high-res images by downsampling both 3D and 2D views, in future we'll replace Fury with VTK
+def _register_background_worker(
+    main_window: Any,
+    worker_attr: str,
+    generation_attr: str,
+    worker: Any,
+) -> int:
+    """Register one owned worker and invalidate any preceding operation."""
+    previous = getattr(main_window, worker_attr, None)
+    if previous is not None and previous is not worker:
+        cancel = getattr(previous, "cancel", None)
+        if callable(cancel):
+            cancel()
+        progress_dialog = getattr(previous, "progress_dialog", None)
+        if progress_dialog is not None:
+            try:
+                progress_dialog.close()
+            except RuntimeError:
+                logger.debug("Previous worker progress dialog is already closed.")
+
+    generation = getattr(main_window, generation_attr, 0) + 1
+    setattr(main_window, generation_attr, generation)
+    setattr(main_window, worker_attr, worker)
+
+    workers = getattr(main_window, "_background_workers", None)
+    if workers is None:
+        workers = []
+        setattr(main_window, "_background_workers", workers)
+    workers.append(worker)
+    return generation
+
+
+def _worker_is_current(
+    main_window: Any,
+    worker_attr: str,
+    generation_attr: str,
+    worker: Any,
+    generation: int,
+) -> bool:
+    return (
+        getattr(main_window, worker_attr, None) is worker
+        and getattr(main_window, generation_attr, 0) == generation
+        and not getattr(worker, "is_cancelled", False)
+    )
+
+
+def _release_background_worker(
+    main_window: Any,
+    worker_attr: str,
+    worker: Any,
+) -> None:
+    workers = getattr(main_window, "_background_workers", None)
+    if workers is not None:
+        try:
+            workers.remove(worker)
+        except ValueError:
+            pass
+    if getattr(main_window, worker_attr, None) is worker:
+        setattr(main_window, worker_attr, None)
+    if hasattr(worker, "progress_dialog"):
+        progress_dialog = worker.progress_dialog
+        if progress_dialog is not None:
+            try:
+                progress_dialog.deleteLater()
+            except RuntimeError:
+                logger.debug("Worker progress dialog was already deleted.")
+        worker.progress_dialog = None
+
+
+def _release_finished_worker(
+    main_window: Any,
+    worker_attr: str,
+    worker: Any,
+) -> None:
+    if worker.has_pending_result:
+        return
+    if worker.isRunning():
+        QTimer.singleShot(
+            10,
+            lambda: _release_finished_worker(main_window, worker_attr, worker),
+        )
+        return
+    _release_background_worker(main_window, worker_attr, worker)
+
+
+def _release_deferred_trx_owners(main_window: Any) -> None:
+    deferred = getattr(main_window, "_deferred_trx_owners", [])
+    workers = getattr(main_window, "_background_workers", [])
+    remaining = []
+    for owner in deferred:
+        in_use = any(
+            getattr(worker, "trx_owner", None) is owner
+            and (
+                worker.isRunning()
+                or getattr(worker, "is_consuming_result", False)
+                or getattr(worker, "has_pending_result", False)
+            )
+            for worker in workers
+        )
+        if in_use:
+            remaining.append(owner)
+            continue
+        try:
+            owner.close()
+        except OSError:
+            logger.warning("Failed to close retired TRX owner.", exc_info=True)
+            remaining.append(owner)
+    main_window._deferred_trx_owners = remaining
+
+
+def _retire_trx_owner(main_window: Any, owner: Any) -> None:
+    if owner is None:
+        return
+    workers = getattr(main_window, "_background_workers", [])
+    users = [
+        worker for worker in workers if getattr(worker, "trx_owner", None) is owner
+    ]
+    for worker in users:
+        worker.cancel()
+        progress_dialog = getattr(worker, "progress_dialog", None)
+        if progress_dialog is not None:
+            try:
+                progress_dialog.close()
+            except RuntimeError:
+                logger.debug("Previous worker progress dialog is already closed.")
+    if any(
+        worker.isRunning()
+        or getattr(worker, "is_consuming_result", False)
+        or getattr(worker, "has_pending_result", False)
+        for worker in users
+    ):
+        deferred = getattr(main_window, "_deferred_trx_owners", None)
+        if deferred is None:
+            deferred = []
+            main_window._deferred_trx_owners = deferred
+        if not any(item is owner for item in deferred):
+            deferred.append(owner)
+        return
+    try:
+        owner.close()
+    except OSError:
+        logger.warning("Failed to close retired TRX owner.", exc_info=True)
+        deferred = getattr(main_window, "_deferred_trx_owners", None)
+        if deferred is None:
+            deferred = []
+            main_window._deferred_trx_owners = deferred
+        if not any(item is owner for item in deferred):
+            deferred.append(owner)
+
+
+_BUNDLE_STATE_ATTRIBUTES = (
+    "tractogram_data",
+    "_tractogram_data_version",
+    "streamline_bboxes",
+    "original_trk_header",
+    "original_trk_affine",
+    "original_trk_path",
+    "original_file_extension",
+    "tractogram_reference_grid",
+    "trx_file_reference",
+    "scalar_data_per_point",
+    "data_per_streamline",
+    "active_scalar_name",
+    "manual_visible_indices",
+    "visible_indices",
+    "_visibility_version",
+    "roi_states",
+    "roi_intersection_cache",
+    "roi_highlight_indices",
+    "selected_streamline_indices",
+    "_inversion_active",
+    "_inversion_keeper_indices",
+    "unified_undo_stack",
+    "unified_redo_stack",
+    "current_color_mode",
+    "_skip_user_disabled",
+    "render_stride",
+    "_last_visibility_version",
+    "_last_render_stride",
+    "_last_color_mode",
+    "_last_active_scalar",
+    "_last_tube_mode",
+    "_last_bundle_opacity",
+    "render_as_tubes",
+    "bundle_opacity",
+    "bundle_is_visible",
+    "scalar_min_val",
+    "scalar_max_val",
+    "scalar_data_min",
+    "scalar_data_max",
+    "scalar_range_initialized",
+    "anatomical_image_data",
+    "anatomical_image_affine",
+    "anatomical_image_path",
+    "anatomical_mmap_image",
+    "anatomical_reference_grid",
+    "image_is_visible",
+)
+
 
 # Auto-downsampling constants
 # 512³ (~134M voxels)
@@ -59,6 +269,151 @@ _MEDOID_DISTANCE_BATCH = 5000
 # thread.  The resampled array is (N, 100, 3) float64 ≈ 2.3 KB per streamline;
 # at 500k that's ~1.1 GB.
 CENTROID_MAX_STREAMLINES = 500_000
+
+
+def _legacy_medoid_sample_indices(count: int, sample_size: int) -> np.ndarray:
+    """Return the historical seeded sample without mutating global RNG state."""
+    random_state = np.random.RandomState(42)
+    return random_state.choice(count, sample_size, replace=False).astype(np.int64)
+
+
+def _historical_mdf_distance(
+    resampled: np.ndarray, first: int, second: int
+) -> float:
+    """Replay the former row kernel's arithmetic for one pair."""
+    points = resampled.shape[1]
+    direct = 0.0
+    for point in range(points):
+        dx = resampled[first, point, 0] - resampled[second, point, 0]
+        dy = resampled[first, point, 1] - resampled[second, point, 1]
+        dz = resampled[first, point, 2] - resampled[second, point, 2]
+        direct += np.sqrt(dx * dx + dy * dy + dz * dz)
+    direct /= points
+    flipped = 0.0
+    for point in range(points):
+        other = points - 1 - point
+        dx = resampled[first, point, 0] - resampled[second, other, 0]
+        dy = resampled[first, point, 1] - resampled[second, other, 1]
+        dz = resampled[first, point, 2] - resampled[second, other, 2]
+        flipped += np.sqrt(dx * dx + dy * dy + dz * dz)
+    flipped /= points
+    return direct if direct < flipped else flipped
+
+
+def _historical_mdf_row_total(
+    resampled: np.ndarray, row_index: int, sample_indices: Optional[np.ndarray]
+) -> float:
+    """Use one bounded row and NumPy's historical row reduction."""
+    columns = range(len(resampled)) if sample_indices is None else sample_indices
+    row = np.zeros(len(columns), dtype=np.float64)
+    for column_index, other in enumerate(columns):
+        other = int(other)
+        if row_index == other:
+            continue
+        first, second = (
+            (min(row_index, other), max(row_index, other))
+            if sample_indices is None
+            else (row_index, other)
+        )
+        row[column_index] = _historical_mdf_distance(resampled, first, second)
+    return float(np.sum(row))
+
+
+def _refine_historical_medoid_candidates(
+    resampled: np.ndarray,
+    totals: np.ndarray,
+    sample_indices: Optional[np.ndarray],
+    batch_size: int,
+    cancel_check: Optional[Callable[[], bool]],
+) -> Optional[np.ndarray]:
+    """Re-evaluate every row whose summation error could change the winner."""
+    if not len(totals) or not np.all(np.isfinite(totals)):
+        return totals
+    maximum = float(np.max(np.abs(totals)))
+    if maximum == 0:
+        return totals
+
+    # Both reductions sum nonnegative, identical pair distances. Gamma bounds
+    # each positive floating sum; the factor four covers both summation trees
+    # and the final merge of at most eight private worker arrays.
+    terms = (len(resampled) if sample_indices is None else len(sample_indices))
+    batches = (len(resampled) + batch_size - 1) // batch_size
+    additions = terms + batches + resampled.shape[1] + 40
+    unit_roundoff = np.finfo(np.float64).eps / 2
+    gamma = additions * unit_roundoff / (1 - additions * unit_roundoff)
+    radius = (4 * gamma + 16 * unit_roundoff) * maximum
+    candidates = np.flatnonzero(totals <= float(np.min(totals)) + 2 * radius)
+    if len(candidates) == 1:
+        return totals
+    run_start = None
+    refined_runs = {}
+    if len(candidates) > 16:
+        # Consecutive bit-identical streamlines have identical historical
+        # distance rows: every other index is on the same side of the run,
+        # and all within-run distances are zero. Reuse that exact row sum.
+        run_start = np.empty(len(resampled), dtype=np.int64)
+        first = 0
+        for index in range(len(resampled)):
+            if index and not np.array_equal(
+                resampled[index], resampled[index - 1]
+            ):
+                first = index
+            run_start[index] = first
+    for index in candidates:
+        if cancel_check is not None and cancel_check():
+            return None
+        representative = int(run_start[index]) if run_start is not None else int(index)
+        if representative not in refined_runs:
+            refined_runs[representative] = _historical_mdf_row_total(
+                resampled, representative, sample_indices
+            )
+        totals[index] = refined_runs[representative]
+    return totals
+
+
+def _compute_medoid_totals(
+    resampled: np.ndarray,
+    sample_indices: Optional[np.ndarray] = None,
+    batch_size: int = _MEDOID_DISTANCE_BATCH,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> Optional[np.ndarray]:
+    """Compute exact or sampled MDF row totals with bounded working memory."""
+    from tractedit_pkg._numba_aot import compute_sampled_mdf_totals_chunk
+    from tractedit_pkg._numba_aot._parallel_wrappers import (
+        accumulate_mdf_totals_range,
+        parallel_chunks_range,
+    )
+
+    resampled = np.ascontiguousarray(resampled, dtype=np.float64)
+    count = len(resampled)
+    totals = np.zeros(count, dtype=np.float64)
+    if batch_size < 1:
+        raise ValueError("Medoid batch size must be positive.")
+
+    if sample_indices is not None:
+        sample_indices = np.ascontiguousarray(sample_indices, dtype=np.int64)
+
+    for batch_start in range(0, count, batch_size):
+        if cancel_check is not None and cancel_check():
+            return None
+        batch_end = min(batch_start + batch_size, count)
+        if progress_callback is not None:
+            progress_callback(batch_start, count)
+        if sample_indices is None:
+            totals += accumulate_mdf_totals_range(resampled, batch_start, batch_end)
+        else:
+            parallel_chunks_range(
+                compute_sampled_mdf_totals_chunk,
+                batch_start,
+                batch_end,
+                resampled,
+                sample_indices,
+                totals,
+            )
+    return _refine_historical_medoid_candidates(
+        resampled, totals, sample_indices, batch_size, cancel_check
+    )
 
 
 # ============================================================================
@@ -190,10 +545,10 @@ def _canonicalize_image(
     so every voxel retains its original scanner-RAS position. Oblique rotation
     and shear are deliberately preserved for the rendering transform.
     """
-    from nibabel.funcs import as_closest_canonical
+    from .reference_grid import canonicalize_nifti
 
     original_orientation = nib.aff2axcodes(img.affine)
-    canonical = as_closest_canonical(img)
+    canonical = canonicalize_nifti(img)
     if nib.aff2axcodes(canonical.affine) != original_orientation:
         logger.info(
             "Image %s reoriented from %s to RAS+ without resampling.",
@@ -240,18 +595,18 @@ def _maybe_downsample_image(
     step = max(1, int(np.ceil(max(shape) / target_size)))
 
     if progress_callback:
-        progress_callback(40, "Loading original data...")
+        progress_callback(40, "Loading display samples...")
 
-    # Load the original data (kept in canonical RAS+ orientation)
-    original_data = img.get_fdata(dtype=np.float32)
     original_affine = img.affine.copy()
 
     if progress_callback:
         progress_callback(60, f"Downsampling with step={step}...")
 
-    # Downsample using striding first (fast operation)
-    # Without this, FURY/VTK will be extremely slow on the non-contiguous strided view
-    resampled_data = np.ascontiguousarray(original_data[::step, ::step, ::step])
+    source_proxy = img.dataobj
+    resampled_data = np.ascontiguousarray(
+        source_proxy[::step, ::step, ::step],
+        dtype=np.float32,
+    )
 
     if progress_callback:
         progress_callback(75, "Applying anti-aliasing filter...")
@@ -291,15 +646,67 @@ class StreamlineLoaderThread(QThread):
     progress = pyqtSignal(int, str)  # Signal to update progress bar (percent, message)
     finished = pyqtSignal(dict)  # Signal when loading is done
     error = pyqtSignal(str)  # Signal if an error occurs
+    done = pyqtSignal()
 
     def __init__(self, input_path: str) -> None:
         super().__init__()
         self.input_path = input_path
         self._cancelled: bool = False
+        self._trx_owner: Optional["tbx.TrxFile"] = None
+        self._result_published = False
+        self._result_pending = False
+        self.is_consuming_result = False
 
     def cancel(self) -> None:
         """Request cooperative cancellation of the loading operation."""
         self._cancelled = True
+
+    @property
+    def is_cancelled(self) -> bool:
+        """Return whether cancellation has been requested."""
+        return self._cancelled
+
+    @property
+    def has_pending_result(self) -> bool:
+        return self._result_pending
+
+    def complete_result(self) -> None:
+        self._result_pending = False
+        self.is_consuming_result = False
+
+    def begin_result(self) -> None:
+        self.is_consuming_result = True
+
+    def take_trx_owner(
+        self,
+        result: "StreamlineLoadResult",
+    ) -> Optional["tbx.TrxFile"]:
+        """Transfer the loaded TRX owner to the result consumer."""
+        owner = result.get("trx_obj")
+        if owner is None or owner is not self._trx_owner:
+            return None
+        self._trx_owner = None
+        return owner
+
+    def discard_result(self, result: "StreamlineLoadResult") -> None:
+        """Release resources held by an unpublished or rejected result."""
+        self.complete_result()
+        owner = self.take_trx_owner(result)
+        if owner is not None:
+            try:
+                owner.close()
+            except (OSError, RuntimeError, AttributeError):
+                logger.warning("Failed to close a rejected TRX result.")
+
+    def discard_pending_result(self) -> None:
+        """Release an emitted TRX result that was never consumed."""
+        self.complete_result()
+        if self._trx_owner is not None:
+            try:
+                self._trx_owner.close()
+            except (OSError, RuntimeError, AttributeError):
+                logger.warning("Failed to close a pending TRX result.")
+            self._trx_owner = None
 
     def run(self) -> None:
         try:
@@ -353,10 +760,9 @@ class StreamlineLoaderThread(QThread):
 
                 # Handle Affine
                 aff = np.identity(4)
-                if hasattr(tractogram_obj, "affine_to_rasmm"):
-                    temp_aff = tractogram_obj.affine_to_rasmm
-                    if isinstance(temp_aff, np.ndarray) and temp_aff.shape == (4, 4):
-                        aff = temp_aff
+                temp_aff = getattr(tractogram_obj, "affine_to_rasmm", None)
+                if temp_aff is not None:
+                    aff = np.asarray(temp_aff)
                 results["affine"] = aff
 
                 # Handle Scalars
@@ -372,30 +778,19 @@ class StreamlineLoaderThread(QThread):
                         active_scalar = list(scalars.keys())[0]
                 results["scalars"] = scalars
                 results["active_scalar"] = active_scalar
+                results["data_per_streamline"] = {
+                    key: np.asarray(values)
+                    for key, values in tractogram_obj.data_per_streamline.items()
+                }
 
-                # Geometry (BBox)
                 if self._cancelled:
                     return
                 self.progress.emit(70, "Finalizing...")
-                # Attempt fast AOT calc
-                if hasattr(loaded_streamlines, "_data") and hasattr(
-                    loaded_streamlines, "_offsets"
-                ):
-                    flat_data = loaded_streamlines._data
-                    offsets = loaded_streamlines._offsets
-                    lengths = loaded_streamlines._lengths
-                    results["bboxes"] = _compute_bboxes_numba(
-                        flat_data, offsets, lengths
-                    )
-                else:
-                    # Fallback slow calc
-                    bboxes = []
-                    for sl in loaded_streamlines:
-                        if len(sl) > 0:
-                            bboxes.append([np.min(sl, axis=0), np.max(sl, axis=0)])
-                        else:
-                            bboxes.append([np.zeros(3), np.zeros(3)])
-                    results["bboxes"] = np.array(bboxes, dtype=np.float32)
+                results["bboxes"] = _validate_and_compute_bboxes(
+                    loaded_streamlines,
+                    aff,
+                    scalars,
+                )
 
             elif ext in [".vtk", ".vtp"]:
                 self.progress.emit(10, "Reading VTK file...")
@@ -413,9 +808,7 @@ class StreamlineLoaderThread(QThread):
                     pct = 10 + int(caller.GetProgress() * 18)  # 0–1 → 10–28 %
                     self.progress.emit(pct, "Reading VTK file...")
 
-                observer_tag = reader.AddObserver(
-                    "ProgressEvent", _on_reader_progress
-                )
+                observer_tag = reader.AddObserver("ProgressEvent", _on_reader_progress)
                 reader.Update()
                 reader.RemoveObserver(observer_tag)
                 if self._cancelled:
@@ -433,6 +826,9 @@ class StreamlineLoaderThread(QThread):
                     points_data = np.empty((0, 3), dtype=np.float32)
 
                 vtk_lines = poly_data.GetLines()
+                offsets_arr = np.zeros(1, dtype=np.intp)
+                connectivity_arr = np.empty(0, dtype=np.intp)
+                lengths_arr = np.empty(0, dtype=np.intp)
 
                 if poly_data.GetNumberOfLines() == 0:
                     as_streamlines = nib.streamlines.ArraySequence()
@@ -465,60 +861,45 @@ class StreamlineLoaderThread(QThread):
 
                 # Handle Scalars (Point Data)
                 self.progress.emit(60, "Reading scalars...")
-                scalars = {}
-                point_data_vtk = poly_data.GetPointData()
-                n_arrays = point_data_vtk.GetNumberOfArrays()
-
-                for i in range(n_arrays):
-                    arr_name = point_data_vtk.GetArrayName(i)
-                    vtk_arr = point_data_vtk.GetArray(i)
-                    np_arr = numpy_support.vtk_to_numpy(vtk_arr)
-
-                    # Vectorised split using the same offsets as the coordinate array
-                    split_at = as_streamlines._offsets[1:]
-                    scalar_parts = np.split(np_arr, split_at)
-
-                    key = arr_name if arr_name else f"Scalar_{i}"
-                    scalars[key] = nib.streamlines.ArraySequence(scalar_parts)
+                scalars, data_per_streamline = extract_vtk_metadata(
+                    poly_data,
+                    connectivity_arr,
+                    offsets_arr.astype(np.intp, copy=False),
+                    lengths_arr,
+                )
 
                 results["scalars"] = scalars
                 results["active_scalar"] = list(scalars.keys())[0] if scalars else None
+                results["data_per_streamline"] = data_per_streamline
 
-                # Geometry (BBox)
                 if self._cancelled:
                     return
                 self.progress.emit(80, "Finalizing...")
-                try:
-                    results["bboxes"] = _compute_bboxes_numba(
-                        as_streamlines._data,
-                        as_streamlines._offsets,
-                        as_streamlines._lengths,
-                    )
-                except (ImportError, TypeError, ValueError):
-                    logger.debug("AOT bbox computation failed, using fallback.")
-                    bboxes = [
-                        (
-                            [np.min(sl, axis=0), np.max(sl, axis=0)]
-                            if len(sl) > 0
-                            else [np.zeros(3), np.zeros(3)]
-                        )
-                        for sl in as_streamlines
-                    ]
-                    results["bboxes"] = np.array(bboxes, dtype=np.float32)
+                results["bboxes"] = _validate_and_compute_bboxes(
+                    as_streamlines,
+                    aff,
+                    scalars,
+                )
 
             elif ext == ".trx":
                 self.progress.emit(10, "Loading TRX file...")
-                trx_obj = tbx.load(self.input_path)
+                try:
+                    trx_obj = tbx.load(self.input_path)
+                except (OSError, ValueError, TypeError, IndexError, MemoryError):
+                    raise
+                except Exception as exc:
+                    # TRX/ZIP parsers raise several exception types for invalid bytes.
+                    raise ValueError(f"Invalid TRX file: {exc}") from exc
+                self._trx_owner = trx_obj
                 results["trx_obj"] = trx_obj
                 results["streamlines"] = trx_obj.streamlines
                 results["header"] = trx_obj.header.copy()
 
                 # Affine
                 aff = np.identity(4)
-                if hasattr(trx_obj, "affine_to_rasmm"):
-                    temp_aff = trx_obj.affine_to_rasmm
-                    if isinstance(temp_aff, np.ndarray) and temp_aff.shape == (4, 4):
-                        aff = temp_aff
+                temp_aff = getattr(trx_obj, "affine_to_rasmm", None)
+                if temp_aff is not None:
+                    aff = np.asarray(temp_aff)
                 results["affine"] = aff
 
                 # Scalars (Basic check)
@@ -528,6 +909,11 @@ class StreamlineLoaderThread(QThread):
                     scalars.update(dpp)
                 results["scalars"] = scalars
                 results["active_scalar"] = list(scalars.keys())[0] if scalars else None
+                results["data_per_streamline"] = {
+                    key: values
+                    for key, values in trx_obj.data_per_streamline.items()
+                    if key != _TRX_BBOX_KEY
+                }
 
                 if self._cancelled:
                     return
@@ -538,9 +924,7 @@ class StreamlineLoaderThread(QThread):
                     hasattr(streamlines, "_data")
                     and streamlines._data.dtype != np.float32
                 ):
-                    streamlines._data = streamlines._data.astype(
-                        np.float32, copy=False
-                    )
+                    streamlines._data = streamlines._data.astype(np.float32, copy=False)
 
                 # Geometry - Bounding box calculation
                 # TRX streamlines are ArraySequence with _data, _offsets, _lengths
@@ -552,52 +936,48 @@ class StreamlineLoaderThread(QThread):
 
                 # Phase 1 optimisation: try loading cached bboxes from
                 # TRX data_per_streamline before recomputing from scratch.
-                cached_bboxes = _try_load_cached_bboxes(
-                    trx_obj, n_streamlines
+                cached_bboxes = _try_load_cached_bboxes(trx_obj, n_streamlines)
+
+                results["bboxes"] = _validate_and_compute_bboxes(
+                    streamlines,
+                    aff,
+                    scalars,
+                    cached_bboxes=cached_bboxes,
                 )
 
-                if cached_bboxes is not None:
-                    results["bboxes"] = cached_bboxes
-                elif (
-                    hasattr(streamlines, "_data")
-                    and hasattr(streamlines, "_offsets")
-                    and hasattr(streamlines, "_lengths")
-                ):
-                    # Fast path: AOT-optimized computation
-                    results["bboxes"] = _compute_bboxes_numba(
-                        streamlines._data,
-                        streamlines._offsets,
-                        streamlines._lengths,
-                    )
-                else:
-                    # Fallback for unexpected data structures
-                    bboxes = []
-                    for sl in streamlines:
-                        if len(sl) > 0:
-                            bboxes.append(
-                                [np.min(sl, axis=0), np.max(sl, axis=0)]
-                            )
-                        else:
-                            bboxes.append([np.zeros(3), np.zeros(3)])
-                    results["bboxes"] = np.array(
-                        bboxes, dtype=np.float32
-                    )
-
             else:
+                self._result_pending = True
                 self.error.emit(f"Unsupported file format: {ext}")
                 return
 
             if self._cancelled:
                 return
 
+            reference_grid = ReferenceGrid.from_header(
+                results["header"],
+                provenance=f"bundle:{ext}",
+            )
+            results["reference_grid"] = reference_grid
+
             # Emit 99 % (not 100 %) so that QProgressDialog's autoClose does
             # not fire here.  The dialog will be closed by on_finished() only
             # after the actor build and first VTK render have completed.
             self.progress.emit(99, "Building visualization...")
+            self._result_published = True
+            self._result_pending = True
             self.finished.emit(results)
 
         except (OSError, ValueError, TypeError, IndexError, MemoryError) as e:
+            self._result_pending = True
             self.error.emit(str(e))
+        finally:
+            if not self._result_published and self._trx_owner is not None:
+                try:
+                    self._trx_owner.close()
+                except OSError:
+                    logger.debug("Failed to close an unpublished TRX result.")
+                self._trx_owner = None
+            self.done.emit()
 
 
 class MedoidCalculationThread(QThread):
@@ -615,19 +995,45 @@ class MedoidCalculationThread(QThread):
         self.streamlines = streamlines
         self.nb_points = nb_points
         self._cancelled = False
+        self._result_pending = False
+        self.is_consuming_result = False
 
     def cancel(self):
         """Request cancellation of the computation."""
         self._cancelled = True
 
+    @property
+    def is_cancelled(self) -> bool:
+        """Return whether cancellation has been requested."""
+        return self._cancelled
+
+    @property
+    def has_pending_result(self) -> bool:
+        return self._result_pending
+
+    def begin_result(self) -> None:
+        self.is_consuming_result = True
+
+    def complete_result(self) -> None:
+        self._result_pending = False
+        self.is_consuming_result = False
+
+    def _publish_result(self, index: int) -> None:
+        self._result_pending = True
+        self.result_ready.emit(index)
+
+    def _publish_error(self, message: str) -> None:
+        self._result_pending = True
+        self.error.emit(message)
+
     def run(self):
         try:
             n = len(self.streamlines)
             if n == 0:
-                self.result_ready.emit(-1)
+                self._publish_result(-1)
                 return
             if n == 1:
-                self.result_ready.emit(0)
+                self._publish_result(0)
                 return
 
             # Prepare data for batch processing (0-10%)
@@ -640,7 +1046,7 @@ class MedoidCalculationThread(QThread):
             lengths = np.ascontiguousarray(as_streamlines._lengths.astype(np.int64))
 
             if self._cancelled:
-                self.result_ready.emit(-1)
+                self._publish_result(-1)
                 return
 
             # Batch Resampling with parallel Numba (10-40%)
@@ -650,100 +1056,52 @@ class MedoidCalculationThread(QThread):
             )
 
             if self._cancelled:
-                self.result_ready.emit(-1)
+                self._publish_result(-1)
                 return
 
-            # Import AOT kernels and batched parallel dispatcher
-            from tractedit_pkg._numba_aot import (
-                compute_distances_chunk as _distances_kernel,
-                compute_mdf_rows_chunk as _mdf_rows_kernel,
-            )
-            from tractedit_pkg._numba_aot._parallel_wrappers import (
-                parallel_chunks_range,
-            )
-
-            batch = _MEDOID_DISTANCE_BATCH
-
-            # Distance Computation (40-90%)
-            # For large bundles, use sampling-based approximate medoid
+            sample_indices = None
             if n > MEDOID_SAMPLING_THRESHOLD:
-                # Approximate medoid using random sampling
                 sample_size = min(MEDOID_SAMPLE_SIZE, n // 3)
                 self.progress.emit(
                     40,
                     f"Computing distances (sampling {sample_size} of {n})...",
                 )
+                sample_indices = _legacy_medoid_sample_indices(n, sample_size)
+            else:
+                self.progress.emit(40, "Computing distance matrix...")
 
-                # Generate random sample indices
-                np.random.seed(42)  # Reproducible results
-                sample_indices = np.random.choice(n, sample_size, replace=False).astype(
-                    np.int64
+            def report_progress(batch_start, total):
+                percent = 40 + int(45 * batch_start / total)
+                self.progress.emit(
+                    percent,
+                    f"Computing distances ({batch_start:,}/{total:,})...",
                 )
 
-                if self._cancelled:
-                    self.result_ready.emit(-1)
-                    return
+            total_dists = _compute_medoid_totals(
+                resampled,
+                sample_indices=sample_indices,
+                cancel_check=lambda: self._cancelled,
+                progress_callback=report_progress,
+            )
+            if total_dists is None:
+                self._publish_result(-1)
+                return
 
-                # Batched distance computation with cancellation checkpoints
-                distances = np.zeros((n, sample_size), dtype=np.float64)
-                for batch_start in range(0, n, batch):
-                    if self._cancelled:
-                        self.result_ready.emit(-1)
-                        return
-                    batch_end = min(batch_start + batch, n)
-                    pct = 40 + int(45 * batch_start / n)
-                    self.progress.emit(
-                        pct,
-                        f"Computing distances ({batch_start:,}/{n:,})...",
-                    )
-                    parallel_chunks_range(
-                        _distances_kernel,
-                        batch_start,
-                        batch_end,
-                        resampled,
-                        sample_indices,
-                        distances,
-                    )
-
-                # Sum distances to find approximate medoid
-                self.progress.emit(85, "Finding approximate medoid...")
-                total_dists = np.sum(distances, axis=1)
-
-            else:
-                # Exact medoid for smaller bundles
-                self.progress.emit(40, "Computing distance matrix...")
-                dist_matrix = np.zeros((n, n), dtype=np.float64)
-
-                # Batched row computation with cancellation checkpoints
-                for batch_start in range(0, n, batch):
-                    if self._cancelled:
-                        self.result_ready.emit(-1)
-                        return
-                    batch_end = min(batch_start + batch, n)
-                    pct = 40 + int(45 * batch_start / n)
-                    self.progress.emit(
-                        pct,
-                        f"Computing distances ({batch_start:,}/{n:,})...",
-                    )
-                    parallel_chunks_range(
-                        _mdf_rows_kernel,
-                        batch_start,
-                        batch_end,
-                        resampled,
-                        dist_matrix,
-                    )
-
-                self.progress.emit(85, "Finding medoid...")
-                total_dists = np.sum(dist_matrix, axis=1)
+            status = (
+                "Finding approximate medoid..."
+                if sample_indices is not None
+                else "Finding medoid..."
+            )
+            self.progress.emit(85, status)
 
             # Find Medoid (85-100%)
             medoid_idx = int(np.argmin(total_dists))
 
             self.progress.emit(100, "Done")
-            self.result_ready.emit(medoid_idx)
+            self._publish_result(medoid_idx)
 
         except (ValueError, IndexError, TypeError, MemoryError) as e:
-            self.error.emit(str(e))
+            self._publish_error(str(e))
 
 
 class AnatomicalImageLoaderThread(QThread):
@@ -754,21 +1112,88 @@ class AnatomicalImageLoaderThread(QThread):
     progress = pyqtSignal(int, str)  # Signal to update progress bar (percent, message)
     finished = pyqtSignal(dict)  # Signal when loading is done
     error = pyqtSignal(str)  # Signal if an error occurs
+    done = pyqtSignal()
 
     def __init__(self, input_path: str):
         super().__init__()
         self.input_path = input_path
+        self._cancelled = False
+        self._result: Optional["AnatomicalImageLoadResult"] = None
+        self._result_pending = False
+        self.is_consuming_result = False
+
+    def cancel(self) -> None:
+        """Request cooperative cancellation of the image load."""
+        self._cancelled = True
+
+    @property
+    def is_cancelled(self) -> bool:
+        """Return whether cancellation has been requested."""
+        return self._cancelled
+
+    @property
+    def has_pending_result(self) -> bool:
+        return self._result_pending
+
+    def complete_result(self) -> None:
+        self._result_pending = False
+        self.is_consuming_result = False
+
+    def begin_result(self) -> None:
+        self.is_consuming_result = True
+
+    def take_result(
+        self,
+        result: "AnatomicalImageLoadResult",
+    ) -> Optional["AnatomicalImageLoadResult"]:
+        """Transfer an image result to its GUI consumer."""
+        if result is not self._result:
+            return None
+        self._result = None
+        return result
+
+    def discard_result(self, result: "AnatomicalImageLoadResult") -> None:
+        """Release an image result rejected by its GUI consumer."""
+        self.complete_result()
+        owned_result = self.take_result(result)
+        if owned_result is not None:
+            mmap_image = owned_result.get("mmap_image")
+            if mmap_image is not None:
+                try:
+                    mmap_image.clear_cache()
+                except (OSError, RuntimeError, AttributeError):
+                    logger.warning("Failed to clear a rejected image result.")
+
+    def discard_pending_result(self) -> None:
+        """Release an emitted image result that was never consumed."""
+        self.complete_result()
+        if self._result is not None:
+            mmap_image = self._result.get("mmap_image")
+            if mmap_image is not None:
+                try:
+                    mmap_image.clear_cache()
+                except (OSError, RuntimeError, AttributeError):
+                    logger.warning("Failed to clear a pending image result.")
+            self._result = None
 
     def run(self):
+        mmap_image = None
+        published = False
         try:
             self.progress.emit(10, "Loading NIfTI header...")
 
             # Load the NIfTI file (lazy - data not loaded yet)
             img = nib.load(self.input_path)
+            if self._cancelled:
+                return
+
+            _validate_volume_geometry(img.dataobj, img.affine, "Anatomical image")
 
             img = _canonicalize_image(
                 img, self.input_path, lambda msg: self.progress.emit(15, msg)
             )
+            if self._cancelled:
+                return
 
             # Get file size estimate for progress feedback
             header = img.header
@@ -790,47 +1215,63 @@ class AnatomicalImageLoaderThread(QThread):
             image_data, image_affine, was_downsampled = _maybe_downsample_image(
                 img, progress_callback
             )
+            if self._cancelled:
+                return
+            reference_grid = ReferenceGrid.from_nifti(
+                img,
+                provenance=f"anatomical:{self.input_path}",
+            )
 
             self.progress.emit(85, "Creating memory-mapped accessor...")
 
             # Create memory-mapped image for full-resolution 2D slicing
             mmap_image = MemoryMappedImage(img)
+            if self._cancelled:
+                return
 
             self.progress.emit(90, "Validating...")
 
-            # Basic validation
-            if image_data.ndim < 3:
-                self.error.emit(
-                    f"Loaded image has only {image_data.ndim} dimensions, expected 3 or more."
-                )
-                return
-            if image_affine.shape != (4, 4):
-                self.error.emit(
-                    f"Loaded image affine has shape {image_affine.shape}, expected (4, 4)."
-                )
-                return
+            _validate_volume_geometry(
+                image_data,
+                image_affine,
+                "Anatomical image",
+            )
 
             status_msg = "Done"
             if was_downsampled:
                 status_msg = f"Done (downsampled to {image_data.shape[0]}×{image_data.shape[1]}×{image_data.shape[2]})"
 
             self.progress.emit(100, status_msg)
-            self.finished.emit(
-                {
-                    "data": image_data,
-                    "affine": image_affine,
-                    "path": self.input_path,
-                    "was_downsampled": was_downsampled,
-                    "mmap_image": mmap_image,
-                }
-            )
+            if self._cancelled:
+                return
+            self._result = {
+                "data": image_data,
+                "affine": image_affine,
+                "path": self.input_path,
+                "was_downsampled": was_downsampled,
+                "mmap_image": mmap_image,
+                "reference_grid": reference_grid,
+            }
+            self._result_pending = True
+            self.finished.emit(self._result)
+            published = True
 
         except FileNotFoundError:
+            self._result_pending = True
             self.error.emit(f"File not found: {self.input_path}")
         except nib.filebasedimages.ImageFileError as e:
+            self._result_pending = True
             self.error.emit(f"Invalid NIfTI file: {e}")
         except (OSError, ValueError, MemoryError) as e:
+            self._result_pending = True
             self.error.emit(f"Error loading image: {type(e).__name__}: {e}")
+        finally:
+            if not published and mmap_image is not None:
+                try:
+                    mmap_image.clear_cache()
+                except (OSError, AttributeError):
+                    logger.debug("Failed to clear an unpublished image accessor.")
+            self.done.emit()
 
 
 # ============================================================================
@@ -841,10 +1282,132 @@ class AnatomicalImageLoaderThread(QThread):
 # _compute_bboxes_numba — AOT chunk + ThreadPool wrapper
 from tractedit_pkg._numba_aot._parallel_wrappers import (
     compute_bboxes as _compute_bboxes_numba,
+    compute_bboxes_prevalidated as _compute_bboxes_prevalidated,
+    validate_streamlines as _validate_streamlines_numba,
 )
 
-# Key used to store/retrieve cached bounding boxes inside TRX files.
+
+def _packed_streamline_arrays(
+    streamlines: Any,
+) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    from .input_validation import packed_streamline_arrays
+
+    return packed_streamline_arrays(streamlines)
+
+
+def _array_is_finite(array: np.ndarray, block_bytes: int = 4 * 1024 * 1024) -> bool:
+    from .input_validation import array_is_finite
+
+    return array_is_finite(array, block_bytes)
+
+
+def _validate_scalar_data(
+    scalar_data: Dict[str, Any],
+    streamline_lengths: np.ndarray,
+) -> None:
+    for name, sequence in scalar_data.items():
+        if len(sequence) != len(streamline_lengths):
+            raise ValueError(
+                f"Scalar {name!r} has {len(sequence)} streamlines; "
+                f"expected {len(streamline_lengths)}."
+            )
+        scalar_lengths = getattr(sequence, "_lengths", None)
+        if scalar_lengths is not None and not np.array_equal(
+            np.asarray(scalar_lengths, dtype=np.int64), streamline_lengths
+        ):
+            raise ValueError(f"Scalar {name!r} does not match streamline lengths.")
+        values = getattr(sequence, "_data", None)
+        if values is not None:
+            if not _array_is_finite(np.asarray(values)):
+                raise ValueError(f"Scalar {name!r} contains non-finite values.")
+            continue
+        for index, item in enumerate(sequence):
+            array = np.asarray(item)
+            if len(array) != streamline_lengths[index]:
+                raise ValueError(
+                    f"Scalar {name!r} does not match streamline {index}."
+                )
+            if not _array_is_finite(array):
+                raise ValueError(f"Scalar {name!r} contains non-finite values.")
+
+
+def _validate_and_compute_bboxes(
+    streamlines: Any,
+    affine: np.ndarray,
+    scalar_data: Dict[str, Any],
+    cached_bboxes: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Validate one loaded tractogram and return authoritative bounding boxes."""
+    _validate_affine(affine, "Tractogram")
+    packed = _packed_streamline_arrays(streamlines)
+    if packed is None:
+        bboxes = []
+        lengths = []
+        for index, streamline in enumerate(streamlines):
+            coordinates = np.asarray(streamline)
+            if coordinates.ndim != 2 or coordinates.shape[1] != 3:
+                raise ValueError(
+                    f"Streamline {index} must have shape (N, 3), "
+                    f"got {coordinates.shape}."
+                )
+            if len(coordinates) == 0:
+                raise ValueError(f"Tractogram contains an empty streamline at index {index}.")
+            if len(coordinates) == 1:
+                raise ValueError(
+                    f"Tractogram contains a single-point streamline at index {index}."
+                )
+            if not _array_is_finite(coordinates):
+                raise ValueError(
+                    f"Tractogram contains non-finite coordinates at index {index}."
+                )
+            minimum = np.min(coordinates, axis=0)
+            maximum = np.max(coordinates, axis=0)
+            bboxes.append([minimum, maximum])
+            lengths.append(len(coordinates))
+        _validate_scalar_data(scalar_data, np.asarray(lengths, dtype=np.int64))
+        return np.asarray(bboxes, dtype=np.float32)
+
+    data, offsets, lengths = packed
+    _validate_scalar_data(scalar_data, lengths)
+    if cached_bboxes is None:
+        bboxes = _compute_bboxes_prevalidated(
+            data,
+            offsets,
+            lengths,
+        )
+        nonfinite = np.flatnonzero(~np.all(np.isfinite(bboxes), axis=(1, 2)))
+        if nonfinite.size:
+            raise ValueError(
+                "Tractogram contains non-finite coordinates at index "
+                f"{nonfinite[0]}."
+            )
+        return bboxes
+
+    status = _validate_streamlines_numba(
+        data,
+        offsets,
+        lengths,
+        _validated=True,
+    )
+    nonfinite = np.flatnonzero(status == 1)
+    if nonfinite.size:
+        raise ValueError(
+            f"Tractogram contains non-finite coordinates at index {nonfinite[0]}."
+        )
+    return cached_bboxes
+
 _TRX_BBOX_KEY = "_tractedit_bboxes"
+_TRX_BBOX_CACHE_VERSION = 1
+_TRX_BBOX_CACHE_VERSION_KEY = "TRACTEDIT_BBOX_CACHE_VERSION"
+_TRX_BBOX_CACHE_DIGEST_KEY = "TRACTEDIT_BBOX_CACHE_DIGEST"
+_TRX_BBOX_GEOMETRY_DIGEST_KEY = "TRACTEDIT_BBOX_GEOMETRY_SAMPLE_DIGEST"
+_TRX_BBOX_SAMPLE_STREAMLINES = 64
+_TRX_BBOX_SAMPLE_POINTS = 16
+_TRX_BBOX_HEADER_KEYS = (
+    _TRX_BBOX_CACHE_VERSION_KEY,
+    _TRX_BBOX_CACHE_DIGEST_KEY,
+    _TRX_BBOX_GEOMETRY_DIGEST_KEY,
+)
 
 
 # ============================================================================
@@ -852,9 +1415,65 @@ _TRX_BBOX_KEY = "_tractedit_bboxes"
 # ============================================================================
 
 
+def _sample_indices(count: int, limit: int) -> np.ndarray:
+    if count <= 0:
+        return np.empty(0, dtype=np.int64)
+    if count <= limit:
+        return np.arange(count, dtype=np.int64)
+    return np.linspace(0, count - 1, num=limit, dtype=np.int64)
+
+
+def _bbox_cache_digest(flat_bboxes: np.ndarray) -> str:
+    canonical = np.ascontiguousarray(flat_bboxes, dtype="<f4")
+    checksum = zlib.crc32(np.asarray(canonical.shape, dtype="<u8").tobytes())
+    checksum = zlib.crc32(canonical, checksum)
+    return f"{checksum:08x}"
+
+
+def _bbox_geometry_sample_digest(
+    streamlines: Any,
+    n_streamlines: int,
+) -> Optional[str]:
+    if streamlines is None or len(streamlines) != n_streamlines:
+        return None
+
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(np.asarray([n_streamlines], dtype="<u8").tobytes())
+    streamline_indices = _sample_indices(
+        n_streamlines,
+        _TRX_BBOX_SAMPLE_STREAMLINES,
+    )
+    for streamline_index in streamline_indices:
+        points = np.asarray(streamlines[int(streamline_index)])
+        if points.ndim != 2 or points.shape[1] != 3:
+            return None
+        point_indices = _sample_indices(len(points), _TRX_BBOX_SAMPLE_POINTS)
+        digest.update(
+            np.asarray(
+                [int(streamline_index), len(points)],
+                dtype="<u8",
+            ).tobytes()
+        )
+        digest.update(np.asarray(point_indices, dtype="<u8").tobytes())
+        digest.update(np.ascontiguousarray(points[point_indices], dtype="<f4"))
+    return digest.hexdigest()
+
+
+def _discard_cached_bboxes(trx_obj: "tbx.TrxFile") -> None:
+    data_per_streamline = getattr(trx_obj, "data_per_streamline", None)
+    if data_per_streamline is not None:
+        data_per_streamline.pop(_TRX_BBOX_KEY, None)
+    header = getattr(trx_obj, "header", None)
+    if header is not None:
+        for key in _TRX_BBOX_HEADER_KEYS:
+            header.pop(key, None)
+
+
 def _try_load_cached_bboxes(
     trx_obj: "tbx.TrxFile",
     n_streamlines: int,
+    *,
+    validate_geometry: bool = False,
 ) -> Optional[np.ndarray]:
     """
     Attempt to load cached bounding boxes from a TRX file's
@@ -867,6 +1486,8 @@ def _try_load_cached_bboxes(
     Args:
         trx_obj: The loaded TRX file object (memmap-backed).
         n_streamlines: Expected number of streamlines for shape validation.
+        validate_geometry: Recompute every bounding box and require exact
+            equality. The default keeps the bounded cache-hit path.
 
     Returns:
         Bounding boxes as ``np.ndarray`` of shape ``(N, 2, 3)``
@@ -876,6 +1497,16 @@ def _try_load_cached_bboxes(
     try:
         dps = getattr(trx_obj, "data_per_streamline", None)
         if dps is None or _TRX_BBOX_KEY not in dps:
+            return None
+
+        header = getattr(trx_obj, "header", None)
+        if (
+            header is None
+            or header.get(_TRX_BBOX_CACHE_VERSION_KEY) != _TRX_BBOX_CACHE_VERSION
+        ):
+            logger.warning(
+                "TRX bbox cache: unsupported or missing schema, recomputing."
+            )
             return None
 
         raw = dps[_TRX_BBOX_KEY]
@@ -895,8 +1526,52 @@ def _try_load_cached_bboxes(
             )
             return None
 
-        # Reshape from flat (N, 6) → (N, 2, 3) expected by the app
-        cached = np.asarray(raw, dtype=np.float32).reshape(-1, 2, 3)
+        if not np.issubdtype(raw.dtype, np.number):
+            logger.warning("TRX bbox cache: nonnumeric data, recomputing.")
+            return None
+
+        flat = np.ascontiguousarray(raw, dtype=np.float32)
+        cached = flat.reshape(-1, 2, 3)
+        if not np.all(np.isfinite(cached)):
+            logger.warning("TRX bbox cache: nonfinite bounds, recomputing.")
+            return None
+        if not np.all(cached[:, 0] <= cached[:, 1]):
+            logger.warning("TRX bbox cache: inverted bounds, recomputing.")
+            return None
+
+        expected_cache_digest = header.get(_TRX_BBOX_CACHE_DIGEST_KEY)
+        if (
+            not isinstance(expected_cache_digest, str)
+            or _bbox_cache_digest(flat) != expected_cache_digest
+        ):
+            logger.warning("TRX bbox cache: payload provenance mismatch, recomputing.")
+            return None
+
+        expected_geometry_digest = header.get(_TRX_BBOX_GEOMETRY_DIGEST_KEY)
+        geometry_digest = _bbox_geometry_sample_digest(
+            getattr(trx_obj, "streamlines", None),
+            n_streamlines,
+        )
+        if (
+            not isinstance(expected_geometry_digest, str)
+            or geometry_digest != expected_geometry_digest
+        ):
+            logger.warning("TRX bbox cache: geometry provenance mismatch, recomputing.")
+            return None
+
+        if validate_geometry:
+            streamlines = trx_obj.streamlines
+            computed = _compute_bboxes_numba(
+                streamlines._data,
+                streamlines._offsets,
+                streamlines._lengths,
+            )
+            if not np.array_equal(cached, computed):
+                logger.warning(
+                    "TRX bbox cache: full geometry validation failed, recomputing."
+                )
+                return None
+
         logger.info(
             "TRX: loaded cached bounding boxes from "
             "data_per_streamline (%d streamlines, skipped computation).",
@@ -904,10 +1579,8 @@ def _try_load_cached_bboxes(
         )
         return cached
 
-    except (ValueError, KeyError, TypeError, IndexError) as exc:
-        logger.warning(
-            "TRX bbox cache: failed to read (%s), recomputing.", exc
-        )
+    except (AttributeError, ValueError, KeyError, TypeError, IndexError) as exc:
+        logger.warning("TRX bbox cache: failed to read (%s), recomputing.", exc)
         return None
 
 
@@ -930,14 +1603,31 @@ def _embed_cached_bboxes(
         return
 
     try:
-        flat = bboxes.reshape(-1, 6).astype(np.float32)
+        streamlines = getattr(trx_obj, "streamlines", None)
+        n_streamlines = len(streamlines) if streamlines is not None else -1
+        if bboxes.shape != (n_streamlines, 2, 3):
+            raise ValueError(f"expected ({n_streamlines}, 2, 3), got {bboxes.shape}")
+        flat = np.ascontiguousarray(bboxes.reshape(-1, 6), dtype=np.float32)
+        cached = flat.reshape(-1, 2, 3)
+        if not np.all(np.isfinite(cached)) or not np.all(cached[:, 0] <= cached[:, 1]):
+            raise ValueError("bounding boxes must be finite and ordered")
+        geometry_digest = _bbox_geometry_sample_digest(streamlines, n_streamlines)
+        if geometry_digest is None:
+            raise ValueError("streamline geometry is unavailable")
+        header = getattr(trx_obj, "header", None)
+        if header is None:
+            raise ValueError("TRX header is unavailable")
+
         trx_obj.data_per_streamline[_TRX_BBOX_KEY] = flat
+        header[_TRX_BBOX_CACHE_VERSION_KEY] = _TRX_BBOX_CACHE_VERSION
+        header[_TRX_BBOX_CACHE_DIGEST_KEY] = _bbox_cache_digest(flat)
+        header[_TRX_BBOX_GEOMETRY_DIGEST_KEY] = geometry_digest
         logger.debug(
             "TRX: embedded cached bounding boxes (%d streamlines).",
             flat.shape[0],
         )
-    except (ValueError, TypeError, IndexError) as exc:
-        # Non-fatal: saving continues without the cache.
+    except (AttributeError, ValueError, TypeError, IndexError) as exc:
+        _discard_cached_bboxes(trx_obj)
         logger.warning(
             "TRX: failed to embed cached bboxes (%s). "
             "Saving continues without bbox cache.",
@@ -958,10 +1648,7 @@ def _extract_visible_bboxes(main_window: Any) -> Optional[np.ndarray]:
     Returns:
         Bounding boxes array or ``None``.
     """
-    if (
-        main_window.streamline_bboxes is None
-        or not main_window.visible_indices
-    ):
+    if main_window.streamline_bboxes is None or not main_window.visible_indices:
         return None
 
     indices = sorted(main_window.visible_indices)
@@ -983,8 +1670,8 @@ def _save_trx_native(
     Save a TRX file using the native trx-python API.
 
     Uses ``TrxFile.select(copy_safe=True)`` to extract visible streamlines
-    without Python-level iteration, then embeds cached bounding boxes
-    as ``data_per_streamline`` before saving.
+    without Python-level iteration, retains intersecting source groups, then
+    embeds cached bounding boxes as ``data_per_streamline`` before saving.
 
     Parameters
     ----------
@@ -1018,31 +1705,40 @@ def _save_trx_native(
         len(trx_source.streamlines),
     )
 
-    trx_subset = trx_source.select(
-        indices_arr, keep_group=False, copy_safe=True
-    )
+    keep_groups = bool(getattr(trx_source, "groups", None))
+    trx_subset = None
+    try:
+        trx_subset = trx_source.select(
+            indices_arr, keep_group=keep_groups, copy_safe=True
+        )
 
-    # Embed cached bboxes for fast reload (Phase 1 integration)
-    if bboxes is not None:
-        try:
-            saved_bboxes = bboxes[indices_arr]  # (M, 2, 3)
-            _embed_cached_bboxes(trx_subset, saved_bboxes)
-        except (ValueError, IndexError, TypeError) as exc:
-            # Non-fatal: continue saving without bbox cache
-            logger.warning(
-                "TRX native save: failed to embed bboxes (%s). "
-                "Saving continues without bbox cache.",
-                exc,
-            )
+        if bboxes is not None:
+            try:
+                saved_bboxes = bboxes[indices_arr]
+                _embed_cached_bboxes(trx_subset, saved_bboxes)
+            except (ValueError, IndexError, TypeError) as exc:
+                logger.warning(
+                    "TRX native save: failed to embed bboxes (%s). "
+                    "Saving continues without bbox cache.",
+                    exc,
+                )
+        else:
+            _discard_cached_bboxes(trx_subset)
 
-    tbx.save(trx_subset, output_path)
+        transactional_save(
+            output_path,
+            lambda staged_path: tbx.save(trx_subset, staged_path),
+        )
+    finally:
+        if trx_subset is not None:
+            close = getattr(trx_subset, "close", None)
+            if callable(close):
+                close()
     logger.info(
         "File saved successfully (TRX, native path): %s",
         os.path.basename(output_path),
     )
-    return (
-        f"File saved successfully (TRX): {os.path.basename(output_path)}"
-    )
+    return f"File saved successfully (TRX): {os.path.basename(output_path)}"
 
 
 # ============================================================================
@@ -1129,7 +1825,6 @@ def _process_existing_sequence(data: Any, dtype: Type, length_req: Any) -> Any:
     return data
 
 
-
 def _validate_length(
     data: tuple, expected: Optional[Union[int, Tuple[int, ...]]], original: Any
 ) -> Any:
@@ -1206,17 +1901,6 @@ def _compute_centroid_math(
     return _compute_centroid_numba(resampled)
 
 
-# _compute_mdf_distance_matrix — AOT chunk + ThreadPool wrapper
-from tractedit_pkg._numba_aot._parallel_wrappers import (
-    compute_mdf_distance_matrix as _compute_mdf_distance_matrix,
-)
-
-# _compute_distances_to_samples — AOT chunk + ThreadPool wrapper
-from tractedit_pkg._numba_aot._parallel_wrappers import (
-    compute_distances_to_samples as _compute_distances_to_samples,
-)
-
-
 def _finalize_statistic_save(
     main_window: Any, result_streamline: np.ndarray, method: str
 ) -> None:
@@ -1256,9 +1940,13 @@ def _finalize_statistic_save(
 
         # Save Logic
         header = {}
+        reference_grid = _main_window_reference_grid(main_window)
         if out_ext.lower() == ".trk":
             header = _prepare_trk_header(
-                main_window.original_trk_header, 1, main_window.anatomical_image_affine
+                main_window.original_trk_header,
+                1,
+                main_window.anatomical_image_affine,
+                reference_grid=reference_grid,
             )
         elif out_ext.lower() == ".tck":
             header = _prepare_tck_header(main_window.original_trk_header, 1)
@@ -1267,6 +1955,7 @@ def _finalize_statistic_save(
                 main_window.original_trk_header,
                 1,
                 anatomical_img_affine=main_window.anatomical_image_affine,
+                reference_grid=reference_grid,
             )
 
         _save_tractogram_file(new_tractogram, header, output_path, out_ext.lower())
@@ -1323,7 +2012,10 @@ def calculate_and_save_statistic(main_window: Any, method: str) -> None:
         return
 
     # Safety Check for Centroid
-    if method == "centroid" and len(main_window.visible_indices) > CENTROID_MAX_STREAMLINES:
+    if (
+        method == "centroid"
+        and len(main_window.visible_indices) > CENTROID_MAX_STREAMLINES
+    ):
         QMessageBox.warning(
             main_window,
             "Safety Warning",
@@ -1363,38 +2055,91 @@ def calculate_and_save_statistic(main_window: Any, method: str) -> None:
 
         # Create Thread
         thread = MedoidCalculationThread(visible_streamlines)
-        main_window._medoid_thread = thread  # Keep reference
+        thread.trx_owner = getattr(main_window, "trx_file_reference", None)
+        thread.progress_dialog = progress
+        generation = _register_background_worker(
+            main_window,
+            "_medoid_thread",
+            "_medoid_generation",
+            thread,
+        )
 
         def on_progress(val, msg):
-            if not progress.wasCanceled():
+            if (
+                _worker_is_current(
+                    main_window,
+                    "_medoid_thread",
+                    "_medoid_generation",
+                    thread,
+                    generation,
+                )
+                and not progress.wasCanceled()
+            ):
                 progress.setValue(val)
                 progress.setLabelText(msg)
 
         def on_result(idx):
-            progress.close()
-            if idx == -1:
-                status_updater("Medoid calculation cancelled.")
-            else:
-                result_streamline = visible_streamlines[idx]
-                _finalize_statistic_save(main_window, result_streamline, method)
+            if not _worker_is_current(
+                main_window,
+                "_medoid_thread",
+                "_medoid_generation",
+                thread,
+                generation,
+            ):
+                progress.close()
+                visible_streamlines.clear()
+                thread.complete_result()
+                _release_finished_worker(main_window, "_medoid_thread", thread)
+                QTimer.singleShot(0, lambda: _release_deferred_trx_owners(main_window))
+                return
+            thread.begin_result()
+            try:
+                progress.close()
+                if idx == -1:
+                    status_updater("Medoid calculation cancelled.")
+                else:
+                    result_streamline = visible_streamlines[idx]
+                    _finalize_statistic_save(main_window, result_streamline, method)
+            finally:
+                result_streamline = None
+                visible_streamlines.clear()
+                thread.complete_result()
+                _release_finished_worker(main_window, "_medoid_thread", thread)
+                QTimer.singleShot(0, lambda: _release_deferred_trx_owners(main_window))
 
         def on_error(msg):
-            progress.close()
-            QMessageBox.critical(
-                main_window, "Error", f"Medoid calculation failed:\n{msg}"
-            )
+            if not _worker_is_current(
+                main_window,
+                "_medoid_thread",
+                "_medoid_generation",
+                thread,
+                generation,
+            ):
+                progress.close()
+                visible_streamlines.clear()
+                thread.complete_result()
+                _release_finished_worker(main_window, "_medoid_thread", thread)
+                QTimer.singleShot(0, lambda: _release_deferred_trx_owners(main_window))
+                return
+            thread.begin_result()
+            try:
+                progress.close()
+                QMessageBox.critical(
+                    main_window, "Error", f"Medoid calculation failed:\n{msg}"
+                )
+            finally:
+                visible_streamlines.clear()
+                thread.complete_result()
+                _release_finished_worker(main_window, "_medoid_thread", thread)
+                QTimer.singleShot(0, lambda: _release_deferred_trx_owners(main_window))
 
         def on_thread_finished():
             """Clean up after QThread has fully stopped."""
-            t = getattr(main_window, "_medoid_thread", None)
-            if t is not None:
-                t.wait()
-                del main_window._medoid_thread
+            _release_finished_worker(main_window, "_medoid_thread", thread)
+            _release_deferred_trx_owners(main_window)
 
         thread.progress.connect(on_progress)
-        thread.result_ready.connect(
-            on_result, type=Qt.ConnectionType.QueuedConnection
-        )
+        thread.result_ready.connect(on_result, type=Qt.ConnectionType.QueuedConnection)
         thread.error.connect(on_error)
         # QThread's built-in finished fires after run() has fully exited
         thread.finished.connect(
@@ -1520,6 +2265,8 @@ def load_anatomical_image(
         # Load NIfTI (lazy - data not loaded yet)
         img = nib.load(input_path)
 
+        _validate_volume_geometry(img.dataobj, img.affine, "Anatomical image")
+
         img = _canonicalize_image(img, input_path, status_updater)
 
         # Use auto-downsampling for large images
@@ -1528,15 +2275,7 @@ def load_anatomical_image(
         # Create memory-mapped accessor for full-resolution 2D slicing
         mmap_image = MemoryMappedImage(img)
 
-        # Basic validation
-        if image_data.ndim < 3:
-            raise ValueError(
-                f"Loaded image has only {image_data.ndim} dimensions, expected 3 or more."
-            )
-        if image_affine.shape != (4, 4):
-            raise ValueError(
-                f"Loaded image affine has shape {image_affine.shape}, expected (4, 4)."
-            )
+        _validate_volume_geometry(image_data, image_affine, "Anatomical image")
 
         if was_downsampled:
             status_updater(
@@ -1629,52 +2368,16 @@ def load_roi_images(
         try:
             img = nib.load(input_path)
 
+            _validate_volume_geometry(img.dataobj, img.affine, "ROI")
+
             img = _canonicalize_image(img, input_path, status_updater)
 
-            image_data_raw = img.get_fdata()
+            # Apply proxy scaling exactly once, retaining the effective dtype.
+            # Own a writable array for editing; never round or narrow values.
+            image_data = np.asarray(img.dataobj).copy()
             image_affine = img.affine
 
-            # Preserve data integrity while optimizing memory
-            is_integer_data = np.allclose(image_data_raw, np.round(image_data_raw))
-
-            if is_integer_data:
-                # Round to handle floating point artifacts (e.g., 1.9999999 -> 2)
-                image_data_rounded = np.round(image_data_raw)
-                min_val = image_data_rounded.min()
-                max_val = image_data_rounded.max()
-
-                # Choose smallest appropriate integer type
-                if min_val >= 0 and max_val <= 255:
-                    image_data = image_data_rounded.astype(np.uint8)
-                elif min_val >= 0 and max_val <= 65535:
-                    image_data = image_data_rounded.astype(np.uint16)
-                elif min_val >= -32768 and max_val <= 32767:
-                    image_data = image_data_rounded.astype(np.int16)
-                else:
-                    image_data = image_data_rounded.astype(np.int32)
-
-                logger.debug(
-                    f"ROI '{os.path.basename(input_path)}' loaded as {image_data.dtype} "
-                    f"(range: {min_val:.0f} to {max_val:.0f})"
-                )
-            else:
-                # Preserve floating point for probability maps, partial volume estimates, etc.
-                image_data = image_data_raw.astype(np.float32)
-                logger.debug(
-                    f"ROI '{os.path.basename(input_path)}' loaded as float32 "
-                    f"(contains non-integer values, range: {image_data_raw.min():.4f} to {image_data_raw.max():.4f})"
-                )
-
-            if image_data.ndim < 3:
-                logger.warning(
-                    f"Skipping {os.path.basename(input_path)}: Has {image_data.ndim} dims, expected 3+."
-                )
-                continue
-            if image_affine.shape != (4, 4):
-                logger.warning(
-                    f"Skipping {os.path.basename(input_path)}: Invalid affine shape."
-                )
-                continue
+            _validate_volume_geometry(image_data, image_affine, "ROI")
 
             loaded_rois.append((image_data, image_affine, input_path))
             status_updater(f"Successfully loaded ROI: {os.path.basename(input_path)}")
@@ -1713,10 +2416,6 @@ def load_streamlines_file(
         )
     if not input_path:
         return
-
-    # Close existing bundle to clean up state
-    if main_window.tractogram_data:
-        main_window._close_bundle(keep_image=keep_image)
 
     # Setup Progress Dialog (Modal)
     progress = QProgressDialog("Initializing...", "Cancel", 0, 100, main_window)
@@ -1773,30 +2472,136 @@ def load_streamlines_file(
 
     # Create and Configure Thread
     loader_thread = StreamlineLoaderThread(input_path)
+    loader_thread.progress_dialog = progress
+    generation = _register_background_worker(
+        main_window,
+        "_loader_thread",
+        "_bundle_load_generation",
+        loader_thread,
+    )
+    completed = False
 
     def on_progress(val, msg):
+        if not _worker_is_current(
+            main_window,
+            "_loader_thread",
+            "_bundle_load_generation",
+            loader_thread,
+            generation,
+        ):
+            return
         progress.setValue(val)
         progress.setLabelText(msg)
 
     def on_error(msg):
-        progress.cancel()
+        nonlocal completed
+        if not _worker_is_current(
+            main_window,
+            "_loader_thread",
+            "_bundle_load_generation",
+            loader_thread,
+            generation,
+        ):
+            progress.close()
+            loader_thread.complete_result()
+            _release_finished_worker(main_window, "_loader_thread", loader_thread)
+            return
+        completed = True
+        loader_thread.begin_result()
+        progress.close()
         QMessageBox.critical(main_window, "Load Error", f"Error loading file:\n{msg}")
+        loader_thread.complete_result()
+        _release_finished_worker(main_window, "_loader_thread", loader_thread)
 
-    def on_finished(data):
+    def on_finished(data: "StreamlineLoadResult") -> None:
+        nonlocal completed
+        if completed or not _worker_is_current(
+            main_window,
+            "_loader_thread",
+            "_bundle_load_generation",
+            loader_thread,
+            generation,
+        ):
+            progress.close()
+            loader_thread.discard_result(data)
+            _release_finished_worker(main_window, "_loader_thread", loader_thread)
+            return
+
+        completed = True
+        loader_thread.begin_result()
+        new_trx_owner = loader_thread.take_trx_owner(data)
+        streamlines = data.get("streamlines")
+        if streamlines is None or len(streamlines) == 0:
+            if new_trx_owner is not None:
+                try:
+                    new_trx_owner.close()
+                except (OSError, RuntimeError, AttributeError):
+                    logger.warning("Failed to close an empty TRX result.")
+            progress.close()
+            QMessageBox.information(
+                main_window, "Load Info", "No streamlines found in file."
+            )
+            loader_thread.complete_result()
+            _release_finished_worker(main_window, "_loader_thread", loader_thread)
+            return
+
+        previous_state = {
+            name: getattr(main_window, name)
+            for name in _BUNDLE_STATE_ATTRIBUTES
+            if hasattr(main_window, name)
+        }
+        previous_trx_owner = previous_state.get("trx_file_reference")
+        previous_image = previous_state.get("anatomical_image_data")
+        old_mmap = previous_state.get("anatomical_mmap_image")
+        action_state = {}
+        for action_name in (
+            "color_default_action",
+            "color_orientation_action",
+            "color_scalar_action",
+        ):
+            action = getattr(main_window, action_name, None)
+            if action is not None:
+                action_state[action_name] = action.isChecked()
+        skip_state = {}
+        skip_checkbox = getattr(main_window, "skip_checkbox", None)
+        if skip_checkbox is not None:
+            skip_state["checked"] = skip_checkbox.isChecked()
+        skip_spinbox = getattr(main_window, "skip_spinbox", None)
+        if skip_spinbox is not None:
+            skip_state["enabled"] = skip_spinbox.isEnabled()
+            skip_state["value"] = skip_spinbox.value()
+        clear_image = (
+            not keep_image
+            and previous_state.get("tractogram_data") is not None
+            and previous_image is not None
+        )
+        committed = False
         try:
+            if clear_image:
+                main_window.anatomical_image_data = None
+                main_window.anatomical_image_affine = None
+                main_window.anatomical_image_path = None
+                main_window.anatomical_mmap_image = None
+                main_window.anatomical_reference_grid = None
+                main_window.image_is_visible = True
+                main_window.vtk_panel.clear_anatomical_slices()
+
             # Apply Data to MainWindow
-            main_window.tractogram_data = data["streamlines"]
+            main_window.tractogram_data = streamlines
+            main_window._tractogram_data_version = (
+                getattr(main_window, "_tractogram_data_version", 0) + 1
+            )
             main_window.streamline_bboxes = data["bboxes"]
 
             main_window.original_trk_header = data["header"]
             main_window.original_trk_affine = data["affine"]
             main_window.original_trk_path = data["path"]
             main_window.original_file_extension = data["ext"]
+            main_window.tractogram_reference_grid = data.get("reference_grid")
 
-            # Close any previously open TRX file before assigning the new one
-            main_window._close_trx_file()
-            main_window.trx_file_reference = data.get("trx_obj", None)
+            main_window.trx_file_reference = new_trx_owner
             main_window.scalar_data_per_point = data["scalars"]
+            main_window.data_per_streamline = data["data_per_streamline"]
             main_window.active_scalar_name = data["active_scalar"]
 
             # Initialize Logic State
@@ -1818,14 +2623,12 @@ def load_streamlines_file(
             main_window.unified_undo_stack = []
             main_window.unified_redo_stack = []
             main_window.current_color_mode = ColorMode.ORIENTATION
-
-            # Check for empty file
-            if not main_window.tractogram_data or len(main_window.tractogram_data) == 0:
-                QMessageBox.information(
-                    main_window, "Load Info", "No streamlines found in file."
-                )
-                main_window._close_bundle()
-                return
+            if hasattr(main_window, "bundle_is_visible"):
+                main_window.bundle_is_visible = True
+            if hasattr(main_window, "render_as_tubes"):
+                main_window.render_as_tubes = False
+            if hasattr(main_window, "scalar_range_initialized"):
+                main_window.scalar_range_initialized = False
 
             # Auto Skip Calculation
             should_render = True
@@ -1834,38 +2637,154 @@ def load_streamlines_file(
                 main_window._skip_user_disabled = False
                 main_window._auto_calculate_skip_level()
                 should_render = False
+            if loader_thread.is_cancelled:
+                raise RuntimeError("Bundle load cancelled.")
 
             # Finalize UI + first VTK render
-            status_msg = f"Loaded {len(main_window.tractogram_data)} streamlines from {os.path.basename(data['path'])}"
-            _update_vtk_and_ui_after_load(main_window, status_msg, render=should_render)
-
-            # Close the progress dialog only after the actor is built and the scene has been rendered
-            progress.setValue(100)
-
-        except (OSError, ValueError, TypeError, AttributeError, IndexError) as e:
-            progress.setValue(100)  # Ensure the dialog always closes on error
-            logger.error(f"Error in on_finished: {e}", exc_info=True)
-            QMessageBox.critical(
-                main_window, "Load Error", f"Error finalizing load:\n{e}"
+            status_msg = (
+                f"Loaded {len(main_window.tractogram_data)} streamlines from "
+                f"{os.path.basename(data['path'])}"
             )
-            # Attempt to cleanup if possible
-            if hasattr(main_window, "_close_bundle"):
-                # Don't recurse if close bundle fails — intentionally broad
+            _update_vtk_and_ui_after_load(main_window, status_msg, render=should_render)
+            main_window.vtk_panel.update_highlight()
+            if loader_thread.is_cancelled:
+                raise RuntimeError("Bundle load cancelled.")
+
+            progress.setValue(100)
+            committed = True
+        except Exception as e:
+            # Restore authoritative state before any UI or VTK recovery, which
+            # can itself allocate or fail during an out-of-memory condition.
+            for name, value in previous_state.items():
+                setattr(main_window, name, value)
+            logger.error("Error in on_finished: %s", e, exc_info=True)
+            try:
+                progress.close()
+            except Exception:
+                logger.debug("Failed to close rejected bundle progress dialog.")
+            for action_name, checked in action_state.items():
                 try:
-                    main_window._close_bundle(keep_image=True)
+                    action = getattr(main_window, action_name)
+                    was_blocked = action.blockSignals(True)
+                    try:
+                        action.setChecked(checked)
+                    finally:
+                        action.blockSignals(was_blocked)
                 except Exception:
-                    logger.debug("Cleanup after load failure also failed.")
+                    logger.debug("Failed to restore bundle action %s.", action_name)
+            if skip_checkbox is not None:
+                try:
+                    was_blocked = skip_checkbox.blockSignals(True)
+                    try:
+                        skip_checkbox.setChecked(skip_state["checked"])
+                    finally:
+                        skip_checkbox.blockSignals(was_blocked)
+                except Exception:
+                    logger.debug("Failed to restore bundle skip checkbox.")
+            if skip_spinbox is not None:
+                try:
+                    was_blocked = skip_spinbox.blockSignals(True)
+                    try:
+                        skip_spinbox.setEnabled(skip_state["enabled"])
+                        skip_spinbox.setValue(skip_state["value"])
+                    finally:
+                        skip_spinbox.blockSignals(was_blocked)
+                except Exception:
+                    logger.debug("Failed to restore bundle skip level.")
+            if getattr(main_window, "vtk_panel", None):
+                if clear_image:
+                    try:
+                        main_window.vtk_panel.update_anatomical_slices()
+                    except Exception:
+                        logger.debug("Failed to restore the previous image actor.")
+                try:
+                    main_window.vtk_panel.update_main_streamlines_actor(force=True)
+                except Exception:
+                    logger.debug("Failed to restore the previous bundle actor.")
+                try:
+                    main_window.vtk_panel.update_highlight()
+                except Exception:
+                    logger.debug("Failed to restore the previous highlight actor.")
+                if previous_state.get("_inversion_active", False):
+                    try:
+                        main_window.vtk_panel.update_invert_contour()
+                    except Exception:
+                        logger.debug("Failed to restore the inversion contour.")
+            for update_name in (
+                "_update_bundle_info_display",
+                "_update_action_states",
+                "_update_data_panel_display",
+            ):
+                update = getattr(main_window, update_name, None)
+                if callable(update):
+                    try:
+                        update()
+                    except Exception:
+                        logger.debug("Failed to refresh previous bundle UI.")
+            if not loader_thread.is_cancelled:
+                try:
+                    QMessageBox.critical(
+                        main_window, "Load Error", f"Error finalizing load:\n{e}"
+                    )
+                except Exception:
+                    logger.debug("Failed to display bundle load error.")
+        finally:
+            # Ownership was transferred out of the loader. Rejected results
+            # must be disposed even if a secondary rollback operation fails.
+            try:
+                if (
+                    not committed
+                    and new_trx_owner is not None
+                    and new_trx_owner is not previous_trx_owner
+                ):
+                    try:
+                        new_trx_owner.close()
+                    except Exception:
+                        logger.warning("Failed to close rejected TRX replacement.")
+            finally:
+                loader_thread.complete_result()
+                _release_finished_worker(main_window, "_loader_thread", loader_thread)
+
+        if committed:
+            if previous_trx_owner is not new_trx_owner:
+                try:
+                    _retire_trx_owner(main_window, previous_trx_owner)
+                except (OSError, RuntimeError, AttributeError):
+                    logger.warning("Failed to retire the previous TRX owner.")
+            if clear_image and old_mmap is not None:
+                try:
+                    old_mmap.clear_cache()
+                except (OSError, AttributeError):
+                    logger.warning("Failed to clear the previous image cache.")
+            if previous_state.get("tractogram_data") is not None:
+                remove_odf = getattr(main_window, "_remove_odf_data", None)
+                if (
+                    callable(remove_odf)
+                    and getattr(main_window, "odf_data", None) is not None
+                ):
+                    try:
+                        remove_odf()
+                    except (OSError, RuntimeError, ValueError, AttributeError):
+                        logger.warning("Failed to reset the previous ODF view.")
+            try:
+                if hasattr(main_window, "geo_lines_action"):
+                    main_window.geo_lines_action.setChecked(True)
+                scalar_toolbar = getattr(main_window, "scalar_toolbar", None)
+                if scalar_toolbar is not None:
+                    scalar_toolbar.setVisible(False)
+            except (RuntimeError, AttributeError):
+                logger.warning("Failed to reset the previous bundle controls.")
+
+    def on_done():
+        _release_finished_worker(main_window, "_loader_thread", loader_thread)
 
     # Connect Signals
     loader_thread.progress.connect(on_progress)
     loader_thread.error.connect(on_error)
-    loader_thread.finished.connect(
-        on_finished, type=Qt.ConnectionType.QueuedConnection
-    )
+    loader_thread.finished.connect(on_finished, type=Qt.ConnectionType.QueuedConnection)
     progress.canceled.connect(loader_thread.cancel)
-
-    # Keep reference
-    main_window._loader_thread = loader_thread
+    if hasattr(loader_thread, "done"):
+        loader_thread.done.connect(on_done, type=Qt.ConnectionType.QueuedConnection)
 
     # Start
     loader_thread.start()
@@ -1999,10 +2918,11 @@ def _get_save_path_and_extension(
 def _prepare_tractogram_and_affine(main_window: Any) -> nib.streamlines.Tractogram:
     """Prepares the Tractogram object and validates the affine matrix."""
     tractogram = main_window.tractogram_data
-    indices_to_save = sorted(list(main_window.visible_indices))
+    indices_to_save = sorted(main_window.visible_indices)
+    indices_array = np.asarray(indices_to_save, dtype=np.intp)
+    streamline_count = len(tractogram)
 
-    # Create a generator for the streamlines to save
-    streamlines_to_save_gen = (tractogram[i] for i in indices_to_save)
+    streamlines_to_save = [tractogram[index] for index in indices_to_save]
 
     affine_matrix = main_window.original_trk_affine
 
@@ -2010,33 +2930,72 @@ def _prepare_tractogram_and_affine(main_window: Any) -> nib.streamlines.Tractogr
         logger.warning(f"Warning: Affine matrix invalid. Using identity.")
         affine_matrix = np.identity(4)
 
-    # Handle potential scalar data
     data_per_point_to_save = {}
     if main_window.scalar_data_per_point:
-        try:
-            for key, scalar_sequence in main_window.scalar_data_per_point.items():
-                # Use the same generator logic to get scalars for visible indices
-                scalars_for_key_gen = (scalar_sequence[i] for i in indices_to_save)
-                data_per_point_to_save[key] = list(scalars_for_key_gen)
-        except (ValueError, IndexError, KeyError, TypeError) as e:
-            logger.warning(
-                f"Warning: Could not filter scalar data for saving. Saving without scalars. Error: {e}"
-            )
-            data_per_point_to_save = {}
+        for key, scalar_sequence in main_window.scalar_data_per_point.items():
+            if len(scalar_sequence) != streamline_count:
+                raise ValueError(
+                    f"Per-point metadata field '{key}' has "
+                    f"{len(scalar_sequence)} items; expected {streamline_count}."
+                )
+            selected_scalars = [scalar_sequence[index] for index in indices_to_save]
+            if any(
+                len(values) != len(streamline)
+                for values, streamline in zip(
+                    selected_scalars, streamlines_to_save, strict=True
+                )
+            ):
+                raise ValueError(
+                    f"Per-point metadata field '{key}' does not match point counts."
+                )
+            data_per_point_to_save[key] = selected_scalars
 
-    # Use Nibabel's Tractogram object as a generic container
+    data_per_streamline_to_save = {}
+    source_data_per_streamline = getattr(main_window, "data_per_streamline", None)
+    if source_data_per_streamline:
+        for key, values in source_data_per_streamline.items():
+            array = np.asarray(values)
+            if array.ndim not in (1, 2) or len(array) != streamline_count:
+                raise ValueError(
+                    f"Per-streamline metadata field '{key}' has invalid shape "
+                    f"{array.shape}; expected {streamline_count} items."
+                )
+            data_per_streamline_to_save[key] = array[indices_array]
+
     new_tractogram = nib.streamlines.Tractogram(
-        list(streamlines_to_save_gen),
+        streamlines_to_save,
         data_per_point=data_per_point_to_save if data_per_point_to_save else None,
+        data_per_streamline=(
+            data_per_streamline_to_save if data_per_streamline_to_save else None
+        ),
         affine_to_rasmm=affine_matrix,
     )
     return new_tractogram
+
+
+def _main_window_reference_grid(main_window: Any) -> Optional[ReferenceGrid]:
+    reference_grid = getattr(main_window, "anatomical_reference_grid", None)
+    if reference_grid is not None:
+        return reference_grid
+    reference_grid = getattr(main_window, "tractogram_reference_grid", None)
+    if reference_grid is not None:
+        return reference_grid
+    bboxes = getattr(main_window, "streamline_bboxes", None)
+    if bboxes is None or len(bboxes) == 0:
+        return None
+    return ReferenceGrid.from_bounds(
+        np.min(bboxes[:, 0], axis=0),
+        np.max(bboxes[:, 1], axis=0),
+        affine=getattr(main_window, "original_trk_affine", None),
+        provenance="synthetic:bundle-bounds",
+    )
 
 
 def _prepare_trk_header(
     base_header: Dict[str, Any],
     nb_streamlines: int,
     anatomical_img_affine: Optional[np.ndarray] = None,
+    reference_grid: Optional[ReferenceGrid] = None,
 ) -> Dict[str, Any]:
     """
     Prepares and validates the header dictionary for TRK saving.
@@ -2044,6 +3003,10 @@ def _prepare_trk_header(
     anatomical_img_affine, otherwise defaults to 'RAS'.
     """
     header = base_header.copy()
+    source_grid = ReferenceGrid.from_header(header, provenance="tractogram-header")
+    selected_grid = source_grid or reference_grid
+    if selected_grid is not None:
+        header.update(selected_grid.header_fields())
     logger.info("Preparing TRK header for saving...")
     if anatomical_img_affine is not None:
         logger.debug(f"Anatomical affine provided. Type: {type(anatomical_img_affine)}")
@@ -2265,12 +3228,17 @@ def _prepare_trx_header(
     base_header: Optional[Dict[str, Any]],
     nb_streamlines: int,
     anatomical_img_affine: Optional[np.ndarray] = None,
+    reference_grid: Optional[ReferenceGrid] = None,
 ) -> Dict[str, Any]:
     """
     Prepares the header dictionary for TRX saving.
     Ensures essential reference fields (affine, dimensions) are present.
     """
     header = base_header.copy() if base_header is not None else {}
+    source_grid = ReferenceGrid.from_header(header, provenance="tractogram-header")
+    selected_grid = source_grid or reference_grid
+    if selected_grid is not None:
+        header.update(selected_grid.header_fields())
     header["nb_streamlines"] = nb_streamlines
 
     # Clean up TCK specific
@@ -2339,7 +3307,9 @@ def _prepare_trx_header(
                     nib.affines.voxel_sizes(anatomical_img_affine)
                 )
             except (ValueError, np.linalg.LinAlgError):
-                logger.debug("Failed to compute voxel sizes from affine, using default.")
+                logger.debug(
+                    "Failed to compute voxel sizes from affine, using default."
+                )
                 header["voxel_sizes"] = (1.0, 1.0, 1.0)
         else:
             header["voxel_sizes"] = (1.0, 1.0, 1.0)
@@ -2416,18 +3386,7 @@ def _create_vtk_polydata_from_tractogram(
     cell_array.SetCells(n_streamlines, vtk_ids)
     poly_data.SetLines(cell_array)
 
-    # Add Scalars (Point Data)
-    if tractogram.data_per_point:
-        for key, seq in tractogram.data_per_point.items():
-            # Flatten
-            if hasattr(seq, "_data"):
-                flat_scalar = seq._data
-            else:
-                flat_scalar = np.concatenate(seq)
-
-            vtk_arr = numpy_support.numpy_to_vtk(flat_scalar, deep=True)
-            vtk_arr.SetName(key)
-            poly_data.GetPointData().AddArray(vtk_arr)
+    add_vtk_metadata(poly_data, tractogram)
 
     return poly_data
 
@@ -2438,6 +3397,8 @@ def _save_tractogram_file(
     output_path: str,
     file_ext: str,
     bboxes_to_embed: Optional[np.ndarray] = None,
+    *,
+    _transactional: bool = True,
 ) -> str:
     """
     Saves the tractogram using nibabel or trx-python based on the extension.
@@ -2454,6 +3415,30 @@ def _save_tractogram_file(
     Returns:
         Success message string.
     """
+    ensure_metadata_supported(
+        file_ext,
+        tractogram.data_per_point,
+        tractogram.data_per_streamline,
+    )
+
+    if _transactional:
+        transactional_save(
+            output_path,
+            lambda staged_path: _save_tractogram_file(
+                tractogram,
+                header,
+                staged_path,
+                file_ext,
+                bboxes_to_embed=bboxes_to_embed,
+                _transactional=False,
+            ),
+        )
+        format_name = file_ext.removeprefix(".").upper()
+        return (
+            f"File saved successfully ({format_name}): "
+            f"{os.path.basename(output_path)}"
+        )
+
     if file_ext == ".trk":
         trk_file = nib.streamlines.TrkFile(tractogram, header=header)
         nib.streamlines.save(trk_file, output_path)
@@ -2467,34 +3452,42 @@ def _save_tractogram_file(
         return f"File saved successfully (TCK): {os.path.basename(output_path)}"
 
     elif file_ext == ".trx":
-        # Create a valid reference object (Nifti1Image) for TRX
-        # TRX requires a reference that defines the space (affine, dimensions)
-        affine = header.get("voxel_to_rasmm", np.eye(4))
-        dimensions = header.get("dimensions", (1, 1, 1))
-        voxel_sizes = header.get("voxel_sizes", (1.0, 1.0, 1.0))
-
-        # Create a dummy Nifti header
-        nifti_header = nib.Nifti1Header()
-        nifti_header.set_data_shape(dimensions)
-        nifti_header.set_zooms(voxel_sizes)
-        nifti_header.set_qform(affine)
-        nifti_header.set_sform(affine)
-
-        # Create dummy image (empty data, just for reference)
-        dummy_data = np.empty(dimensions, dtype=np.int8)
-        reference_img = nib.Nifti1Image(dummy_data, affine, header=nifti_header)
-
-        # Create TRX object using the valid reference
-        trx_obj_to_save = tbx.TrxFile.from_lazy_tractogram(
-            tractogram, reference_img
+        reference_grid = ReferenceGrid.from_header(
+            header,
+            provenance="trx-save-header",
+        )
+        if reference_grid is None:
+            dimensions = header.get("dimensions", (1, 1, 1))
+            affine = header.get("voxel_to_rasmm", np.eye(4))
+            reference_grid = ReferenceGrid(
+                affine=affine,
+                shape=dimensions,
+                provenance="synthetic:trx-save-fallback",
+            )
+        streamlines = tractogram.streamlines
+        if hasattr(streamlines, "_data"):
+            nb_vertices = len(streamlines._data)
+        else:
+            nb_vertices = sum(len(streamline) for streamline in streamlines)
+        trx_reference = reference_grid.trx_reference(
+            nb_vertices=nb_vertices,
+            nb_streamlines=len(streamlines),
         )
 
-        # Phase 1 optimisation: embed cached bounding boxes so that
-        # subsequent loads can skip the bbox computation step entirely.
-        _embed_cached_bboxes(trx_obj_to_save, bboxes_to_embed)
+        trx_obj_to_save = None
+        try:
+            trx_obj_to_save = tbx.TrxFile.from_lazy_tractogram(
+                tractogram,
+                trx_reference,
+            )
 
-        # Save the newly created object using tbx.save()
-        tbx.save(trx_obj_to_save, output_path)
+            _embed_cached_bboxes(trx_obj_to_save, bboxes_to_embed)
+            tbx.save(trx_obj_to_save, output_path)
+        finally:
+            if trx_obj_to_save is not None:
+                close = getattr(trx_obj_to_save, "close", None)
+                if callable(close):
+                    close()
         logger.info("File saved successfully (TRX)")
         return f"File saved successfully (TRX): {os.path.basename(output_path)}"
 
@@ -2515,6 +3508,7 @@ def _save_tractogram_file(
             temp_tractogram = nib.streamlines.Tractogram(
                 streamlines_world,
                 data_per_point=tractogram.data_per_point,
+                data_per_streamline=tractogram.data_per_streamline,
                 affine_to_rasmm=np.eye(4),
             )
             poly_data = _create_vtk_polydata_from_tractogram(temp_tractogram)
@@ -2529,9 +3523,7 @@ def _save_tractogram_file(
             writer = vtk.vtkPolyDataWriter()
             writer.SetFileTypeToBinary()
 
-        writer.SetFileName(output_path)
-        writer.SetInputData(poly_data)
-        writer.Write()
+        write_vtk_polydata(writer, poly_data, output_path)
 
         logger.info(f"File saved successfully ({file_ext.upper()})")
         return f"File saved successfully ({file_ext.upper()}): {os.path.basename(output_path)}"
@@ -2561,6 +3553,22 @@ def save_streamlines_file(main_window: Any) -> None:
         status_updater("Save cancelled.")
         return
 
+    trx_source = main_window.trx_file_reference
+    source_groups = getattr(trx_source, "groups", None)
+    source_data_per_group = getattr(trx_source, "data_per_group", None)
+    try:
+        ensure_metadata_supported(
+            output_ext,
+            main_window.scalar_data_per_point,
+            getattr(main_window, "data_per_streamline", None),
+            source_groups,
+            source_data_per_group,
+        )
+    except ValueError as exc:
+        QMessageBox.critical(main_window, "Save Error", str(exc))
+        status_updater(f"Error saving file: {os.path.basename(output_path)}")
+        return
+
     # Prepare Data
     status_updater(
         f"Saving {len(main_window.visible_indices)} streamlines to: {os.path.basename(output_path)}..."
@@ -2570,25 +3578,33 @@ def save_streamlines_file(main_window: Any) -> None:
     # ------------------------------------------------------------------
     # Phase 2: TRX-native fast path
     # ------------------------------------------------------------------
-    if output_ext == ".trx" and main_window.trx_file_reference is not None:
+    if output_ext == ".trx" and trx_source is not None:
         try:
             success_msg = _save_trx_native(
-                trx_source=main_window.trx_file_reference,
+                trx_source=trx_source,
                 visible_indices=main_window.visible_indices,
                 bboxes=main_window.streamline_bboxes,
                 output_path=output_path,
             )
             status_updater(success_msg)
             return
-        except (OSError, ValueError, TypeError) as e:
+        except (OSError, ValueError, TypeError, IndexError, KeyError) as e:
             logger.warning(
                 "TRX native save failed, falling back to generic path: %s",
                 e,
             )
-            # Fall through to generic path below
+            if source_groups or source_data_per_group:
+                error_msg = (
+                    "TRX native save failed. A generic fallback would discard "
+                    "group metadata, so no fallback was attempted."
+                )
+                QMessageBox.critical(main_window, "Save Error", error_msg)
+                status_updater(f"Error saving file: {os.path.basename(output_path)}")
+                return
 
     try:
         tractogram = _prepare_tractogram_and_affine(main_window)
+        reference_grid = _main_window_reference_grid(main_window)
 
         header_to_save: Dict[str, Any] = {}
         if output_ext == ".trk":
@@ -2596,6 +3612,7 @@ def save_streamlines_file(main_window: Any) -> None:
                 main_window.original_trk_header,
                 len(tractogram.streamlines),
                 anatomical_img_affine=main_window.anatomical_image_affine,
+                reference_grid=reference_grid,
             )
         elif output_ext == ".tck":
             header_to_save = _prepare_tck_header(
@@ -2607,6 +3624,7 @@ def save_streamlines_file(main_window: Any) -> None:
                 main_window.original_trk_header,
                 len(tractogram.streamlines),
                 anatomical_img_affine=main_window.anatomical_image_affine,
+                reference_grid=reference_grid,
             )
 
         # Save File

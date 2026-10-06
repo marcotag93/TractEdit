@@ -98,15 +98,22 @@ class ScalarManager:
             return
 
         try:
-            valid_scalars = (s for s in scalar_sequence if s is not None and s.size > 0)
+            data_min_val = np.inf
+            data_max_val = -np.inf
+            has_values = False
+            for scalar_values in scalar_sequence:
+                if scalar_values is None or scalar_values.size == 0:
+                    continue
+                values = np.asarray(scalar_values).reshape(-1)
+                if not np.all(np.isfinite(values)):
+                    raise ValueError("Active scalar data contains non-finite values.")
+                data_min_val = min(data_min_val, float(np.min(values)))
+                data_max_val = max(data_max_val, float(np.max(values)))
+                has_values = True
 
-            all_scalars_flat = np.concatenate(list(valid_scalars))
-            if all_scalars_flat.size == 0:
+            if not has_values:
                 logger.info("Scalar range: Concatenated scalar data is empty.")
                 return
-
-            data_min_val = np.min(all_scalars_flat)
-            data_max_val = np.max(all_scalars_flat)
 
             # Handle edge case where all data is the same value
             if data_min_val == data_max_val:

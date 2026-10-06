@@ -29,9 +29,13 @@ import glob
 import os
 import subprocess
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import numpy as np  # noqa: F401 — required by Numba type resolution
+from numba.core.compiler import Flags
 from numba.pycc import CC
+from numba.pycc import compiler as pycc_compiler
 
 # ---------------------------------------------------------------------------
 # Output directory: place the compiled extension next to this script.
@@ -143,6 +147,23 @@ def _create_compiler() -> CC:
     return compiler
 
 
+@contextmanager
+def _gil_releasing_compiler_flags() -> Iterator[None]:
+    """Build CPython wrappers that release the GIL during native calls."""
+    original_factory = pycc_compiler.Flags
+
+    def create_flags() -> Flags:
+        flags = Flags()
+        flags.release_gil = True
+        return flags
+
+    pycc_compiler.Flags = create_flags
+    try:
+        yield
+    finally:
+        pycc_compiler.Flags = original_factory
+
+
 # ---------------------------------------------------------------------------
 # AOT function definitions
 # ---------------------------------------------------------------------------
@@ -233,7 +254,16 @@ def _register_functions(compiler: CC) -> None:
         """Resample a streamline to *nb_points* using linear interpolation."""
         n_pts = streamline.shape[0]
 
-        if n_pts <= 1:
+        if n_pts == 0:
+            raise ValueError("Cannot resample an empty streamline.")
+        if nb_points < 2:
+            raise ValueError("Resampling requires at least two output points.")
+        for point_index in range(n_pts):
+            for axis in range(3):
+                if not np.isfinite(streamline[point_index, axis]):
+                    raise ValueError("Streamline coordinates must be finite.")
+
+        if n_pts == 1:
             result = np.empty((nb_points, 3), dtype=np.float64)
             for i in range(nb_points):
                 result[i, 0] = streamline[0, 0]
@@ -448,12 +478,17 @@ def _register_functions(compiler: CC) -> None:
             max_y = flat_data[first_idx, 1]
             min_z = flat_data[first_idx, 2]
             max_z = flat_data[first_idx, 2]
+            valid = np.isfinite(min_x) and np.isfinite(min_y) and np.isfinite(min_z)
 
             for j in range(1, length):
                 idx = start + j
                 x = flat_data[idx, 0]
                 y = flat_data[idx, 1]
                 z = flat_data[idx, 2]
+
+                if not np.isfinite(x) or not np.isfinite(y) or not np.isfinite(z):
+                    valid = False
+                    continue
 
                 if x < min_x:
                     min_x = x
@@ -468,12 +503,54 @@ def _register_functions(compiler: CC) -> None:
                 if z > max_z:
                     max_z = z
 
-            bboxes[i, 0, 0] = min_x
-            bboxes[i, 0, 1] = min_y
-            bboxes[i, 0, 2] = min_z
-            bboxes[i, 1, 0] = max_x
-            bboxes[i, 1, 1] = max_y
-            bboxes[i, 1, 2] = max_z
+            if valid:
+                bboxes[i, 0, 0] = min_x
+                bboxes[i, 0, 1] = min_y
+                bboxes[i, 0, 2] = min_z
+                bboxes[i, 1, 0] = max_x
+                bboxes[i, 1, 1] = max_y
+                bboxes[i, 1, 2] = max_z
+            else:
+                bboxes[i, 0, 0] = np.nan
+                bboxes[i, 0, 1] = np.nan
+                bboxes[i, 0, 2] = np.nan
+                bboxes[i, 1, 0] = np.nan
+                bboxes[i, 1, 1] = np.nan
+                bboxes[i, 1, 2] = np.nan
+
+    @compiler.export(
+        "validate_streamlines_chunk",
+        "void(float32[:,::1], int64[::1], int64[::1],"
+        " uint8[::1], int64, int64)",
+    )
+    def validate_streamlines_chunk(flat_data, offsets, lengths, status, start_i, end_i):
+        """Mark non-finite and zero-length streamlines in a packed buffer."""
+        for i in range(start_i, end_i):
+            start = offsets[i]
+            length = lengths[i]
+            if length <= 1:
+                status[i] = 2
+                continue
+
+            first_x = flat_data[start, 0]
+            first_y = flat_data[start, 1]
+            first_z = flat_data[start, 2]
+            if (
+                not np.isfinite(first_x)
+                or not np.isfinite(first_y)
+                or not np.isfinite(first_z)
+            ):
+                status[i] = 1
+                continue
+
+            for j in range(1, length):
+                index = start + j
+                x = flat_data[index, 0]
+                y = flat_data[index, 1]
+                z = flat_data[index, 2]
+                if not np.isfinite(x) or not np.isfinite(y) or not np.isfinite(z):
+                    status[i] = 1
+                    break
 
     # -- 3B: Batch sphere intersection (from selection.py:45) ----------
     #    Note: sphere check logic is inlined because AOT cannot resolve
@@ -573,6 +650,95 @@ def _register_functions(compiler: CC) -> None:
                 ):
                     results[i] = True
                     break
+
+    @compiler.export(
+        "check_oriented_box_chunk",
+        "void(float64[:,::1], int64[::1], float64[:,::1], float64[::1],"
+        " float64[::1], float64[::1], boolean[::1], int64, int64)",
+    )
+    def check_oriented_box_chunk(
+        data,
+        offsets,
+        R,
+        T,
+        box_min,
+        box_max,
+        results,
+        start_i,
+        end_i,
+    ):
+        """Check segment intersection with a voxel-oriented box."""
+        for i in range(start_i, end_i):
+            start_idx = offsets[i]
+            end_idx = offsets[i + 1]
+            if end_idx <= start_idx:
+                continue
+
+            found = False
+            for point_index in range(start_idx, end_idx):
+                inside = True
+                for axis in range(3):
+                    value = (
+                        data[point_index, 0] * R[0, axis]
+                        + data[point_index, 1] * R[1, axis]
+                        + data[point_index, 2] * R[2, axis]
+                        + T[axis]
+                    )
+                    if value < box_min[axis] or value > box_max[axis]:
+                        inside = False
+                        break
+                if inside:
+                    found = True
+                    break
+
+            if not found:
+                for point_index in range(start_idx, end_idx - 1):
+                    start = np.empty(3, dtype=np.float64)
+                    delta = np.empty(3, dtype=np.float64)
+                    for axis in range(3):
+                        first = (
+                            data[point_index, 0] * R[0, axis]
+                            + data[point_index, 1] * R[1, axis]
+                            + data[point_index, 2] * R[2, axis]
+                            + T[axis]
+                        )
+                        second = (
+                            data[point_index + 1, 0] * R[0, axis]
+                            + data[point_index + 1, 1] * R[1, axis]
+                            + data[point_index + 1, 2] * R[2, axis]
+                            + T[axis]
+                        )
+                        start[axis] = first
+                        delta[axis] = second - first
+
+                    enter = 0.0
+                    leave = 1.0
+                    intersects = True
+                    for axis in range(3):
+                        if abs(delta[axis]) < 1e-15:
+                            if (
+                                start[axis] < box_min[axis]
+                                or start[axis] > box_max[axis]
+                            ):
+                                intersects = False
+                                break
+                        else:
+                            first = (box_min[axis] - start[axis]) / delta[axis]
+                            second = (box_max[axis] - start[axis]) / delta[axis]
+                            if first > second:
+                                first, second = second, first
+                            if first > enter:
+                                enter = first
+                            if second < leave:
+                                leave = second
+                            if enter > leave:
+                                intersects = False
+                                break
+                    if intersects:
+                        found = True
+                        break
+
+            results[i] = found
 
     # -- 3D: Parallel streamline copy (from selection.py:134) ----------
 
@@ -681,81 +847,71 @@ def _register_functions(compiler: CC) -> None:
                     flat_data[p1, 2] - flat_data[p0, 2]
                 )
 
-    # -- 3F: MDF distance matrix rows (from file_io.py:1109) ----------
-
     @compiler.export(
-        "compute_mdf_rows_chunk",
-        "void(float64[:,:,::1], float64[:,::1], int64, int64)",
+        "accumulate_mdf_totals_chunk",
+        "void(float64[:,:,::1], float64[::1], int64, int64)",
     )
-    def compute_mdf_rows_chunk(resampled, dist_matrix, start_i, end_i):
-        """Compute MDF distance matrix rows [start_i, end_i)."""
+    def accumulate_mdf_totals_chunk(resampled, totals, start_i, end_i):
+        """Accumulate upper-triangle MDF distances into private totals."""
         n = resampled.shape[0]
         nb_points = resampled.shape[1]
 
         for i in range(start_i, end_i):
             for j in range(i + 1, n):
                 d_direct = 0.0
-                for k in range(nb_points):
-                    dx = resampled[i, k, 0] - resampled[j, k, 0]
-                    dy = resampled[i, k, 1] - resampled[j, k, 1]
-                    dz = resampled[i, k, 2] - resampled[j, k, 2]
-                    d_direct += np.sqrt(dx * dx + dy * dy + dz * dz)
-                d_direct /= nb_points
-
                 d_flipped = 0.0
-                for k in range(nb_points):
-                    flipped_k = nb_points - 1 - k
-                    dx = resampled[i, k, 0] - resampled[j, flipped_k, 0]
-                    dy = resampled[i, k, 1] - resampled[j, flipped_k, 1]
-                    dz = resampled[i, k, 2] - resampled[j, flipped_k, 2]
+                for point in range(nb_points):
+                    flipped_point = nb_points - 1 - point
+                    dx = resampled[i, point, 0] - resampled[j, point, 0]
+                    dy = resampled[i, point, 1] - resampled[j, point, 1]
+                    dz = resampled[i, point, 2] - resampled[j, point, 2]
+                    d_direct += np.sqrt(dx * dx + dy * dy + dz * dz)
+                    dx = resampled[i, point, 0] - resampled[j, flipped_point, 0]
+                    dy = resampled[i, point, 1] - resampled[j, flipped_point, 1]
+                    dz = resampled[i, point, 2] - resampled[j, flipped_point, 2]
                     d_flipped += np.sqrt(dx * dx + dy * dy + dz * dz)
-                d_flipped /= nb_points
-
-                dist = d_direct if d_direct < d_flipped else d_flipped
-                dist_matrix[i, j] = dist
-                dist_matrix[j, i] = dist
-
-    # -- 3G: Distances to samples (from file_io.py:1153) ---------------
+                distance = min(d_direct, d_flipped) / nb_points
+                totals[i] += distance
+                totals[j] += distance
 
     @compiler.export(
-        "compute_distances_chunk",
-        "void(float64[:,:,::1], int64[::1], float64[:,::1], int64, int64)",
+        "compute_sampled_mdf_totals_chunk",
+        "void(float64[:,:,::1], int64[::1], float64[::1], int64, int64)",
     )
-    def compute_distances_chunk(resampled, sample_indices, distances, start_i, end_i):
-        """Compute MDF distances to sample streamlines for rows
-        [start_i, end_i).
-        """
+    def compute_sampled_mdf_totals_chunk(
+        resampled, sample_indices, totals, start_i, end_i
+    ):
+        """Compute one sampled MDF total per row without a distance matrix."""
         nb_points = resampled.shape[1]
-        k = sample_indices.shape[0]
 
         for i in range(start_i, end_i):
-            for j_idx in range(k):
-                j = sample_indices[j_idx]
-
-                if i == j:
+            total = 0.0
+            for sample_index in sample_indices:
+                if i == sample_index:
                     continue
-
                 d_direct = 0.0
-                for pt in range(nb_points):
-                    dx = resampled[i, pt, 0] - resampled[j, pt, 0]
-                    dy = resampled[i, pt, 1] - resampled[j, pt, 1]
-                    dz = resampled[i, pt, 2] - resampled[j, pt, 2]
-                    d_direct += np.sqrt(dx * dx + dy * dy + dz * dz)
-                d_direct /= nb_points
-
                 d_flipped = 0.0
-                for pt in range(nb_points):
-                    flipped_pt = nb_points - 1 - pt
-                    dx = resampled[i, pt, 0] - resampled[j, flipped_pt, 0]
-                    dy = resampled[i, pt, 1] - resampled[j, flipped_pt, 1]
-                    dz = resampled[i, pt, 2] - resampled[j, flipped_pt, 2]
+                for point in range(nb_points):
+                    flipped_point = nb_points - 1 - point
+                    dx = resampled[i, point, 0] - resampled[sample_index, point, 0]
+                    dy = resampled[i, point, 1] - resampled[sample_index, point, 1]
+                    dz = resampled[i, point, 2] - resampled[sample_index, point, 2]
+                    d_direct += np.sqrt(dx * dx + dy * dy + dz * dz)
+                    dx = (
+                        resampled[i, point, 0]
+                        - resampled[sample_index, flipped_point, 0]
+                    )
+                    dy = (
+                        resampled[i, point, 1]
+                        - resampled[sample_index, flipped_point, 1]
+                    )
+                    dz = (
+                        resampled[i, point, 2]
+                        - resampled[sample_index, flipped_point, 2]
+                    )
                     d_flipped += np.sqrt(dx * dx + dy * dy + dz * dz)
-                d_flipped /= nb_points
-
-                if d_direct < d_flipped:
-                    distances[i, j_idx] = d_direct
-                else:
-                    distances[i, j_idx] = d_flipped
+                total += min(d_direct, d_flipped) / nb_points
+            totals[i] = total
 
     # -- 3H: Endpoint labeling (from connectivity.py:187) --------------
 
@@ -851,7 +1007,8 @@ def main() -> None:
     _register_functions(compiler)
 
     print(f"Compiling tractedit_numba -> {_SCRIPT_DIR}")
-    compiler.compile()
+    with _gil_releasing_compiler_flags():
+        compiler.compile()
     print("AOT compilation completed successfully.")
 
 

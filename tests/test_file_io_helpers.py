@@ -585,9 +585,7 @@ class TestTryLoadCachedBboxes:
             tbx.save(trx_obj, trx_path)
 
             trx_loaded = tbx.load(trx_path)
-            result = _try_load_cached_bboxes(
-                trx_loaded, len(sample_streamlines)
-            )
+            result = _try_load_cached_bboxes(trx_loaded, len(sample_streamlines))
             assert result is None
         finally:
             if trx_loaded is not None and hasattr(trx_loaded, "close"):
@@ -657,7 +655,10 @@ class TestEmbedCachedBboxes:
     def test_embed_stores_flat_array(self, sample_streamlines):
         """Embedded bboxes should be stored as (N, 6) float32."""
         n = len(sample_streamlines)
-        bboxes = np.random.rand(n, 2, 3).astype(np.float32)
+        bboxes = np.sort(
+            np.random.rand(n, 2, 3).astype(np.float32),
+            axis=1,
+        )
 
         ref = _make_reference_image()
         tractogram = nib.streamlines.Tractogram(
@@ -671,9 +672,7 @@ class TestEmbedCachedBboxes:
         stored = trx_obj.data_per_streamline[_TRX_BBOX_KEY]
         assert stored.shape == (n, 6)
         assert stored.dtype == np.float32
-        np.testing.assert_allclose(
-            stored, bboxes.reshape(-1, 6), atol=1e-7
-        )
+        np.testing.assert_allclose(stored, bboxes.reshape(-1, 6), atol=1e-7)
 
     def test_embed_none_is_noop(self, sample_streamlines):
         """Embedding None bboxes should not add the key."""
@@ -709,9 +708,7 @@ class TestExtractVisibleBboxes:
         """Should return bboxes only for visible indices, sorted."""
 
         class FakeMainWindow:
-            streamline_bboxes = np.arange(30).reshape(5, 2, 3).astype(
-                np.float32
-            )
+            streamline_bboxes = np.arange(30).reshape(5, 2, 3).astype(np.float32)
             visible_indices = {0, 2, 4}
 
         result = _extract_visible_bboxes(FakeMainWindow())
@@ -780,9 +777,7 @@ class TestTrxBboxRoundTrip:
             shutil.rmtree(tmp, ignore_errors=True)
 
     @pytest.mark.numba
-    def test_trx_without_cache_falls_back_to_computation(
-        self, sample_streamlines
-    ):
+    def test_trx_without_cache_falls_back_to_computation(self, sample_streamlines):
         """TRX without cache → _try_load_cached_bboxes returns None,
         and AOT computation produces correct results."""
         ref = _make_reference_image()
@@ -804,9 +799,7 @@ class TestTrxBboxRoundTrip:
 
             # Fallback: compute from scratch
             sl = trx_loaded.streamlines
-            computed = _compute_bboxes_numba(
-                sl._data, sl._offsets, sl._lengths
-            )
+            computed = _compute_bboxes_numba(sl._data, sl._offsets, sl._lengths)
             assert computed.shape == (n, 2, 3)
             assert computed.dtype == np.float32
         finally:
@@ -1105,9 +1098,7 @@ class TestSaveTrxNative:
             # to get the flat (N_total_pts, K) array.
             loaded_flat = np.asarray(loaded_dpv._data)
             expected = np.concatenate(scalar_per_point, axis=0)
-            np.testing.assert_allclose(
-                loaded_flat, expected, atol=1e-6
-            )
+            np.testing.assert_allclose(loaded_flat, expected, atol=1e-6)
         finally:
             if trx_source is not None and hasattr(trx_source, "close"):
                 trx_source.close()
@@ -1162,9 +1153,7 @@ class TestSaveTrxNative:
             expected_scalar = scalar_per_point[0]
             loaded_dpv = trx_loaded.data_per_vertex["test_scalar"]
             loaded_flat = np.asarray(loaded_dpv._data)
-            np.testing.assert_allclose(
-                loaded_flat, expected_scalar, atol=1e-6
-            )
+            np.testing.assert_allclose(loaded_flat, expected_scalar, atol=1e-6)
         finally:
             if trx_source is not None and hasattr(trx_source, "close"):
                 trx_source.close()

@@ -1,11 +1,10 @@
 [build-system]
 requires = ["poetry-core>=2.0.0", "setuptools", "numba==0.63.1", "numpy==2.3.5"]
-build-backend = "_tractedit_build_backend"
-backend-path = ["."]
+build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 name = "tractedit"
-version = "3.4.8"
+version = "3.5.0"
 description = "A Python-based interactive tool for virtual dissection and manual refinement of diffusion MRI tractography. Supports .trk, .tck, .trx, .vtk, .vtp formats."
 authors = [
     "Marco Tagliaferri <marco.tagliaferri@unitn.it>",
@@ -15,6 +14,7 @@ license = "MIT"
 readme = "README.md"
 homepage = "https://github.com/marcotag93/TractEdit"
 repository = "https://github.com/marcotag93/TractEdit"
+build = "_tractedit_build.py"
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
@@ -26,6 +26,10 @@ classifiers = [
     "Environment :: X11 Applications :: Qt",
 ]
 packages = [{ include = "tractedit_pkg" }, { include = "main.py" }]
+exclude = [
+    "tractedit_pkg/_numba_aot/*.pyd",
+    "tractedit_pkg/_numba_aot/*.so",
+]
 include = [
     { path = "tractedit_pkg/_numba_aot/*.pyd", format = "wheel" },
     { path = "tractedit_pkg/_numba_aot/*.so", format = "wheel" },

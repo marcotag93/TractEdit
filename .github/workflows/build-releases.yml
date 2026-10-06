@@ -1,10 +1,13 @@
 name: Build Releases
 
 on:
+  pull_request:
   push:
+    branches:
+      - main
     tags:
-      - 'v*'  # Trigger on version tags like v1.0.0
-  workflow_dispatch:  # Allow manual trigger
+      - 'v*'
+  workflow_dispatch:
     inputs:
       build_macos:
         description: 'Build macOS DMG'
@@ -23,8 +26,295 @@ on:
         type: boolean
         default: true
 
+# Release files are uploaded manually; this workflow only builds and tests artifacts.
+permissions:
+  contents: read
+
+# ========== Common Test and Distribution Gates ==========
 jobs:
+  test:
+    name: Python 3.11 tests and lint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-26, windows-latest]
+    env:
+      QT_QPA_PLATFORM: offscreen
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Install Linux GUI runtime libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxcb-cursor0 \
+            libxcb-xinerama0 libxkbcommon-x11-0
+
+      - name: Install test environment
+        env:
+          TRACTEDIT_AOT_TARGET_CPU: generic
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install 'poetry==2.2.1'
+          poetry install --with build,dev,test --no-interaction --no-root
+          poetry run python _tractedit_build.py
+
+      - name: Run deterministic test suite
+        run: poetry run python -m pytest tests -q -p no:cacheprovider
+
+      - name: Check packaging code style
+        run: |
+          poetry run black --check _tractedit_build.py
+          poetry run flake8 _tractedit_build.py --max-line-length=88
+
+  distribution:
+    name: Distribution gate (${{ matrix.os }})
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    needs: test
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - macos-26
+          - windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Install Linux GUI runtime libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxcb-cursor0 \
+            libxcb-xinerama0 libxkbcommon-x11-0
+
+      - name: Build wheel from sdist
+        shell: bash
+        env:
+          TRACTEDIT_AOT_TARGET_CPU: generic
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install 'build==1.3.0'
+          python -m build --outdir dist
+
+      - name: Validate distribution metadata and contents
+        shell: bash
+        run: |
+          python - <<'PY'
+          import base64
+          import csv
+          import hashlib
+          import io
+          import tarfile
+          import zipfile
+          from pathlib import Path, PurePosixPath
+
+          from packaging.utils import parse_wheel_filename
+
+          sdists = list(Path("dist").glob("*.tar.gz"))
+          wheels = list(Path("dist").glob("*.whl"))
+          assert len(sdists) == 1, sdists
+          assert len(wheels) == 1, wheels
+
+          with tarfile.open(sdists[0], "r:gz") as archive:
+              names = archive.getnames()
+          assert any(name.endswith("/_tractedit_build.py") for name in names)
+          assert not any(
+              "/tractedit_pkg/_numba_aot/tractedit_numba." in name
+              and name.endswith((".pyd", ".so"))
+              for name in names
+          )
+
+          _, _, _, filename_tags = parse_wheel_filename(wheels[0].name)
+          assert not any(
+              tag.abi == "none" and tag.platform == "any"
+              for tag in filename_tags
+          )
+          with zipfile.ZipFile(wheels[0]) as archive:
+              names = archive.namelist()
+              assert len(names) == len(set(names))
+              wheel_files = [n for n in names if n.endswith(".dist-info/WHEEL")]
+              record_files = [n for n in names if n.endswith(".dist-info/RECORD")]
+              assert len(wheel_files) == len(record_files) == 1
+              metadata = archive.read(wheel_files[0]).decode("utf-8")
+              assert "Root-Is-Purelib: false" in metadata
+              declared_tags = {
+                  line.partition(":")[2].strip()
+                  for line in metadata.splitlines()
+                  if line.startswith("Tag:")
+              }
+              assert {str(tag) for tag in filename_tags} <= declared_tags
+              assert any(
+                  name.startswith("tractedit_pkg/_numba_aot/tractedit_numba.")
+                  and name.endswith((".pyd", ".so"))
+                  for name in names
+              )
+              for name in names:
+                  member = PurePosixPath(name)
+                  assert not member.is_absolute() and ".." not in member.parts
+              rows = list(
+                  csv.reader(
+                      io.StringIO(
+                          archive.read(record_files[0]).decode("utf-8")
+                      )
+                  )
+              )
+              records = {row[0]: row[1:] for row in rows}
+              assert set(records) == set(names)
+              for name in names:
+                  digest_field, size_field = records[name]
+                  if name == record_files[0]:
+                      assert not digest_field and not size_field
+                      continue
+                  data = archive.read(name)
+                  algorithm, encoded = digest_field.split("=", 1)
+                  assert algorithm == "sha256"
+                  digest = base64.urlsafe_b64encode(
+                      hashlib.sha256(data).digest()
+                  ).rstrip(b"=").decode("ascii")
+                  assert encoded == digest
+                  assert size_field == str(len(data))
+          PY
+
+      - name: Create clean wheel environment
+        id: wheel-environment
+        shell: bash
+        run: |
+          python -m venv .wheel-venv
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            echo "python=$(pwd -P)/.wheel-venv/Scripts/python.exe" >> "$GITHUB_OUTPUT"
+            echo "cli=$(pwd -P)/.wheel-venv/Scripts/tractedit.exe" >> "$GITHUB_OUTPUT"
+          else
+            echo "python=$(pwd -P)/.wheel-venv/bin/python" >> "$GITHUB_OUTPUT"
+            echo "cli=$(pwd -P)/.wheel-venv/bin/tractedit" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install and smoke-test wheel
+        shell: bash
+        run: |
+          PYTHON="${{ steps.wheel-environment.outputs.python }}"
+          "$PYTHON" -m pip install --upgrade pip
+          "$PYTHON" -m pip install --only-binary=:all: dist/*.whl
+          "$PYTHON" -m pip check
+          export TRACTEDIT_CHECKOUT="$("$PYTHON" -c 'from pathlib import Path; print(Path.cwd().resolve())')"
+          SMOKE_DIR="$(mktemp -d)"
+          cd "$SMOKE_DIR"
+          PYTHONPATH= PYTHONNOUSERSITE=1 "$PYTHON" -I - <<'PY'
+          import importlib.util
+          import os
+          from pathlib import Path
+          import sysconfig
+
+          import numpy as np
+
+          installed = Path(sysconfig.get_paths()["platlib"]).resolve()
+          def installed_origin(name):
+              spec = importlib.util.find_spec(name)
+              assert spec is not None and spec.origin, name
+              origin = Path(spec.origin).resolve()
+              assert origin.is_relative_to(installed), (name, origin, installed)
+              return origin
+
+          package = installed_origin("tractedit_pkg").parent
+          installed_origin("main")
+          native = [p for p in package.joinpath("_numba_aot").glob("tractedit_numba.*") if p.suffix in (".pyd", ".so")]
+          assert len(native) == 1 and native[0].resolve().is_relative_to(installed), native
+          checkout = Path(os.environ["TRACTEDIT_CHECKOUT"]).resolve()
+          assert not Path.cwd().resolve().is_relative_to(checkout)
+          assert importlib.util.find_spec("numba") is None
+          from tractedit_pkg._numba_aot import resample_streamline
+          from importlib.resources import files
+
+          assert files("tractedit_pkg").joinpath("assets/logo.png").is_file()
+          streamline = np.array([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]])
+          result = resample_streamline(streamline, 3)
+          np.testing.assert_array_equal(result[:, 0], [0.0, 1.0, 2.0])
+          PY
+          PYTHONPATH= PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 "${{ steps.wheel-environment.outputs.cli }}" --version
+          PYTHONPATH= PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 "${{ steps.wheel-environment.outputs.cli }}" --help
+
+      - name: Create clean editable environment
+        id: editable-environment
+        shell: bash
+        run: |
+          python -m venv .editable-venv
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            echo "python=$(pwd -P)/.editable-venv/Scripts/python.exe" >> "$GITHUB_OUTPUT"
+            echo "cli=$(pwd -P)/.editable-venv/Scripts/tractedit.exe" >> "$GITHUB_OUTPUT"
+          else
+            echo "python=$(pwd -P)/.editable-venv/bin/python" >> "$GITHUB_OUTPUT"
+            echo "cli=$(pwd -P)/.editable-venv/bin/tractedit" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install and smoke-test editable source
+        shell: bash
+        env:
+          TRACTEDIT_AOT_TARGET_CPU: generic
+        run: |
+          PYTHON="${{ steps.editable-environment.outputs.python }}"
+          "$PYTHON" -m pip install --upgrade pip
+          "$PYTHON" -m pip install --editable .
+          "$PYTHON" -m pip check
+          export TRACTEDIT_CHECKOUT="$("$PYTHON" -c 'from pathlib import Path; print(Path.cwd().resolve())')"
+          SMOKE_DIR="$(mktemp -d)"
+          cd "$SMOKE_DIR"
+          PYTHONPATH= PYTHONNOUSERSITE=1 "$PYTHON" -I - <<'PY'
+          import importlib.util
+          import os
+          from pathlib import Path
+
+          import numpy as np
+
+          checkout = Path(os.environ["TRACTEDIT_CHECKOUT"]).resolve()
+          assert not Path.cwd().resolve().is_relative_to(checkout)
+          def editable_origin(name):
+              spec = importlib.util.find_spec(name)
+              assert spec is not None and spec.origin, name
+              origin = Path(spec.origin).resolve()
+              assert origin.is_relative_to(checkout), (name, origin, checkout)
+              return origin
+
+          package = editable_origin("tractedit_pkg").parent
+          editable_origin("main")
+          native = [p for p in package.joinpath("_numba_aot").glob("tractedit_numba.*") if p.suffix in (".pyd", ".so")]
+          assert len(native) == 1 and native[0].resolve().is_relative_to(checkout), native
+          assert importlib.util.find_spec("numba") is None
+          from tractedit_pkg._numba_aot import resample_streamline
+          from importlib.resources import files
+
+          assert files("tractedit_pkg").joinpath("assets/logo.png").is_file()
+          streamline = np.array([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]])
+          result = resample_streamline(streamline, 3)
+          np.testing.assert_array_equal(result[:, 0], [0.0, 1.0, 2.0])
+          PY
+          PYTHONPATH= PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 "${{ steps.editable-environment.outputs.cli }}" --version
+          PYTHONPATH= PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 "${{ steps.editable-environment.outputs.cli }}" --help
+
+  # ========== Four-Target Build Matrix ==========
   build:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    needs:
+      - test
+      - distribution
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -33,7 +323,7 @@ jobs:
             target: dmg
             name: macOS DMG
             artifact_name: TractEdit-macOS-arm64
-          - os: ubuntu-24.04
+          - os: ubuntu-22.04
             target: appimage
             name: Linux AppImage
             artifact_name: TractEdit-Linux-AppImage
@@ -86,11 +376,11 @@ jobs:
 
       - name: Checkout code
         if: steps.check.outputs.should_build == 'true'
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python 3.11
         if: steps.check.outputs.should_build == 'true'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.11'
 
@@ -121,9 +411,9 @@ jobs:
             echo "VERSION=${{ steps.version-unix.outputs.VERSION }}" >> $GITHUB_OUTPUT
           fi
 
-      # ========== Linux-specific setup ==========
+      # ========== Target-Specific Host Setup ==========
       - name: Install Linux system dependencies
-        if: steps.check.outputs.should_build == 'true' && runner.os == 'Linux'
+        if: steps.check.outputs.should_build == 'true' && matrix.target == 'deb'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -135,18 +425,34 @@ jobs:
             fuse \
             imagemagick
 
-      # ========== Common Python setup ==========
+      - name: Install AppImage system dependencies (Jammy)
+        if: steps.check.outputs.should_build == 'true' && matrix.target == 'appimage'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1-mesa-dev libxcb-xinerama0 \
+            libxcb-cursor0 libxkbcommon-x11-0 libegl1 imagemagick binutils file \
+            libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libgtk-3-0 \
+            libwayland-cursor0 libwayland-egl1
+
+      # ========== Python Tools and Common AOT Compilation ==========
       - name: Install Poetry
-        if: steps.check.outputs.should_build == 'true'
+        if: steps.check.outputs.should_build == 'true' && matrix.target != 'appimage'
         run: |
           python -m pip install --upgrade pip
           pip install poetry
 
       - name: Install Python dependencies
-        if: steps.check.outputs.should_build == 'true'
+        if: steps.check.outputs.should_build == 'true' && matrix.target != 'appimage'
         run: |
           poetry install --with build --no-interaction --no-root
           poetry run pip install pyinstaller
+
+      - name: Install AppImage Python build tools and locked dependencies
+        if: steps.check.outputs.should_build == 'true' && matrix.target == 'appimage'
+        run: |
+          python -m pip install 'poetry==2.2.1'
+          poetry install --with build --no-interaction --no-root
+          poetry run python -m pip install 'pyinstaller==6.16.0' 'pyinstaller-hooks-contrib==2025.9'
 
       - name: Build AOT numerical extension
         if: steps.check.outputs.should_build == 'true'
@@ -158,7 +464,7 @@ jobs:
           # Verify the compiled module exists
           python -c "import glob, sys; files = glob.glob('tractedit_pkg/_numba_aot/tractedit_numba.*'); print(f'AOT module: {files}'); sys.exit(0 if files else 1)"
 
-      # ========== Build with PyInstaller ==========
+      # ========== PyInstaller Builds ==========
       - name: Build with PyInstaller (Linux)
         if: steps.check.outputs.should_build == 'true' && runner.os == 'Linux'
         run: |
@@ -174,7 +480,23 @@ jobs:
         run: |
           poetry run pyinstaller .github/scripts/windows/tractedit.spec --noconfirm
 
-      # ========== macOS DMG ==========
+      # ========== PyInstaller Application Verification ==========
+      - name: Smoke-test PyInstaller application (Linux)
+        if: steps.check.outputs.should_build == 'true' && runner.os == 'Linux'
+        run: dist/tractedit/tractedit --version
+
+      - name: Smoke-test PyInstaller application (macOS)
+        if: steps.check.outputs.should_build == 'true' && runner.os == 'macOS'
+        run: dist/TractEdit.app/Contents/MacOS/TractEdit --version
+
+      - name: Smoke-test PyInstaller application (Windows)
+        if: steps.check.outputs.should_build == 'true' && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & dist\TractEdit\TractEdit.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # ========== macOS DMG Packaging ==========
       - name: Create DMG
         if: steps.check.outputs.should_build == 'true' && matrix.target == 'dmg'
         run: |
@@ -190,18 +512,43 @@ jobs:
             "TractEdit-${{ steps.version.outputs.VERSION }}-macos-arm64.dmg" \
             "dist/TractEdit.app"
 
-      # ========== Linux AppImage ==========
+      # ========== Linux AppImage Packaging ==========
       - name: Download appimagetool
         if: steps.check.outputs.should_build == 'true' && matrix.target == 'appimage'
+        shell: bash
         run: |
-          wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
-          chmod +x appimagetool-x86_64.AppImage
-          sudo mv appimagetool-x86_64.AppImage /usr/local/bin/appimagetool
+          set -euo pipefail
+          mkdir -p build/appimage-tools
+          cd build/appimage-tools
+          curl --fail --location --retry 3 -o appimagetool.AppImage \
+            https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          curl --fail --location --retry 3 -o runtime-x86_64 \
+            https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64
+          echo 'ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool.AppImage' | sha256sum --check
+          echo '2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d  runtime-x86_64' | sha256sum --check
+          chmod +x appimagetool.AppImage
+          # Extract only the build tool; final-artifact mount tests are separate.
+          ./appimagetool.AppImage --appimage-extract > /dev/null
+          # The selected musl runtime must have no interpreter or dynamic dependencies.
+          readelf -lW runtime-x86_64 > runtime-program-headers.txt
+          readelf -dW runtime-x86_64 > runtime-dynamic.txt
+          if grep -q INTERP runtime-program-headers.txt; then
+            echo '::error::Downloaded AppImage runtime has PT_INTERP'
+            exit 1
+          fi
+          if grep -q NEEDED runtime-dynamic.txt; then
+            echo '::error::Downloaded AppImage runtime has DT_NEEDED'
+            exit 1
+          fi
 
       - name: Build AppImage
         if: steps.check.outputs.should_build == 'true' && matrix.target == 'appimage'
+        shell: bash
+        env:
+          APPIMAGE_VERSION: ${{ steps.version.outputs.VERSION }}
         run: |
-          VERSION="${{ steps.version.outputs.VERSION }}"
+          set -euo pipefail
+          VERSION="$APPIMAGE_VERSION"
           APPDIR="build/TractEdit.AppDir"
           
           # Create AppDir structure
@@ -216,6 +563,31 @@ jobs:
           
           # Copy PyInstaller output
           cp -r "dist/tractedit/"* "$APPDIR/usr/bin/"
+
+          # The shared spec retains the PDF image plugin but excludes its Qt
+          # library. Complete this AppImage's existing plugin dependency only;
+          # use the installed, locked Qt wheel without changing the shared spec.
+          poetry run python - <<'PY'
+          from pathlib import Path
+          import shutil
+          from PyQt6.QtCore import QLibraryInfo
+
+          internal = Path("build/TractEdit.AppDir/usr/bin/_internal")
+          if (internal / "PyQt6/Qt6/plugins/imageformats/libqpdf.so").exists():
+              qt_lib = Path(QLibraryInfo.path(QLibraryInfo.LibraryPath.LibrariesPath))
+              shutil.copy2(qt_lib / "libQt6Pdf.so.6", internal / "libQt6Pdf.so.6")
+          # PyInstaller treats these as host libraries (the shared spec also
+          # excludes JPEG). Retain the three observed Qt/GTK dependencies in
+          # this AppImage so a minimal Noble host resolves every shipped ELF.
+          for name in ("libjpeg.so.8", "libwayland-cursor.so.0", "libwayland-egl.so.1"):
+              shutil.copy2(Path("/usr/lib/x86_64-linux-gnu") / name, internal / name)
+          # Jammy's bundled C++ runtime shadows Noble's newer Mesa/LLVM
+          # requirement (GLIBCXX_3.4.32), aborting VTK initialization. Use the
+          # host C++ runtime on both supported Ubuntu versions; the final ELF
+          # gate verifies all application GLIBCXX/CXXABI needs on each host.
+          for path in internal.rglob("libstdc++.so*"):
+              path.unlink()
+          PY
           
           # Copy desktop file and appdata
           cp ".github/scripts/linux/tractedit.desktop" "$APPDIR/usr/share/applications/"
@@ -261,7 +633,7 @@ jobs:
               exec "${HERE}/usr/bin/tractedit" "$@"
           fi
           
-          "${HERE}/usr/bin/tractedit" "$@" 2>/dev/null
+          "${HERE}/usr/bin/tractedit" "$@"
           EXIT_CODE=$?
           
           if [ $EXIT_CODE -ne 0 ]; then
@@ -278,9 +650,11 @@ jobs:
           
           # Build AppImage
           cd build
-          ARCH=x86_64 appimagetool "TractEdit.AppDir" "../dist/TractEdit-$VERSION-x86_64.AppImage"
+          ARCH=x86_64 appimage-tools/squashfs-root/AppRun \
+            --runtime-file appimage-tools/runtime-x86_64 \
+            "TractEdit.AppDir" "../dist/TractEdit-$VERSION-x86_64.AppImage"
 
-      # ========== Linux DEB ==========
+      # ========== Linux DEB Packaging ==========
       - name: Build DEB package
         if: steps.check.outputs.should_build == 'true' && matrix.target == 'deb'
         run: |
@@ -378,74 +752,1532 @@ jobs:
           dpkg-deb --build --root-owner-group "${PACKAGE_NAME}_${VERSION}_amd64"
           mv "${PACKAGE_NAME}_${VERSION}_amd64.deb" "../dist/"
 
-      # ========== Upload artifacts ==========
-      - name: Upload DMG artifact
-        if: steps.check.outputs.should_build == 'true' && matrix.target == 'dmg'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact_name }}
-          path: TractEdit-*.dmg
-          retention-days: 30
-
-      - name: Upload AppImage artifact
-        if: steps.check.outputs.should_build == 'true' && matrix.target == 'appimage'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact_name }}
-          path: dist/TractEdit-*.AppImage
-          retention-days: 30
-
-      - name: Upload DEB artifact
-        if: steps.check.outputs.should_build == 'true' && matrix.target == 'deb'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact_name }}
-          path: dist/TractEdit_*.deb
-          retention-days: 30
-
-      - name: Upload Windows artifact
-        if: steps.check.outputs.should_build == 'true' && matrix.target == 'exe'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact_name }}
-          path: dist/TractEdit/
-          retention-days: 30
-
-      # ========== Upload to Release ==========
-      - name: Upload DMG to Release
-        if: steps.check.outputs.should_build == 'true' && startsWith(github.ref, 'refs/tags/') && matrix.target == 'dmg'
-        uses: softprops/action-gh-release@v1
-        with:
-          files: TractEdit-*.dmg
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload AppImage to Release
-        if: steps.check.outputs.should_build == 'true' && startsWith(github.ref, 'refs/tags/') && matrix.target == 'appimage'
-        uses: softprops/action-gh-release@v1
-        with:
-          files: dist/TractEdit-*.AppImage
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload DEB to Release
-        if: steps.check.outputs.should_build == 'true' && startsWith(github.ref, 'refs/tags/') && matrix.target == 'deb'
-        uses: softprops/action-gh-release@v1
-        with:
-          files: dist/TractEdit_*.deb
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
+      # ========== Windows EXE and ZIP Packaging ==========
       - name: Create Windows ZIP
         if: steps.check.outputs.should_build == 'true' && matrix.target == 'exe'
         shell: pwsh
         run: |
           Compress-Archive -Path dist\TractEdit -DestinationPath "TractEdit-${{ steps.version.outputs.VERSION }}-windows-x64.zip"
 
-      - name: Upload Windows ZIP to Release
-        if: steps.check.outputs.should_build == 'true' && startsWith(github.ref, 'refs/tags/') && matrix.target == 'exe'
-        uses: softprops/action-gh-release@v1
-        with:
-          files: TractEdit-*.zip
+      # ========== Packaged Artifact Verification ==========
+      - name: Verify DMG artifact
+        if: steps.check.outputs.should_build == 'true' && matrix.target == 'dmg'
+        run: hdiutil verify "TractEdit-${{ steps.version.outputs.VERSION }}-macos-arm64.dmg"
+
+      - name: Smoke-test AppImage artifact
+        if: steps.check.outputs.should_build == 'true' && matrix.target == 'appimage'
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+          APPIMAGE_VERSION: ${{ steps.version.outputs.VERSION }}
+        run: |
+          set -euo pipefail
+          image="dist/TractEdit-${APPIMAGE_VERSION}-x86_64.AppImage"
+          test -f "$image"
+          dist/TractEdit-${APPIMAGE_VERSION}-x86_64.AppImage --version
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          image = Path("dist") / f"TractEdit-{os.environ['APPIMAGE_VERSION']}-x86_64.AppImage"
+          images = list(Path("dist").glob("*.AppImage"))
+          if images != [image]:
+              raise SystemExit(f"Expected exactly {image}, found {images}")
+          with image.open("rb") as stream:
+              digest = hashlib.file_digest(stream, "sha256").hexdigest()
+          manifest = {
+              "commit": os.environ["GITHUB_SHA"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "build_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "version": os.environ["APPIMAGE_VERSION"],
+              "filename": image.name,
+              "size_bytes": image.stat().st_size,
+              "appimage_sha256": digest,
+              "workflow_sha256": hashlib.sha256(
+                  Path(".github/workflows/build-releases.yml").read_bytes()
+              ).hexdigest(),
+              "appimagetool_version": "1.9.1",
+              "appimagetool_sha256": "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0",
+              "runtime_version": "20251108",
+              "runtime_sha256": "2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d",
+              "runtime_option": "--runtime-file appimage-tools/runtime-x86_64",
+          }
+          Path("dist/AppImage.sha256").write_text(f"{digest}  {image.name}\n")
+          Path("dist/AppImage-manifest.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          print(json.dumps(manifest, indent=2, sort_keys=True))
+          PY
+
+      - name: Smoke-test DEB payload
+        if: steps.check.outputs.should_build == 'true' && matrix.target == 'deb'
+        run: |
+          mkdir -p build/deb-smoke
+          dpkg-deb --extract "dist/TractEdit_${{ steps.version.outputs.VERSION }}_amd64.deb" build/deb-smoke
+          build/deb-smoke/opt/tractedit/tractedit --version
+
+      - name: Smoke-test Windows ZIP payload
+        if: steps.check.outputs.should_build == 'true' && matrix.target == 'exe'
+        shell: pwsh
+        run: |
+          Expand-Archive "TractEdit-${{ steps.version.outputs.VERSION }}-windows-x64.zip" -DestinationPath build\zip-smoke
+          & build\zip-smoke\TractEdit\TractEdit.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # ========== Distribution Artifact Collection ==========
+      - name: Upload DMG artifact
+        if: steps.check.outputs.should_build == 'true' && matrix.target == 'dmg'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: TractEdit-*.dmg
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload AppImage artifact
+        if: steps.check.outputs.should_build == 'true' && matrix.target == 'appimage'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            dist/TractEdit-*.AppImage
+            dist/AppImage.sha256
+            dist/AppImage-manifest.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload DEB artifact
+        if: steps.check.outputs.should_build == 'true' && matrix.target == 'deb'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/TractEdit_*.deb
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Windows artifact
+        if: steps.check.outputs.should_build == 'true' && matrix.target == 'exe'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: TractEdit-*-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  # AppImage-only continuation: both host matrices must pass before manual release.
+  # Downloadable build artifacts alone do not indicate that these checks passed.
+  # ========== AppImage Compatibility on Ubuntu 22.04 and 24.04 ==========
+  appimage-compatibility:
+    name: AppImage ABI and desktop (${{ matrix.os }})
+    needs: build
+    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.build_appimage)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - name: Checkout workflow for provenance
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.11 for verification
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Download the single AppImage build
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: TractEdit-Linux-AppImage
+          path: artifact
+
+      - name: Verify AppImage identity and provenance
+        id: identity
+        shell: bash
+        env:
+          EXPECTED_COMMIT: ${{ github.sha }}
+          EXPECTED_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import tomllib
+
+          folder = Path("artifact")
+          manifest = json.loads((folder / "AppImage-manifest.json").read_text())
+          version = tomllib.loads(Path("pyproject.toml").read_text())["tool"]["poetry"]["version"]
+          expected = f"TractEdit-{version}-x86_64.AppImage"
+          images = list(folder.glob("*.AppImage"))
+          if len(images) != 1 or images[0].name != expected:
+              raise SystemExit(f"Expected only {expected}; found {images}")
+          image = images[0]
+          with image.open("rb") as stream:
+              digest = hashlib.file_digest(stream, "sha256").hexdigest()
+          workflow_digest = hashlib.sha256(
+              Path(".github/workflows/build-releases.yml").read_bytes()
+          ).hexdigest()
+          checks = {
+              "commit": os.environ["EXPECTED_COMMIT"],
+              "run_id": os.environ["EXPECTED_RUN_ID"],
+              "version": version,
+              "filename": expected,
+              "size_bytes": image.stat().st_size,
+              "appimage_sha256": digest,
+              "workflow_sha256": workflow_digest,
+              "appimagetool_version": "1.9.1",
+              "appimagetool_sha256": "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0",
+              "runtime_version": "20251108",
+              "runtime_sha256": "2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d",
+              "runtime_option": "--runtime-file appimage-tools/runtime-x86_64",
+          }
+          if any(manifest.get(key) != value for key, value in checks.items()):
+              raise SystemExit(f"AppImage manifest mismatch: {checks} != {manifest}")
+          if not re.fullmatch(r"[1-9]\d*", str(manifest.get("build_attempt", ""))):
+              raise SystemExit("Invalid build attempt")
+          if (folder / "AppImage.sha256").read_text() != f"{digest}  {expected}\n":
+              raise SystemExit("AppImage.sha256 mismatch")
+          Path("evidence/identity.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"image={image.resolve()}\nsha256={digest}\n")
+          print(f"Verified {expected}: {digest}")
+          PY
+
+      - name: Prepare FUSE3 and desktop host without libfuse2
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y xvfb xauth xdotool x11-apps firejail binutils fuse3 \
+            libgl1 libegl1 libxcb-cursor0 libxcb-xinerama0 libxkbcommon-x11-0
+          for package in libfuse2 libfuse2t64; do
+            status=$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)
+            printf '%s %s\n' "$package" "$status" >> evidence/fuse-packages-before.txt
+            if [[ "$status" == 'install ok installed' ]]; then
+              sudo apt-get purge -y "$package"
+            fi
+            status=$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)
+            printf '%s %s\n' "$package" "$status" >> evidence/fuse-packages-after.txt
+            if [[ "$status" == 'install ok installed' ]]; then
+              echo "::error::$package remains installed"
+              exit 1
+            fi
+          done
+          if ! ldconfig -p > evidence/ldconfig.txt 2> evidence/ldconfig.stderr; then
+            echo '::error::ldconfig failed'
+            exit 1
+          fi
+          if grep -F 'libfuse.so.2' evidence/ldconfig.txt; then
+            echo '::error::libfuse.so.2 is still available'
+            exit 1
+          fi
+          test -c /dev/fuse
+          command -v fusermount3 > evidence/fusermount3-path.txt
+          fusermount3 -V > evidence/fusermount3-version.txt
+          firejail --version > evidence/firejail-version.txt
+          printf '%s\n' \
+            'Catalog source: https://github.com/AppImage/appimage.github.io/blob/master/code/worker.sh' \
+            'Catalog worker observed on 2026-09-28: Alpine Firejail git20230825, direct --appimage launch, up to 30 seconds for a window.' \
+            'This job records the installed Ubuntu Firejail version and configuration separately.' \
+            > evidence/catalog-reference.txt
+          if [[ -f /etc/firejail/firejail.config ]]; then
+            cp /etc/firejail/firejail.config evidence/firejail.config
+          fi
+          cat /etc/os-release > evidence/os-release.txt
+          dpkg-query -W > evidence/packages.txt
+          printf 'FUSE3 helper and device available; live mount is checked in GUI probes.\n' \
+            > evidence/fuse-check.txt
+
+      - name: Audit final runtime and every payload ELF
+        shell: bash
+        env:
+          IMAGE: ${{ steps.identity.outputs.image }}
+        run: |
+          set -euo pipefail
+          chmod +x "$IMAGE"
+          cd artifact
+          timeout 120s "$IMAGE" --appimage-extract > ../evidence/extract.log 2>&1
+          cd ..
+          python3 - <<'PY'
+          """Audit the final AppImage ELF and every distinct extracted ELF."""
+
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+
+          image = Path(os.environ["IMAGE"]).resolve()
+          payload = Path("artifact/squashfs-root").resolve()
+          report = {
+              "image": str(image),
+              "payload_root": str(payload),
+              "loader_diagnostic_path": "PyInstaller _internal plus each ELF directory",
+              "runtime": None,
+              "elf_count": 0,
+              "symlink_count": 0,
+              "payload": [],
+              "failures": [],
+          }
+
+          def inspect(path):
+              def readelf(flag):
+                  return subprocess.check_output(
+                      ["readelf", flag, str(path)], text=True,
+                      env={**os.environ, "LC_ALL": "C"}
+                  )
+              needs = readelf("-VW").partition("Version needs section")[2]
+              return {
+                  "path": str(path),
+                  "x86_64": "Advanced Micro Devices X86-64" in readelf("-hW"),
+                  "requirements": sorted(set(re.findall(
+                      r"Name: ((?:GLIBC|GLIBCXX|CXXABI)_[\w.]+)", needs
+                  ))),
+                  "needed": re.findall(r"\(NEEDED\).*?\[(.*?)\]", readelf("-dW")),
+                  "interpreter": "INTERP" in readelf("-lW"),
+              }
+
+          def fail(message):
+              report["failures"].append(message)
+
+          try:
+              runtime = inspect(image)
+              report["runtime"] = runtime
+              if not runtime["x86_64"]:
+                  fail("AppImage runtime is not x86_64")
+              if runtime["interpreter"] or runtime["needed"] or runtime["requirements"]:
+                  fail("AppImage runtime is not static")
+              if not payload.is_dir():
+                  fail("AppImage extraction did not create a payload")
+              else:
+                  for path in sorted(payload.rglob("*")):
+                      if not path.is_symlink():
+                          continue
+                      report["symlink_count"] += 1
+                      try:
+                          target = path.resolve(strict=True)
+                      except (OSError, RuntimeError):
+                          fail(f"{path}: broken or cyclic symlink")
+                          continue
+                      if not target.is_relative_to(payload):
+                          fail(f"{path}: symlink escapes AppDir")
+                  for path in sorted(payload.rglob("*")):
+                      if not path.is_file() or path.is_symlink():
+                          continue
+                      with path.open("rb") as stream:
+                          if stream.read(4) != b"\x7fELF":
+                              continue
+                      try:
+                          record = inspect(path)
+                          if not record["x86_64"]:
+                              fail(f"{path}: not x86_64")
+                          for version in record["requirements"]:
+                              if version.startswith("GLIBC_"):
+                                  value = version.removeprefix("GLIBC_")
+                                  if not re.fullmatch(r"\d+(?:\.\d+)*", value) or tuple(
+                                      map(int, value.split("."))
+                                  ) > (2, 35):
+                                      fail(f"{path}: unsupported {version}")
+                          internal = payload / "usr/bin/_internal"
+                          env = {**os.environ, "LC_ALL": "C",
+                                 "LD_LIBRARY_PATH": f"{internal}:{path.parent}"}
+                          result = subprocess.run(
+                              ["ldd", "-v", str(path)], env=env,
+                              text=True, capture_output=True, timeout=30
+                          )
+                          loader = result.stdout + result.stderr
+                          record["loader"] = loader
+                          record["resolved_paths"] = sorted(set(re.findall(
+                              r"=>\s+(/\S+)", loader
+                          )))
+                          if "not found" in loader:
+                              fail(f"{path}: unresolved library or symbol version")
+                          if result.returncode and not any(
+                              phrase in loader for phrase in (
+                                  "not a dynamic executable", "statically linked"
+                              )
+                          ):
+                              fail(f"{path}: ldd failed ({result.returncode})")
+                          report["payload"].append(record)
+                          report["elf_count"] += 1
+                      except Exception as error:
+                          fail(f"{path}: audit failed: {error}")
+                  if report["elf_count"] == 0:
+                      fail("No payload ELF files found")
+          except Exception as error:
+              fail(f"Runtime audit failed: {error}")
+          finally:
+              Path("evidence/elf-audit.json").write_text(
+                  json.dumps(report, indent=2) + "\n", encoding="utf-8"
+              )
+          print(f"{report['elf_count']} payload ELFs, {len(report['failures'])} failures")
+          for failure in report["failures"]:
+              print(failure)
+          raise SystemExit(bool(report["failures"]))
+          PY
+
+      - name: Prepare bounded GUI probe supervisor
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/appimage-gui-probe.py" <<'PY'
+          """Observe the real GUI process, FUSE mount, and sandbox network."""
+
+          import json
+          import os
+          from pathlib import Path
+          import signal
+          import subprocess
+          import sys
+          import time
+
+          mode = sys.argv[1]
+          image = str(Path(os.environ["IMAGE"]).resolve())
+          evidence = Path(os.environ["GITHUB_WORKSPACE"]) / "evidence"
+          report = {"mode": mode, "image": image, "passed": False}
+          log = evidence / f"{mode}.log"
+          process = None
+          termination_signal = None
+
+          def request_termination(signum, frame):
+              # Defer the exception until Popen has returned and its PID is owned.
+              global termination_signal
+              termination_signal = signum
+
+          def check_termination():
+              if termination_signal is not None:
+                  raise RuntimeError(f"Probe interrupted by signal {termination_signal}")
+
+          signal.signal(signal.SIGTERM, request_termination)
+          signal.signal(signal.SIGINT, request_termination)
+
+          def live_group_members(group):
+              members = []
+              for entry in Path("/proc").iterdir():
+                  if not entry.name.isdecimal():
+                      continue
+                  try:
+                      # comm may contain spaces or parentheses; fields follow its last ')'.
+                      fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+                  except (FileNotFoundError, ProcessLookupError):
+                      continue
+                  if int(fields[2]) == group and fields[0] not in ("Z", "X"):
+                      members.append(int(entry.name))
+              return members
+
+          def stop_application():
+              if process is None:
+                  return
+              # Check the whole group even when the launcher has already exited.
+              for signum, grace in ((signal.SIGTERM, 3), (signal.SIGKILL, 2)):
+                  try:
+                      os.killpg(process.pid, signum)
+                  except ProcessLookupError:
+                      pass
+                  deadline = time.monotonic() + grace
+                  while time.monotonic() < deadline:
+                      process.poll()  # Reap the launcher if it has terminated.
+                      if not live_group_members(process.pid):
+                          process.wait(timeout=1)
+                          report["cleanup_passed"] = True
+                          return
+                      time.sleep(0.1)
+              report["remaining_pids"] = live_group_members(process.pid)
+              raise RuntimeError("Application process group survived cleanup")
+
+          def child_of(pid, ancestor):
+              seen = set()
+              while pid > 1 and pid not in seen:
+                  if pid == ancestor:
+                      return True
+                  seen.add(pid)
+                  try:
+                      status = Path(f"/proc/{pid}/status").read_text()
+                      pid = int(next(
+                          line.split()[1] for line in status.splitlines()
+                          if line.startswith("PPid:")
+                      ))
+                  except (OSError, StopIteration, ValueError):
+                      break
+              return False
+
+          def owning_host_pid(reported_pid, launcher_pid):
+              # X11 can report a PID inside Firejail's PID namespace. Map its
+              # NSpid to the host and still require launcher ancestry or group.
+              candidates = [reported_pid]
+              for entry in Path("/proc").iterdir():
+                  if not entry.name.isdecimal() or int(entry.name) == reported_pid:
+                      continue
+                  try:
+                      status = (entry / "status").read_text()
+                      nested = next(
+                          line.split()[1:] for line in status.splitlines()
+                          if line.startswith("NSpid:")
+                      )
+                  except (OSError, StopIteration):
+                      continue
+                  if nested and int(nested[-1]) == reported_pid:
+                      candidates.append(int(entry.name))
+              for pid in candidates:
+                  try:
+                      group = os.getpgid(pid)
+                      executable = os.readlink(f"/proc/{pid}/exe")
+                      cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+                  except (OSError, ProcessLookupError):
+                      continue
+                  if (group == launcher_pid or child_of(pid, launcher_pid)) and (
+                      "tractedit" in executable.lower()
+                      or b"tractedit" in cmdline.lower()
+                  ):
+                      return pid
+              return None
+
+          try:
+              (evidence / f"{mode}.pass").unlink(missing_ok=True)
+              check_termination()
+              env = os.environ.copy()
+              for name in ("APPIMAGE_EXTRACT_AND_RUN",
+                           "APPIMAGE_EXTRACT_AND_RUN_NO_CLEANUP", "QT_QPA_PLATFORM"):
+                  env.pop(name, None)
+              if mode.endswith("extract"):
+                  env["APPIMAGE_EXTRACT_AND_RUN"] = "1"
+              if mode != "plain-mount":
+                  env["QT_QPA_PLATFORM"] = "xcb"
+              if mode.startswith("plain"):
+                  command = [image]
+              elif mode == "catalog":
+                  # Current catalog worker.sh launches Firejail directly with --appimage.
+                  command = ["firejail", "--quiet", "--noprofile",
+                             "--net=none", "--appimage", image]
+              else:
+                  command = ["firejail", "--noprofile", "--net=none", image]
+              report["command"] = command
+              report["qt_platform"] = env.get("QT_QPA_PLATFORM", "unset")
+              report["outer_net"] = os.readlink("/proc/self/ns/net")
+              started = time.monotonic()
+              with log.open("w") as output:
+                  process = subprocess.Popen(
+                      command, env=env, stdout=output, stderr=subprocess.STDOUT,
+                      start_new_session=True
+                  )
+                  report["launcher_pid"] = process.pid
+                  check_termination()
+                  startup_limit = 30 if mode == "catalog" else 90
+                  report["startup_limit_seconds"] = startup_limit
+                  deadline = started + startup_limit
+                  window = owner = None
+                  while time.monotonic() < deadline:
+                      check_termination()
+                      if process.poll() is not None:
+                          raise RuntimeError(
+                              f"Launcher exited before GUI: {process.returncode}"
+                          )
+                      result = subprocess.run(
+                          ["xdotool", "search", "--onlyvisible", "--name",
+                           "^TractEdit GUI - Interactive Editor$"],
+                          capture_output=True, text=True, timeout=5
+                      )
+                      for candidate in result.stdout.split():
+                          raw_pid = subprocess.run(
+                              ["xdotool", "getwindowpid", candidate],
+                              capture_output=True, text=True, timeout=5
+                          ).stdout.strip()
+                          if not raw_pid.isdecimal():
+                              continue
+                          pid = owning_host_pid(int(raw_pid), process.pid)
+                          if pid is not None:
+                              window, owner = candidate, pid
+                              report["window_reported_pid"] = int(raw_pid)
+                              break
+                      if window:
+                          break
+                      time.sleep(1)
+                  if not window:
+                      raise RuntimeError("Main application window and owner not found")
+                  appeared = time.monotonic()
+                  report["window_seconds"] = round(appeared - started, 3)
+                  # A slow xdotool query must not admit a window after the deadline.
+                  if appeared > deadline:
+                      raise RuntimeError(f"Main window exceeded {startup_limit}s startup limit")
+                  check_termination()
+                  # Current catalog worker waits up to 30 seconds; the historic
+                  # eleven-second report does not establish a startup cause.
+                  report["catalog_wait_reference_seconds"] = 30
+                  report["window_id"] = window
+                  report["owner_pid"] = owner
+                  until = max(started + 30, appeared + 15)
+                  while time.monotonic() < until:
+                      check_termination()
+                      if process.poll() is not None:
+                          raise RuntimeError(
+                              f"Launcher ended during observation: {process.returncode}"
+                          )
+                      os.kill(owner, 0)
+                      time.sleep(1)
+                  visible = subprocess.run(
+                      ["xdotool", "search", "--onlyvisible", "--name",
+                       "^TractEdit GUI - Interactive Editor$"],
+                      capture_output=True, text=True, timeout=5
+                  ).stdout.split()
+                  if window not in visible or not (
+                      os.getpgid(owner) == process.pid
+                      or child_of(owner, process.pid)
+                  ):
+                      raise RuntimeError("Application window or owner disappeared")
+                  report["observed_seconds"] = round(time.monotonic() - started, 3)
+                  report["owner_executable"] = os.readlink(f"/proc/{owner}/exe")
+                  report["owner_net"] = os.readlink(f"/proc/{owner}/ns/net")
+                  if mode in ("plain-mount", "firejail-mount"):
+                      mounts = Path(f"/proc/{owner}/mountinfo").read_text()
+                      mounted = [
+                          line for line in mounts.splitlines()
+                          if ".mount_" in line and "fuse" in line
+                          and Path(image).name in line
+                      ]
+                      (evidence / f"{mode}.mounts").write_text(
+                          "\n".join(mounted) + "\n"
+                      )
+                      if not mounted:
+                          raise RuntimeError("The final AppImage is not FUSE mounted")
+                      mountpoints = [line.split()[4] for line in mounted]
+                      if not any(
+                          report["owner_executable"].startswith(point + "/")
+                          for point in mountpoints
+                      ):
+                          raise RuntimeError(
+                              "GUI owner does not run from the AppImage mount"
+                          )
+                  if mode.startswith("firejail") or mode == "catalog":
+                      if report["owner_net"] == report["outer_net"]:
+                          raise RuntimeError("Firejail network namespace not created")
+                      route = Path(f"/proc/{owner}/net/route").read_text()
+                      interfaces = Path(f"/proc/{owner}/net/dev").read_text()
+                      (evidence / f"{mode}.network").write_text(
+                          f"route:\n{route}\ninterfaces:\n{interfaces}"
+                      )
+                      names = [
+                          line.split(":")[0].strip()
+                          for line in interfaces.splitlines() if ":" in line
+                      ]
+                      if any(name != "lo" for name in names) or len(route.splitlines()) > 1:
+                          raise RuntimeError(
+                              "Firejail has an external interface or route"
+                          )
+                      launcher_log = log.read_text(errors="replace").lower()
+                      if ("disabling firejail" in launcher_log
+                              or "sandbox is disabled" in launcher_log):
+                          raise RuntimeError("Firejail reported a disabled sandbox")
+                  screenshot = evidence / f"{mode}.xwd"
+                  subprocess.run(
+                      ["xwd", "-silent", "-id", window, "-out", str(screenshot)],
+                      check=True, timeout=20
+                  )
+                  if screenshot.stat().st_size == 0:
+                      raise RuntimeError("Empty desktop screenshot")
+                  check_termination()
+                  report["passed"] = True
+          except Exception as error:
+              report["error"] = str(error)
+              raise
+          finally:
+              try:
+                  stop_application()
+              except Exception as error:
+                  report["passed"] = False
+                  report["cleanup_error"] = str(error)
+                  raise
+              finally:
+                  if termination_signal is not None:
+                      report["passed"] = False
+                      report["termination_signal"] = termination_signal
+                  (evidence / f"{mode}.json").write_text(
+                      json.dumps(report, indent=2) + "\n"
+                  )
+          check_termination()
+          (evidence / f"{mode}.pass").write_text("passed\n")
+          PY
+          cat > "$RUNNER_TEMP/appimage-gui-probe.sh" <<'SH'
+          set -euo pipefail
+          mode=$1
+          # Keep Xvfb alive while the Python supervisor handles TERM and cleans up.
+          # Allow a bounded in-flight query (20s) plus group cleanup before KILL.
+          if ! xvfb-run -a timeout --signal=TERM --kill-after=35s 180s \
+            python3 "$RUNNER_TEMP/appimage-gui-probe.py" "$mode" \
+            > "evidence/$mode-supervisor.log" 2>&1; then
+            cat "evidence/$mode-supervisor.log"
+            if [[ -f "evidence/$mode.log" ]]; then
+              tail -n 80 "evidence/$mode.log"
+            fi
+            exit 1
+          fi
+          test -s "evidence/$mode.pass"
+          SH
+
+      # ========== AppImage Desktop and Firejail Probes ==========
+      # Extraction cannot compensate for a mount failure.
+      - name: Probe ordinary FUSE and extraction launches
+        shell: bash
+        env:
+          IMAGE: ${{ steps.identity.outputs.image }}
+        run: |
+          set -euo pipefail
+          bash "$RUNNER_TEMP/appimage-gui-probe.sh" plain-mount
+          bash "$RUNNER_TEMP/appimage-gui-probe.sh" plain-extract
+
+      - name: Probe ordinary Firejail launches
+        shell: bash
+        env:
+          IMAGE: ${{ steps.identity.outputs.image }}
+        run: |
+          set -euo pipefail
+          bash "$RUNNER_TEMP/appimage-gui-probe.sh" firejail-mount
+          bash "$RUNNER_TEMP/appimage-gui-probe.sh" firejail-extract
+
+      - name: Probe catalog Firejail AppImage launch
+        shell: bash
+        env:
+          IMAGE: ${{ steps.identity.outputs.image }}
+        run: |
+          set -euo pipefail
+          bash "$RUNNER_TEMP/appimage-gui-probe.sh" catalog
+
+      - name: Report validation diagnostics
+        if: always()
+        shell: python {0}
+        run: |
+          import os
+          from pathlib import Path
+
+          root = Path("evidence")
+          reports = sorted(
+              path for path in root.rglob("*")
+              if path.is_file() and path.suffix in (".json", ".log", ".txt", ".network", ".mounts")
+          )
+          remaining = 64000
+          for path in reports:
+              if remaining <= 0:
+                  break
+              limit = min(8000, remaining)
+              with path.open("rb") as stream:
+                  stream.seek(max(0, path.stat().st_size - limit))
+                  tail = stream.read(limit).decode("utf-8", errors="replace")
+              print(f"--- {path.as_posix()} (last {limit} bytes at most) ---")
+              print(tail)
+              remaining -= limit
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("### Validation diagnostics\n\n")
+              summary.write(f"{len(reports)} text reports/logs generated; bounded excerpts are in this step's log.\n\n")
+              summary.write("Only application packages are uploaded as artifacts. Screenshots remain temporary runner files.\n")
+
+  # ========== Shared Package Validation Across All Four Formats ==========
+  # Scientific fixtures and oracles are shared; AppImage GUI checks stay in appimage-compatibility.
+  validate-packages:
+    name: Validate package (${{ matrix.target }}, ${{ matrix.os }})
+    needs: build
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-26
+            target: dmg
+            artifact_name: TractEdit-macOS-arm64
+            enabled: ${{ github.event_name != 'workflow_dispatch' || inputs.build_macos }}
+          - os: ubuntu-24.04
+            target: deb
+            artifact_name: TractEdit-Linux-DEB
+            enabled: ${{ github.event_name != 'workflow_dispatch' || inputs.build_deb }}
+          - os: windows-latest
+            target: exe
+            artifact_name: TractEdit-Windows-x64
+            enabled: ${{ github.event_name != 'workflow_dispatch' || inputs.build_windows }}
+          - os: ubuntu-22.04
+            target: appimage
+            artifact_name: TractEdit-Linux-AppImage
+            enabled: ${{ github.event_name != 'workflow_dispatch' || inputs.build_appimage }}
+          - os: ubuntu-24.04
+            target: appimage
+            artifact_name: TractEdit-Linux-AppImage
+            enabled: ${{ github.event_name != 'workflow_dispatch' || inputs.build_appimage }}
+    steps:
+      - name: Checkout verification inputs
+        if: matrix.enabled
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Set up Python 3.11 for independent verification
+        if: matrix.enabled
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.11'
+      - name: Download the final package
+        if: matrix.enabled
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: artifact
+      - name: Prepare isolated package and record identity
+        if: matrix.enabled && matrix.target != 'appimage'
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: python {0}
+        run: |
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import plistlib
+          import subprocess
+          import tomllib
+          import zipfile
+
+          target = os.environ["TARGET"]
+          version = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["tool"]["poetry"]["version"]
+          filenames = {
+              "dmg": f"TractEdit-{version}-macos-arm64.dmg",
+              "deb": f"TractEdit_{version}_amd64.deb",
+              "exe": f"TractEdit-{version}-windows-x64.zip",
+          }
+          files = list(Path("artifact").iterdir())
+          package = Path("artifact") / filenames[target]
+          if files != [package] or not package.is_file():
+              raise RuntimeError(f"Expected exactly {package}, found {files}")
+          with package.open("rb") as stream:
+              digest = hashlib.file_digest(stream, "sha256").hexdigest()
+          root = Path(os.environ["RUNNER_TEMP"]) / "package-under-test"
+          root.mkdir()
+          if target == "exe":
+              with zipfile.ZipFile(package) as archive:
+                  archive.extractall(root)
+              executable = root / "TractEdit/TractEdit.exe"
+          elif target == "deb":
+              subprocess.run(["dpkg-deb", "--extract", str(package), str(root)], check=True, timeout=120)
+              executable = root / "opt/tractedit/tractedit"
+          else:
+              # Mount read-only and keep the original bundle intact, including symlinks.
+              subprocess.run(["hdiutil", "attach", str(package.resolve()), "-readonly",
+                              "-nobrowse", "-mountpoint", str(root)], check=True, timeout=120)
+              with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+                  output.write(f"DMG_MOUNT={root.as_posix()}\n")
+              bundle = root / "TractEdit.app"
+              with (bundle / "Contents/Info.plist").open("rb") as stream:
+                  executable_name = plistlib.load(stream)["CFBundleExecutable"]
+              executable = bundle / "Contents/MacOS" / executable_name
+          if not executable.is_file():
+              raise RuntimeError(f"Missing packaged executable: {executable}")
+          Path("evidence").mkdir(exist_ok=True)
+          identity = {"package": package.name, "package_sha256": digest,
+                      "commit": os.environ["GITHUB_SHA"], "run_id": os.environ["GITHUB_RUN_ID"],
+                      "target": target, "executable": str(executable)}
+          Path("evidence/identity.json").write_text(json.dumps(identity, indent=2) + "\n")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+              output.write(f"PACKAGE={package.resolve().as_posix()}\nEXPECTED_SHA256={digest}\n")
+              output.write(f"EXECUTABLE={executable.as_posix()}\n")
+      - name: Verify AppImage identity and prepare executable
+        id: identity
+        shell: python {0}
+        env:
+          EXPECTED_COMMIT: ${{ github.sha }}
+          EXPECTED_RUN_ID: ${{ github.run_id }}
+        run: |
+          from pathlib import Path
+          Path("evidence").mkdir(exist_ok=True)
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import tomllib
+
+          folder = Path("artifact")
+          manifest = json.loads((folder / "AppImage-manifest.json").read_text())
+          version = tomllib.loads(Path("pyproject.toml").read_text())["tool"]["poetry"]["version"]
+          filename = f"TractEdit-{version}-x86_64.AppImage"
+          images = list(folder.glob("*.AppImage"))
+          if len(images) != 1 or images[0].name != filename:
+              raise SystemExit(f"Expected only {filename}; found {images}")
+          image = images[0]
+          with image.open("rb") as stream:
+              digest = hashlib.file_digest(stream, "sha256").hexdigest()
+          expected = {
+              "commit": os.environ["EXPECTED_COMMIT"],
+              "run_id": os.environ["EXPECTED_RUN_ID"],
+              "version": version,
+              "filename": filename,
+              "size_bytes": image.stat().st_size,
+              "appimage_sha256": digest,
+              "workflow_sha256": hashlib.sha256(
+                  Path(".github/workflows/build-releases.yml").read_bytes()
+              ).hexdigest(),
+              "appimagetool_version": "1.9.1",
+              "appimagetool_sha256": "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0",
+              "runtime_version": "20251108",
+              "runtime_sha256": "2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d",
+              "runtime_option": "--runtime-file appimage-tools/runtime-x86_64",
+          }
+          if any(manifest.get(key) != value for key, value in expected.items()):
+              raise SystemExit(f"AppImage manifest mismatch: {expected} != {manifest}")
+          if not re.fullmatch(r"[1-9]\d*", str(manifest.get("build_attempt", ""))):
+              raise SystemExit("Invalid build attempt")
+          if (folder / "AppImage.sha256").read_text() != f"{digest}  {filename}\n":
+              raise SystemExit("AppImage.sha256 mismatch")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"image={image.resolve()}\nsha256={digest}\n")
+          Path("evidence/identity.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          image.chmod(image.stat().st_mode | 0o111)
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+              output.write(f"PACKAGE={image.resolve().as_posix()}\n")
+              output.write(f"EXECUTABLE={image.resolve().as_posix()}\nEXPECTED_SHA256={digest}\n")
+        if: matrix.enabled && matrix.target == 'appimage'
+      - name: Install Linux desktop runtime
+        if: matrix.enabled && matrix.target == 'deb'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libgl1 libegl1 libxcb-cursor0 \
+            libxcb-xinerama0 libxkbcommon-x11-0 \
+            libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 \
+            xvfb xauth xdotool x11-apps
+      - name: Install headless Linux runtime libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libgl1 libegl1 libxcb-cursor0 \
+            libxcb-xinerama0 libxkbcommon-x11-0
+        if: matrix.enabled && matrix.target == 'appimage'
+      - name: Install isolated verification tools
+        if: matrix.enabled
+        shell: python {0}
+        run: |
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          import venv
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "verification-venv"
+          venv.EnvBuilder(with_pip=True).create(root)
+          python = root / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+          packages = ["numpy==2.3.5", "nibabel==5.3.3", "trx-python==0.3"]
+          if os.environ["TARGET"] != "appimage":
+              packages += ["psutil==7.1.0"]
+          if sys.platform == "darwin":
+              packages += ["pyobjc-core==12.2.2", "pyobjc-framework-Cocoa==12.2.2",
+                           "pyobjc-framework-Quartz==12.2.2"]
+          if sys.platform == "win32":
+              packages += ["Pillow==11.3.0"]
+          with open("evidence/verifier-install.log", "w") as log:
+              subprocess.run([str(python), "-m", "pip", "install", "--only-binary=:all:", *packages],
+                             stdout=log, stderr=subprocess.STDOUT, check=True, timeout=300)
+          with open("evidence/verifier-packages.txt", "w") as log:
+              subprocess.run([str(python), "-m", "pip", "freeze"], stdout=log, check=True, timeout=30)
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+              output.write(f"VERIFIER={python.as_posix()}\n")
+      - name: Create deterministic tractogram and anatomical grid
+        if: matrix.enabled
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$VERIFIER" - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import nibabel as nib
+          from nibabel.streamlines import Field
+          import numpy as np
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "scientific"
+          root.mkdir(parents=True, exist_ok=True)
+          affine = np.diag([2.0, 2.0, 2.0, 1.0])
+          affine[:3, 3] = [10.0, 20.0, 30.0]
+          voxels = (
+              np.array([[1, 1, 1], [2, 1, 1], [3, 1, 1]], dtype=np.float32),
+              np.array([[2, 1, 1], [2, 2, 1]], dtype=np.float32),
+          )
+          streamlines = [nib.affines.apply_affine(affine, points) for points in voxels]
+          tractogram = nib.streamlines.Tractogram(
+              streamlines,
+              data_per_point={"fa": [
+                  np.array([[0.2], [0.3], [0.4]], dtype=np.float32),
+                  np.array([[0.5], [0.6]], dtype=np.float32),
+              ]},
+              data_per_streamline={"score": np.array([[1.25], [2.5]], dtype=np.float32)},
+              affine_to_rasmm=np.eye(4),
+          )
+          header = {
+              Field.VOXEL_TO_RASMM: affine,
+              Field.DIMENSIONS: (6, 6, 6),
+              Field.VOXEL_SIZES: (2.0, 2.0, 2.0),
+              Field.VOXEL_ORDER: "RAS",
+          }
+          nib.streamlines.save(
+              nib.streamlines.TrkFile(tractogram, header), str(root / "input.trk")
+          )
+          anat = nib.Nifti1Image(np.ones((6, 6, 6), dtype=np.int16), affine)
+          anat.set_sform(affine, code=2)
+          anat.set_qform(affine, code=1)
+          anat.header.set_intent("t test")
+          anat.header.set_slope_inter(2.0, 0.0)
+          nib.save(anat, root / "anat.nii.gz")
+          (root / "invalid.trk").write_bytes(b"not a tractogram")
+          (root / "fixture.json").write_text(
+              json.dumps({"voxel_streamlines": [points.tolist() for points in voxels],
+                          "affine": affine.tolist()})
+          )
+          PY
+      - name: Run packaged conversion TDI and negative input
+        if: matrix.enabled
+        shell: python {0}
+        run: |
+          import os
+          from pathlib import Path
+          import subprocess
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "scientific"
+          executable = os.environ["EXECUTABLE"]
+          env = os.environ.copy()
+          # Do not let the source checkout supply modules to the packaged application.
+          for key in ("PYTHONPATH", "PYTHONHOME", "QT_QPA_PLATFORM", "APPIMAGE_EXTRACT_AND_RUN"):
+              env.pop(key, None)
+          # Extraction is only for scientific CLI checks; normal GUI/FUSE launches
+          # remain mandatory in the separate AppImage compatibility job.
+          if os.environ["TARGET"] == "appimage":
+              env["APPIMAGE_EXTRACT_AND_RUN"] = "1"
+          cases = [
+              ("conversion", ["input.trk", "--convert-to", "output.trx"], True),
+              ("tdi", ["input.trk", "--density-map", "tdi.nii.gz", "--anat", "anat.nii.gz"], True),
+              ("invalid-input", ["invalid.trk", "--convert-to", "invalid.trx"], False),
+          ]
+          for name, arguments, expected_success in cases:
+              with open(f"evidence/{name}.log", "w") as log:
+                  result = subprocess.run([executable, *arguments], cwd=root, env=env,
+                                          stdout=log, stderr=subprocess.STDOUT, timeout=180)
+              if (result.returncode == 0) != expected_success:
+                  raise RuntimeError(f"{name}: unexpected exit status {result.returncode}")
+          if (root / "invalid.trx").exists():
+              raise RuntimeError("Invalid tractogram produced an output")
+      - name: Check outputs with independent numeric oracles
+        if: matrix.enabled
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$VERIFIER" - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import nibabel as nib
+          import numpy as np
+          import trx.trx_file_memmap as tbx
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "scientific"
+          fixture = json.loads((root / "fixture.json").read_text())
+          affine = np.array(fixture["affine"])
+          expected = [
+              nib.affines.apply_affine(affine, np.array(points))
+              for points in fixture["voxel_streamlines"]
+          ]
+          trx = tbx.load(str(root / "output.trx"))
+          try:
+              actual = list(trx.streamlines)
+              assert len(actual) == 2
+              assert [len(points) for points in actual] == [3, 2]
+              for observed, reference in zip(actual, expected):
+                  np.testing.assert_allclose(observed, reference, atol=1e-4)
+              np.testing.assert_allclose(
+                  np.asarray(trx.data_per_streamline["score"]).reshape(-1),
+                  [1.25, 2.5], atol=1e-5
+              )
+              np.testing.assert_allclose(
+                  np.concatenate(list(trx.data_per_vertex["fa"])).reshape(-1),
+                  [0.2, 0.3, 0.4, 0.5, 0.6], atol=1e-5
+              )
+          finally:
+              trx.close()
+          anatomical = nib.load(root / "anat.nii.gz")
+          assert anatomical.dataobj.slope == 2.0
+          assert anatomical.header["intent_code"] != 0
+          image = nib.load(root / "tdi.nii.gz")
+          data = np.asarray(image.dataobj)
+          oracle = np.zeros((6, 6, 6), dtype=np.float32)
+          for points in fixture["voxel_streamlines"]:
+              for point in points:
+                  oracle[tuple(int(value) for value in point)] += 1
+          assert image.shape == oracle.shape
+          np.testing.assert_array_equal(data, oracle)
+          np.testing.assert_allclose(image.affine, affine)
+          assert image.get_data_dtype() == np.dtype("float32")
+          sform, sform_code = image.get_sform(coded=True)
+          qform, qform_code = image.get_qform(coded=True)
+          assert (sform_code, qform_code) == (2, 1)
+          np.testing.assert_allclose(sform, affine)
+          np.testing.assert_allclose(qform, affine)
+          assert image.header["intent_code"] == 0
+          assert image.dataobj.slope == 1.0 and image.dataobj.inter == 0.0
+          with Path(os.environ["PACKAGE"]).open("rb") as stream:
+              digest = hashlib.file_digest(stream, "sha256").hexdigest()
+          assert digest == os.environ["EXPECTED_SHA256"]
+          result = {
+              "package_sha256": digest, "streamline_count": 2,
+              "streamline_lengths": [3, 2], "tdi_shape": list(image.shape),
+              "tdi_total_counts": int(data.sum()), "negative_input_rejected": True,
+              "passed": True,
+          }
+          Path("evidence/scientific-smoke.json").write_text(
+              json.dumps(result, indent=2) + "\n"
+          )
+          print(json.dumps(result))
+          PY
+      - name: Check DEB XCB plugin dependencies
+        if: matrix.enabled && matrix.target == 'deb'
+        shell: python {0}
+        run: |
+          import os
+          from pathlib import Path
+          import subprocess
+
+          root = Path(os.environ["EXECUTABLE"]).parent
+          internal = root / "_internal"
+          plugins = sorted(internal.rglob("libqxcb.so"))
+          if not plugins:
+              raise RuntimeError("The DEB payload has no Qt XCB platform plugin")
+          env = os.environ.copy()
+          # Match the library directory prepended by the PyInstaller bootloader.
+          env["LD_LIBRARY_PATH"] = str(internal) + (
+              ":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else ""
+          )
+          failed = False
+          with Path("evidence/xcb-dependencies.log").open("w") as log:
+              for plugin in plugins:
+                  result = subprocess.run(
+                      ["ldd", str(plugin)], env=env, capture_output=True,
+                      text=True, timeout=30
+                  )
+                  text = f"{plugin}\n{result.stdout}{result.stderr}\n"
+                  print(text)
+                  log.write(text)
+                  failed |= result.returncode != 0 or "not found" in text
+          if failed:
+              raise RuntimeError("Unresolved DEB XCB dependencies; see xcb-dependencies.log")
+
+      - name: Prepare native GUI probe
+        if: matrix.enabled && matrix.target != 'appimage'
+        shell: python {0}
+        run: |
+          import os
+          from pathlib import Path
+
+          script = Path(os.environ["RUNNER_TEMP"]) / "package-gui-probe.py"
+          script.write_text(r'''
+          import ctypes
+          import json
+          import os
+          from pathlib import Path
+          import signal
+          import subprocess
+          import sys
+          import time
+          import psutil
+
+          evidence = Path(os.environ["GITHUB_WORKSPACE"]) / "evidence"
+          title = "TractEdit GUI - Interactive Editor"
+          report = {"passed": False, "startup_limit_seconds": 90}
+          process = None
+          owned = set()
+          interrupted = None
+
+          def on_signal(signum, frame):
+              global interrupted
+              interrupted = signum
+
+          signal.signal(signal.SIGTERM, on_signal)
+          signal.signal(signal.SIGINT, on_signal)
+
+          def check_signal():
+              if interrupted is not None:
+                  raise RuntimeError(f"GUI probe interrupted by signal {interrupted}")
+
+          def live(item):
+              try:
+                  return item.is_running() and item.status() != psutil.STATUS_ZOMBIE
+              except psutil.NoSuchProcess:
+                  return False
+
+          def refresh_owned():
+              for item in list(owned):
+                  try:
+                      owned.update(item.children(recursive=True))
+                  except psutil.NoSuchProcess:
+                      pass
+              return {item.pid for item in owned if live(item)}
+
+          def windows(pids):
+              if sys.platform == "win32":
+                  from ctypes import wintypes
+                  user = ctypes.WinDLL("user32", use_last_error=True)
+                  callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+                  user.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
+                  user.EnumWindows.restype = wintypes.BOOL
+                  user.IsWindowVisible.argtypes = [wintypes.HWND]
+                  user.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+                  user.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+                  user.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+                  found = []
+                  @callback_type
+                  def visit(hwnd, param):
+                      pid = wintypes.DWORD()
+                      user.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                      text = ctypes.create_unicode_buffer(1024)
+                      user.GetWindowTextW(hwnd, text, len(text))
+                      rect = wintypes.RECT()
+                      if (pid.value in pids and user.IsWindowVisible(hwnd) and text.value == title
+                              and user.GetWindowRect(hwnd, ctypes.byref(rect))
+                              and rect.right > rect.left and rect.bottom > rect.top):
+                          found.append({"id": int(hwnd), "pid": pid.value,
+                                        "bounds": [rect.left, rect.top, rect.right, rect.bottom]})
+                      return True
+                  if not user.EnumWindows(visit, 0):
+                      raise ctypes.WinError(ctypes.get_last_error())
+                  return found
+              if sys.platform == "darwin":
+                  import Quartz as q
+                  records = q.CGWindowListCopyWindowInfo(
+                      q.kCGWindowListOptionOnScreenOnly | q.kCGWindowListExcludeDesktopElements,
+                      q.kCGNullWindowID)
+                  found = []
+                  for record in records or []:
+                      bounds = record.get(q.kCGWindowBounds, {})
+                      if (record.get(q.kCGWindowOwnerPID) in pids
+                              and record.get(q.kCGWindowName) == title
+                              and record.get(q.kCGWindowLayer) == 0
+                              and bounds.get("Width", 0) > 0 and bounds.get("Height", 0) > 0):
+                          found.append({"id": int(record[q.kCGWindowNumber]),
+                                        "pid": int(record[q.kCGWindowOwnerPID])})
+                  return found
+              result = subprocess.run(["xdotool", "search", "--onlyvisible", "--name",
+                                       "^" + title + "$"], capture_output=True, text=True, timeout=5)
+              found = []
+              for window in result.stdout.split():
+                  pid = subprocess.run(["xdotool", "getwindowpid", window],
+                                       capture_output=True, text=True, timeout=5).stdout.strip()
+                  if pid.isdecimal() and int(pid) in pids:
+                      found.append({"id": int(window), "pid": int(pid)})
+              return found
+
+          try:
+              env = os.environ.copy()
+              for key in ("PYTHONPATH", "PYTHONHOME", "QT_QPA_PLATFORM", "APPIMAGE_EXTRACT_AND_RUN"):
+                  env.pop(key, None)
+              if sys.platform == "linux":
+                  env["QT_QPA_PLATFORM"] = "xcb"
+                  env["QT_DEBUG_PLUGINS"] = "1"
+              check_signal()
+              started = time.monotonic()
+              with (evidence / "gui.log").open("w") as log:
+                  process = subprocess.Popen(
+                      [os.environ["EXECUTABLE"]], cwd=os.environ["RUNNER_TEMP"], env=env,
+                      stdout=log, stderr=subprocess.STDOUT, start_new_session=(os.name != "nt"))
+                  owned.add(psutil.Process(process.pid))
+                  window = None
+                  deadline = started + 90
+                  while time.monotonic() < deadline:
+                      check_signal()
+                      if process.poll() is not None:
+                          raise RuntimeError(f"Application exited before GUI: {process.returncode}")
+                      candidates = windows(refresh_owned())
+                      if candidates:
+                          window = candidates[0]
+                          break
+                      time.sleep(1)
+                  appeared = time.monotonic()
+                  if window is None or appeared > deadline:
+                      raise RuntimeError("Main window not observable within 90s; check desktop permissions and logs")
+                  report.update(window=window, window_seconds=round(appeared - started, 3))
+                  until = max(started + 30, appeared + 15)
+                  while time.monotonic() < until:
+                      check_signal()
+                      if process.poll() is not None or window["pid"] not in refresh_owned():
+                          raise RuntimeError("Application ended during GUI observation")
+                      time.sleep(1)
+                  visible = windows(refresh_owned())
+                  if not any(x["id"] == window["id"] and x["pid"] == window["pid"] for x in visible):
+                      raise RuntimeError("Main window disappeared")
+                  screenshot = evidence / ("gui.xwd" if sys.platform == "linux" else "gui.png")
+                  if sys.platform == "win32":
+                      from PIL import ImageGrab
+                      ImageGrab.grab(bbox=window["bounds"], all_screens=True).save(screenshot)
+                  elif sys.platform == "darwin":
+                      subprocess.run(["screencapture", "-x", "-l", str(window["id"]), str(screenshot)],
+                                     check=True, timeout=20)
+                  else:
+                      subprocess.run(["xwd", "-silent", "-id", str(window["id"]), "-out", str(screenshot)],
+                                     check=True, timeout=20)
+                  if screenshot.stat().st_size == 0:
+                      raise RuntimeError("Empty GUI screenshot")
+                  check_signal()
+                  report["observed_seconds"] = round(time.monotonic() - started, 3)
+                  report["passed"] = True
+          except BaseException as error:
+              report["error"] = str(error)
+              raise
+          finally:
+              try:
+                  refresh_owned()
+                  # Preserve Process objects so PID reuse cannot target an unrelated process.
+                  for method in ("terminate", "kill"):
+                      for item in owned:
+                          try:
+                              getattr(item, method)()
+                          except psutil.NoSuchProcess:
+                              pass
+                      psutil.wait_procs(list(owned), timeout=3)
+                      if process is not None:
+                          process.poll()
+                      if not refresh_owned():
+                          break
+                  remaining = refresh_owned()
+                  report["cleanup_passed"] = not remaining
+                  if remaining:
+                      raise RuntimeError(f"GUI children survived cleanup: {sorted(remaining)}")
+              except BaseException as error:
+                  report["passed"] = False
+                  report["cleanup_error"] = str(error)
+                  raise
+              finally:
+                  if interrupted is not None:
+                      report["passed"] = False
+                      report["termination_signal"] = interrupted
+                  (evidence / "gui.json").write_text(json.dumps(report, indent=2) + "\n")
+          check_signal()
+          ''', encoding="utf-8")
+      # Install a host graphics driver only in the disposable Windows validation VM.
+      # No Mesa DLLs are copied into the ZIP or its extracted application directory.
+      - name: Install pinned Mesa software renderer for Windows tests
+        if: matrix.enabled && matrix.target == 'exe'
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
+            throw 'System-wide Mesa deployment is restricted to disposable GitHub-hosted runners.'
+          }
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw 'The Windows validation runner must have administrator rights.'
+          }
+          $packageHash = (Get-FileHash -LiteralPath $env:PACKAGE -Algorithm SHA256).Hash
+          $executableHash = (Get-FileHash -LiteralPath $env:EXECUTABLE -Algorithm SHA256).Hash
+          if ($packageHash.ToLowerInvariant() -ne $env:EXPECTED_SHA256) {
+            throw 'The downloaded Windows ZIP identity changed.'
+          }
+          $mesaVersion = '26.2.3'
+          $mesaHash = '3f3613adb43cfd0f2e665ce2400b130c275f0b3317cb3a05566320a3a67589ed'
+          $mesaRoot = Join-Path $env:RUNNER_TEMP 'mesa-ci'
+          New-Item -ItemType Directory -Path $mesaRoot | Out-Null
+          $archive = Join-Path $mesaRoot 'mesa.7z'
+          $url = "https://github.com/pal1000/mesa-dist-win/releases/download/$mesaVersion/mesa3d-$mesaVersion-release-msvc.7z"
+          Invoke-WebRequest -Uri $url -OutFile $archive -TimeoutSec 300
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $mesaHash) {
+            throw 'Mesa archive SHA-256 mismatch.'
+          }
+          & 7z.exe x $archive "-o$mesaRoot" -y
+          if ($LASTEXITCODE -ne 0) { throw 'Mesa archive extraction failed.' }
+          & (Join-Path $mesaRoot 'systemwidedeploy.cmd') 1
+          if ($LASTEXITCODE -ne 0) { throw 'Mesa system-wide deployment failed.' }
+          if ((Get-FileHash -LiteralPath $env:PACKAGE -Algorithm SHA256).Hash -ne $packageHash -or
+              (Get-FileHash -LiteralPath $env:EXECUTABLE -Algorithm SHA256).Hash -ne $executableHash) {
+            throw 'Mesa setup unexpectedly changed the application under test.'
+          }
+          'GALLIUM_DRIVER=llvmpipe' | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "Mesa $mesaVersion, SHA-256: $mesaHash; CI-only system driver." |
+            Set-Content -LiteralPath 'evidence/windows-mesa.log' -Encoding utf8
+
+      - name: Require Windows OpenGL for GUI validation
+        if: matrix.enabled && matrix.target == 'exe'
+        shell: python {0}
+        timeout-minutes: 2
+        run: |
+          import ctypes as c
+          from ctypes import wintypes as w
+          import json
+          import re
+          from pathlib import Path
+
+          # Require the CI software driver before starting the unmodified packaged GUI.
+          report = {"scope": "runner system WGL context", "measured": False}
+          window = dc = context = None
+          user = c.WinDLL("user32", use_last_error=True)
+          gdi = c.WinDLL("gdi32", use_last_error=True)
+          gl = c.WinDLL("opengl32", use_last_error=True)
+
+          class PixelFormat(c.Structure):
+              _fields_ = [("nSize", w.WORD), ("nVersion", w.WORD), ("dwFlags", w.DWORD)]
+              _fields_ += [(name, w.BYTE) for name in (
+                  "iPixelType cColorBits cRedBits cRedShift cGreenBits cGreenShift "
+                  "cBlueBits cBlueShift cAlphaBits cAlphaShift cAccumBits cAccumRedBits "
+                  "cAccumGreenBits cAccumBlueBits cAccumAlphaBits cDepthBits cStencilBits "
+                  "cAuxBuffers iLayerType bReserved").split()]
+              _fields_ += [(name, w.DWORD) for name in ("dwLayerMask", "dwVisibleMask", "dwDamageMask")]
+
+          def bind(dll, name, result, arguments):
+              fn = getattr(dll, name)
+              fn.restype, fn.argtypes = result, arguments
+              return fn
+
+          create = bind(user, "CreateWindowExW", w.HWND,
+                        [w.DWORD, w.LPCWSTR, w.LPCWSTR, w.DWORD, c.c_int, c.c_int,
+                         c.c_int, c.c_int, w.HWND, w.HMENU, w.HINSTANCE, c.c_void_p])
+          getdc = bind(user, "GetDC", w.HDC, [w.HWND])
+          release = bind(user, "ReleaseDC", c.c_int, [w.HWND, w.HDC])
+          destroy = bind(user, "DestroyWindow", w.BOOL, [w.HWND])
+          choose = bind(gdi, "ChoosePixelFormat", c.c_int, [w.HDC, c.POINTER(PixelFormat)])
+          setformat = bind(gdi, "SetPixelFormat", w.BOOL, [w.HDC, c.c_int, c.POINTER(PixelFormat)])
+          createcontext = bind(gl, "wglCreateContext", c.c_void_p, [w.HDC])
+          makecurrent = bind(gl, "wglMakeCurrent", w.BOOL, [w.HDC, c.c_void_p])
+          deletecontext = bind(gl, "wglDeleteContext", w.BOOL, [c.c_void_p])
+          getstring = bind(gl, "glGetString", c.c_char_p, [c.c_uint])
+          getproc = bind(gl, "wglGetProcAddress", c.c_void_p, [c.c_char_p])
+
+          def require(value, operation):
+              if not value:
+                  raise RuntimeError(f"{operation} failed (Win32 error {c.get_last_error()})")
+              return value
+
+          try:
+              assert c.sizeof(PixelFormat) == 40
+              window = require(create(0, "STATIC", "OpenGL diagnostics", 0x80000000,
+                                      0, 0, 16, 16, None, None, None, None), "CreateWindowExW")
+              dc = require(getdc(window), "GetDC")
+              fmt = PixelFormat()
+              fmt.nSize, fmt.nVersion = c.sizeof(fmt), 1
+              fmt.dwFlags = 0x4 | 0x20 | 0x1  # Draw to window, support OpenGL, double buffer.
+              fmt.cColorBits, fmt.cDepthBits, fmt.cStencilBits = 24, 24, 8
+              index = require(choose(dc, c.byref(fmt)), "ChoosePixelFormat")
+              require(setformat(dc, index, c.byref(fmt)), "SetPixelFormat")
+              context = require(createcontext(dc), "wglCreateContext")
+              require(makecurrent(dc, context), "wglMakeCurrent")
+              for name, token in (("vendor", 0x1F00), ("renderer", 0x1F01), ("version", 0x1F02)):
+                  value = require(getstring(token), f"glGetString({name})")
+                  report[name] = value.decode("ascii", errors="replace")
+              address = getproc(b"wglCreateContextAttribsARB")
+              report["has_context_attribs_entrypoint"] = address not in (
+                  None, 0, 1, 2, 3, c.c_void_p(-1).value)
+              report["measured"] = True
+          except Exception as error:
+              report["error"] = str(error)
+          finally:
+              if context:
+                  makecurrent(None, None)
+                  deletecontext(context)
+              if dc:
+                  release(window, dc)
+              if window:
+                  destroy(window)
+              Path("evidence").mkdir(exist_ok=True)
+              text = json.dumps(report, indent=2)
+              Path("evidence/windows-opengl.json").write_text(text + "\n", encoding="utf-8")
+              print(text)
+          version = re.match(r"(\d+)\.(\d+)", report.get("version", ""))
+          if (not report["measured"] or not version
+                  or tuple(map(int, version.groups())) < (3, 2)
+                  or not report.get("has_context_attribs_entrypoint")):
+              raise SystemExit("Runner lacks the OpenGL 3.2 context support required for VTK")
+          if "llvmpipe" not in report.get("renderer", "").lower():
+              raise SystemExit("Expected the pinned Mesa llvmpipe software renderer")
+
+      - name: Observe real packaged GUI
+        id: packaged-gui
+        if: matrix.enabled && matrix.target != 'appimage'
+        shell: bash
+        timeout-minutes: 4
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            xvfb-run -a timeout --signal=TERM --kill-after=35s 180s \
+              "$VERIFIER" "$RUNNER_TEMP/package-gui-probe.py"
+          else
+            "$VERIFIER" "$RUNNER_TEMP/package-gui-probe.py"
+          fi
+      - name: Diagnose Windows GUI crash
+        if: always() && matrix.enabled && matrix.target == 'exe' && steps.packaged-gui.outcome == 'failure'
+        shell: pwsh
+        timeout-minutes: 2
+        run: |
+          New-Item -ItemType Directory -Force -Path evidence | Out-Null
+          $reportPath = Join-Path (Get-Location) 'evidence/windows-crash.log'
+          "Executable: $env:EXECUTABLE" | Set-Content -LiteralPath $reportPath -Encoding utf8
+          "Runner image: $env:ImageOS / $env:ImageVersion" | Add-Content -LiteralPath $reportPath
+          try {
+            $events = @(Get-WinEvent -FilterHashtable @{
+              LogName = 'Application'
+              Id = 1000, 1001
+              StartTime = (Get-Date).AddMinutes(-15)
+            } -ErrorAction Stop | Where-Object {
+              $_.Message -match '(?i)tractedit\.exe'
+            })
+            if ($events.Count -eq 0) {
+              'No matching application crash events were recorded.' | Add-Content -LiteralPath $reportPath
+            }
+            foreach ($event in $events) {
+              $event | Format-List TimeCreated, Id, ProviderName, Message |
+                Out-String -Width 240 | Add-Content -LiteralPath $reportPath
+            }
+          } catch {
+            "Crash events unavailable: $($_.Exception.Message)" | Add-Content -LiteralPath $reportPath
+          }
+          try {
+            Get-CimInstance Win32_VideoController -ErrorAction Stop |
+              Select-Object Name, DriverVersion, VideoProcessor, Status |
+              Format-List | Out-String -Width 240 | Add-Content -LiteralPath $reportPath
+          } catch {
+            "Video information unavailable: $($_.Exception.Message)" | Add-Content -LiteralPath $reportPath
+          }
+          Get-Content -LiteralPath $reportPath
+
+      - name: Detach tested DMG
+        if: always() && matrix.enabled && runner.os == 'macOS' && env.DMG_MOUNT != ''
+        shell: python {0}
+        run: |
+          import os
+          import subprocess
+          subprocess.run(["hdiutil", "detach", os.environ["DMG_MOUNT"]],
+                         check=True, timeout=30)
+      - name: Report validation diagnostics
+        if: always() && matrix.enabled
+        shell: python {0}
+        run: |
+          import os
+          from pathlib import Path
+
+          root = Path("evidence")
+          reports = sorted(
+              path for path in root.rglob("*")
+              if path.is_file() and path.suffix in (".json", ".log", ".txt", ".network", ".mounts")
+          )
+          remaining = 64000
+          for path in reports:
+              if remaining <= 0:
+                  break
+              limit = min(8000, remaining)
+              with path.open("rb") as stream:
+                  stream.seek(max(0, path.stat().st_size - limit))
+                  tail = stream.read(limit).decode("utf-8", errors="replace")
+              print(f"--- {path.as_posix()} (last {limit} bytes at most) ---")
+              print(tail)
+              remaining -= limit
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("### Validation diagnostics\n\n")
+              summary.write(f"{len(reports)} text reports/logs generated; bounded excerpts are in this step's log.\n\n")
+              summary.write("Only application packages are uploaded as artifacts. Screenshots remain temporary runner files.\n")
+    env:
+      TARGET: ${{ matrix.target }}

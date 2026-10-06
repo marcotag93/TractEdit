@@ -20,11 +20,11 @@ Features:
 from __future__ import annotations
 
 import os
-import time
 import logging
-from typing import TYPE_CHECKING, Optional, Dict, Tuple, List, Any
+from typing import TYPE_CHECKING, Optional, Dict, Tuple, List, Any, Iterable
 
 from ..utils import signals_blocked
+from ..transactional_io import staged_output_set, transactional_save
 
 import numpy as np
 from PyQt6.QtWidgets import (
@@ -36,10 +36,23 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 import nibabel as nib
 
+from ..reference_grid import validate_volume_geometry
+
 if TYPE_CHECKING:
     from ..main_window import MainWindow
 
 logger = logging.getLogger(__name__)
+
+
+def _has_valid_endpoints(streamline: Any) -> bool:
+    if streamline is None:
+        return False
+    coordinates = np.asarray(streamline)
+    if coordinates.ndim != 2 or coordinates.shape[1] != 3 or len(coordinates) < 2:
+        return False
+    if not np.all(np.isfinite(coordinates[[0, -1]])):
+        return False
+    return True
 
 
 # ============================================================================
@@ -186,7 +199,7 @@ FREESURFER_BUILTIN_LABELS = {
 
 
 # _compute_endpoint_labels — AOT chunk + ThreadPool wrapper
-from tractedit_pkg._numba_aot._parallel_wrappers import (
+from tractedit_pkg._numba_aot._parallel_wrappers import (  # noqa: E402
     compute_endpoint_labels as _compute_endpoint_labels,
 )
 
@@ -276,7 +289,6 @@ def _create_connectivity_visualization(
 
         matplotlib.use("Agg")  # Non-interactive backend
         import matplotlib.pyplot as plt
-        from matplotlib.colors import LogNorm
     except ImportError:
         logger.warning("Matplotlib not available. Skipping visualization.")
         return False
@@ -353,6 +365,36 @@ def _create_connectivity_visualization(
 # ============================================================================
 
 
+_ATLAS_READ_BLOCK_BYTES = 4 * 1024 * 1024
+
+
+def _read_atlas_c_int32(dataobj) -> np.ndarray:
+    """Read a file proxy sequentially into the native kernel's final layout."""
+    if not isinstance(dataobj, nib.arrayproxy.ArrayProxy) or len(dataobj.shape) != 3:
+        return np.asarray(dataobj, dtype=np.int32, order="C")
+    from nibabel.openers import ImageOpener
+
+    shape = dataobj.shape
+    axis = 2 if dataobj.order == "F" else 0
+    plane_size = int(np.prod(shape)) // shape[axis]
+    # Scaling can promote stored integers to float64. A single plane is the
+    # minimum sequential unit, even if an unusually large plane exceeds budget.
+    width = max(
+        1, _ATLAS_READ_BLOCK_BYTES // (plane_size * max(8, dataobj.dtype.itemsize))
+    )
+    result = np.empty(shape, dtype=np.int32, order="C")
+    spec = (shape, dataobj.dtype, dataobj.offset, dataobj.slope, dataobj.inter)
+    # One explicitly scoped stream avoids repeated decompression for .nii.gz.
+    with ImageOpener(dataobj.file_like) as stream:
+        proxy = nib.arrayproxy.ArrayProxy(stream, spec, mmap=False, order=dataobj.order)
+        for start in range(0, shape[axis], width):
+            slices = [slice(None)] * 3
+            slices[axis] = slice(start, min(start + width, shape[axis]))
+            slices = tuple(slices)
+            result[slices] = proxy[slices]
+    return result
+
+
 class ConnectivityManager:
     """
     Manages connectivity matrix computation for TractEdit.
@@ -380,9 +422,17 @@ class ConnectivityManager:
             The inverse affine matrix, or None if the matrix is singular.
         """
         try:
-            return np.linalg.inv(self.mw.parcellation_affine)
-        except np.linalg.LinAlgError:
-            logger.error("Parcellation affine matrix is singular, cannot compute inverse.")
+            affine = np.asarray(self.mw.parcellation_affine, dtype=np.float64)
+            if affine.shape != (4, 4) or not np.all(np.isfinite(affine)):
+                raise np.linalg.LinAlgError
+            inverse = np.linalg.inv(affine)
+            if not np.all(np.isfinite(inverse)):
+                raise np.linalg.LinAlgError
+            return inverse
+        except (TypeError, ValueError, np.linalg.LinAlgError):
+            logger.error(
+                "Parcellation affine matrix is singular, cannot compute inverse."
+            )
             QMessageBox.critical(
                 self.mw,
                 "Error",
@@ -390,6 +440,167 @@ class ConnectivityManager:
                 "The parcellation file may be corrupted.",
             )
             return None
+
+    def _endpoint_cache_owner(self) -> Tuple[int, int, int, bytes, int, int, int]:
+        """Own labels by data versions/identities and the affine's values.
+
+        Volume and streamline edits require their data version to advance.
+        The small 4x4 affine is snapshotted directly to detect in-place edits
+        without scanning or copying either large dataset.
+        """
+        mw = self.mw
+        tractogram = mw.tractogram_data
+        return (
+            getattr(mw, "_parcellation_data_version", 0),
+            id(mw.parcellation_data),
+            id(mw.parcellation_affine),
+            np.asarray(mw.parcellation_affine, dtype=np.float64).tobytes(),
+            getattr(mw, "_tractogram_data_version", 0),
+            id(tractogram),
+            len(tractogram),
+        )
+
+    def is_parcellation_overlay_cache_current(self) -> bool:
+        """Return whether cached actors match the current visible data."""
+        mw = self.mw
+        if mw.parcellation_data is None or mw.tractogram_data is None:
+            return False
+        expected_key = (
+            self._endpoint_cache_owner(),
+            getattr(mw, "_visibility_version", 0),
+        )
+        return bool(
+            getattr(mw, "_parcellation_overlay_cached", False)
+            and (
+                getattr(mw, "parcellation_region_actors", {})
+                or getattr(mw, "_session_deferred_regions", {})
+            )
+            and getattr(mw, "_parcellation_overlay_cache_key", None) == expected_key
+        )
+
+    def _reset_endpoint_cache(self) -> None:
+        """Clear all endpoint-derived parcellation state."""
+        mw = self.mw
+        mw.parcellation_region_intersection_cache = {}
+        mw.parcellation_start_labels = None
+        mw.parcellation_end_labels = None
+        mw.parcellation_visible_indices = None
+        mw._parcellation_endpoint_labels_computed = None
+        mw._parcellation_endpoint_cache_key = None
+
+    def _ensure_endpoint_labels(self, indices: Iterable[int]) -> Optional[np.ndarray]:
+        """Compute labels only for uncached streamline indices."""
+        mw = self.mw
+        if mw.parcellation_data is None or mw.tractogram_data is None:
+            return None
+
+        owner = self._endpoint_cache_owner()
+        if getattr(mw, "_parcellation_endpoint_cache_key", None) != owner:
+            self._reset_endpoint_cache()
+
+        if isinstance(indices, np.ndarray):
+            requested = np.asarray(indices, dtype=np.int64).reshape(-1)
+        else:
+            requested = np.fromiter(indices, dtype=np.int64)
+
+        n_streamlines = len(mw.tractogram_data)
+        if requested.size and (
+            np.any(requested < 0) or np.any(requested >= n_streamlines)
+        ):
+            raise IndexError("Streamline index outside tractogram bounds.")
+
+        computed = getattr(mw, "_parcellation_endpoint_labels_computed", None)
+        if computed is None or computed.shape != (n_streamlines,):
+            mw.parcellation_start_labels = np.empty(0, dtype=np.int32)
+            mw.parcellation_end_labels = np.empty(0, dtype=np.int32)
+            computed = np.zeros(n_streamlines, dtype=bool)
+            mw._parcellation_endpoint_labels_computed = computed
+            mw.parcellation_visible_indices = np.empty(0, dtype=np.int64)
+
+        missing = requested[~computed[requested]]
+        if missing.size:
+            valid_positions = []
+            start_points = []
+            end_points = []
+            for position, streamline_index in enumerate(missing):
+                streamline = mw.tractogram_data[int(streamline_index)]
+                if _has_valid_endpoints(streamline):
+                    valid_positions.append(position)
+                    start_points.append(streamline[0])
+                    end_points.append(streamline[-1])
+
+            inv_affine = self._invert_parcellation_affine()
+            if inv_affine is None:
+                return None
+            start_labels = np.zeros(len(missing), dtype=np.int32)
+            end_labels = np.zeros(len(missing), dtype=np.int32)
+            if valid_positions:
+                valid_start, valid_end = _compute_endpoint_labels(
+                    np.ascontiguousarray(start_points, dtype=np.float64),
+                    np.ascontiguousarray(end_points, dtype=np.float64),
+                    np.ascontiguousarray(inv_affine[:3, :3], dtype=np.float64),
+                    np.ascontiguousarray(inv_affine[:3, 3], dtype=np.float64),
+                    mw.parcellation_data,
+                    np.array(mw.parcellation_data.shape, dtype=np.int64),
+                )
+                start_labels[valid_positions] = valid_start
+                end_labels[valid_positions] = valid_end
+            invalid_count = len(missing) - len(valid_positions)
+            if invalid_count:
+                logger.warning(
+                    "Ignored %d degenerate streamline(s) during endpoint labeling.",
+                    invalid_count,
+                )
+            mw.parcellation_start_labels = np.concatenate(
+                (mw.parcellation_start_labels, start_labels)
+            )
+            mw.parcellation_end_labels = np.concatenate(
+                (mw.parcellation_end_labels, end_labels)
+            )
+            computed[missing] = True
+            mw.parcellation_visible_indices = np.concatenate(
+                (mw.parcellation_visible_indices, missing)
+            )
+
+        mw._parcellation_endpoint_cache_key = owner
+        return missing
+
+    def ensure_region_intersections(
+        self,
+        labels: Iterable[int],
+        indices: Iterable[int],
+    ) -> bool:
+        """Ensure region caches cover the requested streamline indices."""
+        mw = self.mw
+        try:
+            newly_computed = self._ensure_endpoint_labels(indices)
+            if newly_computed is None:
+                return False
+
+            requested_labels = {int(label) for label in labels}
+            cached_labels = set(mw.parcellation_region_intersection_cache)
+            computed_indices = mw.parcellation_visible_indices
+            start_labels = mw.parcellation_start_labels
+            end_labels = mw.parcellation_end_labels
+
+            if newly_computed.size:
+                new_start_labels = start_labels[-len(newly_computed) :]
+                new_end_labels = end_labels[-len(newly_computed) :]
+                for label in cached_labels:
+                    matches = (new_start_labels == label) | (new_end_labels == label)
+                    mw.parcellation_region_intersection_cache[label].update(
+                        map(int, newly_computed[matches])
+                    )
+
+            for label in requested_labels - cached_labels:
+                matches = (start_labels == label) | (end_labels == label)
+                mw.parcellation_region_intersection_cache[label] = set(
+                    map(int, computed_indices[matches])
+                )
+            return True
+        except (ValueError, IndexError, TypeError) as error:
+            logger.error("Error computing parcellation intersections: %s", error)
+            return False
 
     def load_parcellation(self, file_path: Optional[str] = None) -> bool:
         """
@@ -421,17 +632,27 @@ class ConnectivityManager:
 
             # Load NIfTI
             img = nib.load(file_path)
-            data = np.asarray(img.dataobj, dtype=np.int32)
+            try:
+                validate_volume_geometry(img.dataobj, img.affine, "Parcellation")
+            except ValueError as error:
+                QMessageBox.warning(mw, "Parcellation Error", str(error))
+                return False
+            # The compiled endpoint kernel requires C-contiguous int32 data.
+            data = _read_atlas_c_int32(img.dataobj)
             affine = img.affine.astype(np.float64)
 
-            # Validate - should be 3D integer volume
-            if data.ndim != 3:
-                QMessageBox.warning(
-                    mw,
-                    "Parcellation Error",
-                    "Parcellation file must be a 3D volume.",
-                )
-                return False
+            previous_region_states = getattr(mw, "parcellation_region_states", {})
+            had_active_region_filters = any(
+                state.get("include") or state.get("exclude")
+                for state in previous_region_states.values()
+            )
+            self.invalidate_parcellation_cache(
+                clear_region_states=True,
+                clear_region_visibility=True,
+            )
+            mw._parcellation_data_version = (
+                getattr(mw, "_parcellation_data_version", 0) + 1
+            )
 
             # Store parcellation data
             mw.parcellation_data = data
@@ -446,6 +667,10 @@ class ConnectivityManager:
             for label in unique_labels:
                 if label not in mw.parcellation_labels:
                     mw.parcellation_labels[label] = f"Region_{label}"
+
+            roi_manager = vars(mw).get("roi_manager")
+            if roi_manager is not None and had_active_region_filters:
+                roi_manager.apply_logic_filters()
 
             # Update UI
             n_regions = len(unique_labels)
@@ -513,7 +738,8 @@ class ConnectivityManager:
             return False
 
         try:
-            nib.save(nib.Nifti1Image(region_mask, mw.parcellation_affine), save_path)
+            image = nib.Nifti1Image(region_mask, mw.parcellation_affine)
+            transactional_save(save_path, lambda path: nib.save(image, path))
             mw.vtk_panel.update_status(f"Saved region '{region_name}' to: {save_path}")
             logger.info(f"Saved parcellation region {label} to {save_path}")
             return True
@@ -531,14 +757,11 @@ class ConnectivityManager:
         """
         mw = self.mw
 
-        # Remove overlay actors from scene
-        self._hide_parcellation_actors()
-
-        # Clear cached actors to free memory
-        if hasattr(mw, "parcellation_overlay_actor"):
-            mw.parcellation_overlay_actor = None
-        if hasattr(mw, "parcellation_region_actors"):
-            mw.parcellation_region_actors = {}
+        self.invalidate_parcellation_cache(
+            clear_region_states=True,
+            clear_region_visibility=True,
+        )
+        mw._parcellation_data_version = getattr(mw, "_parcellation_data_version", 0) + 1
 
         # Clear parcellation data
         mw.parcellation_data = None
@@ -575,7 +798,7 @@ class ConnectivityManager:
         mw.vtk_panel.update_status("Parcellation removed and cache cleared.")
         logger.info("Parcellation removed and cache cleared")
 
-    ##TODO - add circular connectome 
+    ##TODO - add circular connectome
     def compute_connectivity_matrix(self) -> Optional[Dict[str, Any]]:
         """
         Computes the structural connectivity matrix from visible streamlines.
@@ -620,7 +843,18 @@ class ConnectivityManager:
 
             # Extract visible streamlines endpoints
             visible_indices = list(mw.visible_indices)
-            n_streamlines = len(visible_indices)
+            valid_indices = [
+                index
+                for index in visible_indices
+                if _has_valid_endpoints(mw.tractogram_data[index])
+            ]
+            invalid_count = len(visible_indices) - len(valid_indices)
+            if invalid_count:
+                logger.warning(
+                    "Ignored %d degenerate streamline(s) in connectivity.",
+                    invalid_count,
+                )
+            n_streamlines = len(valid_indices)
 
             progress.setLabelText(
                 f"Extracting endpoints from {n_streamlines} streamlines..."
@@ -632,14 +866,13 @@ class ConnectivityManager:
                 return None
 
             # Collect start and end points
-            start_points = np.zeros((n_streamlines, 3), dtype=np.float64)
-            end_points = np.zeros((n_streamlines, 3), dtype=np.float64)
+            start_points = np.empty((n_streamlines, 3), dtype=np.float64)
+            end_points = np.empty((n_streamlines, 3), dtype=np.float64)
 
-            for i, idx in enumerate(visible_indices):
+            for i, idx in enumerate(valid_indices):
                 sl = mw.tractogram_data[idx]
-                if sl is not None and len(sl) >= 2:
-                    start_points[i] = sl[0]
-                    end_points[i] = sl[-1]
+                start_points[i] = sl[0]
+                end_points[i] = sl[-1]
 
             progress.setLabelText("Computing endpoint labels (AOT-compiled)...")
             progress.setValue(30)
@@ -784,51 +1017,53 @@ class ConnectivityManager:
             # Determine format from extension
             ext = os.path.splitext(output_path)[1].lower()
 
-            if ext == ".npy":
-                # Save as NumPy binary
-                np.save(output_path, matrix)
+            if ext != ".npy" and not output_path.endswith(".csv"):
+                output_path += ".csv"
 
-                # Also save metadata as JSON sidecar
-                import json
-
-                metadata_path = output_path.replace(".npy", "_labels.json")
-                metadata = {
-                    "labels": result["labels"],
-                    "label_names": label_names,
-                    "n_streamlines": result["n_streamlines"],
-                    "n_regions": result["n_regions"],
-                }
-                with open(metadata_path, "w", encoding="utf-8") as f:
-                    json.dump(metadata, f, indent=2)
-
-                logger.info(
-                    f"Saved connectivity matrix to {output_path} and {metadata_path}"
-                )
-
-            else:
-                # Default to CSV format
-                if not output_path.endswith(".csv"):
-                    output_path += ".csv"
-
-                # Write CSV with headers
-                with open(output_path, "w", encoding="utf-8") as f:
-                    # Header row
-                    f.write("," + ",".join(label_names) + "\n")
-                    # Data rows
-                    for i, row in enumerate(matrix):
-                        f.write(label_names[i] + "," + ",".join(map(str, row)) + "\n")
-
-                logger.info(f"Saved connectivity matrix to {output_path}")
-
-            # Generate PNG visualization with same base name
             base_path = os.path.splitext(output_path)[0]
             png_path = base_path + ".png"
-            _create_connectivity_visualization(
-                matrix,
-                label_names,
-                png_path,
-                title=f"Connectivity Matrix ({result['n_regions']} regions)",
-            )
+            destinations = [output_path, png_path]
+            metadata_path = None
+            if ext == ".npy":
+                metadata_path = output_path.replace(".npy", "_labels.json")
+                destinations.append(metadata_path)
+
+            from pathlib import Path
+
+            destination_paths = [Path(path) for path in destinations]
+            with staged_output_set(destination_paths) as staged:
+                output_key = Path(output_path)
+                if ext == ".npy":
+                    np.save(staged[output_key], matrix)
+
+                    import json
+
+                    metadata = {
+                        "labels": result["labels"],
+                        "label_names": label_names,
+                        "n_streamlines": result["n_streamlines"],
+                        "n_regions": result["n_regions"],
+                    }
+                    with open(
+                        staged[Path(metadata_path)], "w", encoding="utf-8"
+                    ) as file:
+                        json.dump(metadata, file, indent=2)
+                else:
+                    with open(staged[output_key], "w", encoding="utf-8") as file:
+                        file.write("," + ",".join(label_names) + "\n")
+                        for i, row in enumerate(matrix):
+                            values = ",".join(map(str, row))
+                            file.write(f"{label_names[i]},{values}\n")
+
+                if not _create_connectivity_visualization(
+                    matrix,
+                    label_names,
+                    str(staged[Path(png_path)]),
+                    title=f"Connectivity Matrix ({result['n_regions']} regions)",
+                ):
+                    raise OSError("Failed to create connectivity visualization.")
+
+            logger.info("Saved connectivity output set to %s", output_path)
 
             mw.vtk_panel.update_status(
                 f"Connectivity matrix saved: {os.path.basename(output_path)} "
@@ -885,14 +1120,19 @@ class ConnectivityManager:
             )
             return False
 
-        # Check if we have cached actors - just show them
-        if (
-            hasattr(mw, "_parcellation_overlay_cached")
-            and mw._parcellation_overlay_cached
-            and hasattr(mw, "parcellation_region_actors")
-            and mw.parcellation_region_actors
-        ):
-            self._show_parcellation_actors()
+        visible_indices = np.fromiter(
+            mw.visible_indices,
+            dtype=np.int64,
+            count=len(mw.visible_indices),
+        )
+        overlay_cache_key = (
+            self._endpoint_cache_owner(),
+            getattr(mw, "_visibility_version", 0),
+        )
+
+        if self.is_parcellation_overlay_cache_current():
+            if self._show_parcellation_actors() is False:
+                return False
             mw.vtk_panel.update_status(
                 f"Parcellation overlay restored ({len(getattr(mw, 'parcellation_connected_labels', []))} regions)"
             )
@@ -909,38 +1149,15 @@ class ConnectivityManager:
             )
             QApplication.processEvents()
 
-            # Vectorized extraction of endpoints
-            visible_indices = np.array(list(mw.visible_indices), dtype=np.int64)
-            n_streamlines = len(visible_indices)
-
-            # Pre-allocate arrays
-            start_points = np.zeros((n_streamlines, 3), dtype=np.float64)
-            end_points = np.zeros((n_streamlines, 3), dtype=np.float64)
-
-            # Vectorized extraction using numpy stacking. Get all streamlines as list first, then extract endpoints
-            streamlines = [mw.tractogram_data[idx] for idx in visible_indices]
-
-            for i, sl in enumerate(streamlines):
-                if sl is not None and len(sl) >= 2:
-                    start_points[i] = sl[0]
-                    end_points[i] = sl[-1]
-
-            # AOT-compiled label extraction
-            inv_affine = self._invert_parcellation_affine()
-            if inv_affine is None:
+            if self._ensure_endpoint_labels(visible_indices) is None:
                 return False
-            inv_affine_3x3 = inv_affine[:3, :3].astype(np.float64)
-            inv_affine_offset = inv_affine[:3, 3].astype(np.float64)
-            dims = np.array(mw.parcellation_data.shape, dtype=np.int64)
-
-            start_labels, end_labels = _compute_endpoint_labels(
-                start_points,
-                end_points,
-                inv_affine_3x3,
-                inv_affine_offset,
-                mw.parcellation_data,
-                dims,
+            visible_rows = np.isin(
+                mw.parcellation_visible_indices,
+                visible_indices,
+                assume_unique=True,
             )
+            start_labels = mw.parcellation_start_labels[visible_rows]
+            end_labels = mw.parcellation_end_labels[visible_rows]
 
             mw.vtk_panel.update_progress_bar(1, TOTAL_STEPS, visible=True)
             mw.vtk_panel.update_status(
@@ -956,19 +1173,11 @@ class ConnectivityManager:
             logger.info(f"Found {len(connected_labels)} connected regions")
             mw.parcellation_connected_labels = connected_set
 
-            # Store endpoint labels for region intersection computation (include/exclude filters)
-            mw.parcellation_start_labels = start_labels
-            mw.parcellation_end_labels = end_labels
-            mw.parcellation_visible_indices = visible_indices.copy()
-
             # Vectorized color assignment. Generate colormap colors for all possible labels at once
             try:
                 import matplotlib
 
-                matplotlib.use("Agg")
-                import matplotlib.pyplot as plt
-
-                cmap = plt.cm.get_cmap("tab20")
+                cmap = matplotlib.colormaps["tab20"]
                 use_cmap = True
             except ImportError:
                 use_cmap = False
@@ -1073,6 +1282,7 @@ class ConnectivityManager:
             # Mark as cached
             mw._parcellation_overlay_cached = True
             mw._parcellation_overlay_visible = True
+            mw._parcellation_overlay_cache_key = overlay_cache_key
 
             mw.vtk_panel.update_progress_bar(TOTAL_STEPS, TOTAL_STEPS, visible=True)
             QApplication.processEvents()
@@ -1115,7 +1325,9 @@ class ConnectivityManager:
 
                 QTimer.singleShot(100, lambda: self._finalize_render(mw))
             except RuntimeError:
-                logger.debug("VTK render or timer setup failed during overlay creation.")
+                logger.debug(
+                    "VTK render or timer setup failed during overlay creation."
+                )
 
             return True
 
@@ -1147,6 +1359,7 @@ class ConnectivityManager:
         Prevents crashes from stale VTK state.
         """
         mw = self.mw
+        mw._session_deferred_regions = {}
 
         if not mw.vtk_panel or not mw.vtk_panel.scene:
             return
@@ -1171,6 +1384,7 @@ class ConnectivityManager:
         # Reset cache flags
         mw._parcellation_overlay_cached = False
         mw._parcellation_overlay_visible = False
+        mw._parcellation_overlay_cache_key = None
 
         # Force VTK garbage collection
         try:
@@ -1178,11 +1392,23 @@ class ConnectivityManager:
         except RuntimeError:
             logger.debug("VTK render failed during actor cleanup.")
 
-    def _show_parcellation_actors(self) -> None:
+    def _show_parcellation_actors(self) -> bool:
         """Shows cached parcellation actors (adds them back to scene)."""
         mw = self.mw
         if not mw.vtk_panel or not mw.vtk_panel.scene:
-            return
+            return False
+
+        if getattr(mw, "_session_deferred_regions", {}):
+            from .session_manager import materialize_session_regions
+
+            labels = [
+                label
+                for label, presentation in mw._session_deferred_regions.items()
+                if mw.parcellation_region_visibility.get(label, True)
+                and presentation["visible"]
+            ]
+            if not materialize_session_regions(mw, labels):
+                return False
 
         if hasattr(mw, "parcellation_overlay_actor") and mw.parcellation_overlay_actor:
             try:
@@ -1203,16 +1429,21 @@ class ConnectivityManager:
 
         mw.vtk_panel.render_window.Render()
         mw._parcellation_overlay_visible = True
+        return True
 
-    def _hide_parcellation_actors(self) -> None:
+    def _hide_parcellation_actors(self, render: bool = True) -> None:
         """Hides parcellation actors (removes from scene but keeps cached)."""
         mw = self.mw
+        for presentation in getattr(mw, "_session_deferred_regions", {}).values():
+            presentation["attached"] = False
         if not mw.vtk_panel or not mw.vtk_panel.scene:
             return
 
+        actor_removed = False
         if hasattr(mw, "parcellation_overlay_actor") and mw.parcellation_overlay_actor:
             try:
                 mw.vtk_panel.scene.rm(mw.parcellation_overlay_actor)
+                actor_removed = True
             except (ValueError, RuntimeError):
                 logger.debug("Failed to remove parcellation overlay from scene.")
 
@@ -1220,10 +1451,12 @@ class ConnectivityManager:
             for actor in mw.parcellation_region_actors.values():
                 try:
                     mw.vtk_panel.scene.rm(actor)
+                    actor_removed = True
                 except (ValueError, RuntimeError):
                     logger.debug("Failed to remove parcellation region actor.")
 
-        mw.vtk_panel.render_window.Render()
+        if render and actor_removed:
+            mw.vtk_panel.render_window.Render()
         mw._parcellation_overlay_visible = False
 
     def remove_parcellation_overlay(self) -> None:
@@ -1242,24 +1475,34 @@ class ConnectivityManager:
 
         mw.vtk_panel.update_status("Parcellation overlay hidden")
 
-    def invalidate_parcellation_cache(self) -> None:
-        """
-        Invalidates the parcellation overlay cache.
-        Call this when streamlines or parcellation data changes.
-        """
+    def _invalidate_overlay_cache(self, render: bool = True) -> None:
+        """Clear visibility-dependent parcellation actors."""
         mw = self.mw
-
-        # Remove actors from scene if visible
-        self._hide_parcellation_actors()
-
-        # Clear cached actors
-        if hasattr(mw, "parcellation_overlay_actor"):
-            mw.parcellation_overlay_actor = None
-        if hasattr(mw, "parcellation_region_actors"):
-            mw.parcellation_region_actors = {}
-
+        mw._session_deferred_regions = {}
+        self._hide_parcellation_actors(render=render)
+        mw.parcellation_overlay_actor = None
+        mw.parcellation_region_actors = {}
+        mw.parcellation_connected_labels = set()
+        mw.parcellation_main_labels = set()
+        mw.parcellation_label_colors = {}
         mw._parcellation_overlay_cached = False
         mw._parcellation_overlay_visible = False
+        mw._parcellation_overlay_cache_key = None
+
+    def invalidate_parcellation_cache(
+        self,
+        clear_region_states: bool = False,
+        clear_region_visibility: bool = False,
+        render: bool = True,
+    ) -> None:
+        """Clear caches owned by the current atlas and tractogram."""
+        mw = self.mw
+        self._invalidate_overlay_cache(render=render)
+        self._reset_endpoint_cache()
+        if clear_region_states:
+            mw.parcellation_region_states = {}
+        if clear_region_visibility:
+            mw.parcellation_region_visibility = {}
 
     def toggle_region_visibility(
         self, label: int, visible: bool, batch_mode: bool = False
@@ -1283,6 +1526,16 @@ class ConnectivityManager:
 
         # Don't create actors if the main overlay is not visible
         overlay_visible = getattr(mw, "_parcellation_overlay_visible", False)
+
+        if (
+            visible
+            and overlay_visible
+            and label in getattr(mw, "_session_deferred_regions", {})
+        ):
+            from .session_manager import materialize_session_regions
+
+            if not materialize_session_regions(mw, [label]):
+                return
 
         # If toggling ON and no actor exists, create on-demand
         if visible and label not in mw.parcellation_region_actors:
@@ -1411,8 +1664,7 @@ class ConnectivityManager:
         """
         Computes which streamlines pass through a parcellation region.
 
-        Uses cached endpoint labels from create_parcellation_overlay() for fast lookup.
-        Stores result in parcellation_region_intersection_cache.
+        Extends the endpoint cache for currently visible streamlines as needed.
 
         Args:
             label: The parcellation region label ID.
@@ -1425,47 +1677,16 @@ class ConnectivityManager:
         if mw.parcellation_data is None or mw.tractogram_data is None:
             return False
 
-        # Check if we have cached endpoint labels
-        start_labels = getattr(mw, "parcellation_start_labels", None)
-        end_labels = getattr(mw, "parcellation_end_labels", None)
-        visible_indices = getattr(mw, "parcellation_visible_indices", None)
-
-        if start_labels is None or end_labels is None or visible_indices is None:
-            logger.warning(
-                "Endpoint labels not cached. Please enable parcellation overlay first."
-            )
-            return False
-
-        # Initialize cache if not exists
-        if not hasattr(mw, "parcellation_region_intersection_cache"):
-            mw.parcellation_region_intersection_cache = {}
-
-        try:
-            # Find streamlines where either start or end is in this region (Vectorized)
-            matches_start = start_labels == label
-            matches_end = end_labels == label
-            matches = matches_start | matches_end
-
-            # Get indices of matching streamlines (relative to visible_indices)
-            matching_relative_indices = np.where(matches)[0]
-
-            # Convert to actual tractogram indices
-            matching_absolute_indices = set(
-                int(visible_indices[i]) for i in matching_relative_indices
-            )
-
-            mw.parcellation_region_intersection_cache[label] = matching_absolute_indices
-
+        indices = getattr(mw, "visible_indices", range(len(mw.tractogram_data)))
+        if self.ensure_region_intersections([label], indices):
             region_name = mw.parcellation_labels.get(label, f"Region_{label}")
             logger.info(
-                f"Region {region_name}: {len(matching_absolute_indices)} streamlines"
+                "Region %s: %d streamlines",
+                region_name,
+                len(mw.parcellation_region_intersection_cache[label]),
             )
-
             return True
-
-        except (ValueError, IndexError, TypeError) as e:
-            logger.error(f"Error computing region intersection for {label}: {e}")
-            return False
+        return False
 
     def recalculate_all_intersections(self) -> bool:
         """
@@ -1491,63 +1712,14 @@ class ConnectivityManager:
             mw.vtk_panel.update_status("Recalculating parcellation intersections...")
             QApplication.processEvents()
 
-            # Clear existing caches
-            mw.parcellation_region_intersection_cache = {}
-
-            # Recompute endpoint labels from current visible streamlines
-            visible_indices = np.array(list(mw.visible_indices), dtype=np.int64)
-            n_streamlines = len(visible_indices)
-
-            # Pre-allocate arrays
-            start_points = np.zeros((n_streamlines, 3), dtype=np.float64)
-            end_points = np.zeros((n_streamlines, 3), dtype=np.float64)
-
-            # Extract endpoints
-            streamlines = [mw.tractogram_data[idx] for idx in visible_indices]
-
-            for i, sl in enumerate(streamlines):
-                if sl is not None and len(sl) >= 2:
-                    start_points[i] = sl[0]
-                    end_points[i] = sl[-1]
-
-            # AOT-compiled label extraction
-            inv_affine = self._invert_parcellation_affine()
-            if inv_affine is None:
-                return False
-            inv_affine_3x3 = inv_affine[:3, :3].astype(np.float64)
-            inv_affine_offset = inv_affine[:3, 3].astype(np.float64)
-            dims = np.array(mw.parcellation_data.shape, dtype=np.int64)
-
-            start_labels, end_labels = _compute_endpoint_labels(
-                start_points,
-                end_points,
-                inv_affine_3x3,
-                inv_affine_offset,
-                mw.parcellation_data,
-                dims,
-            )
-
-            # Update cached endpoint labels
-            mw.parcellation_start_labels = start_labels
-            mw.parcellation_end_labels = end_labels
-            mw.parcellation_visible_indices = visible_indices.copy()
-
-            # Update connected labels set
-            all_endpoint_labels = np.concatenate([start_labels, end_labels])
-            connected_labels = np.unique(all_endpoint_labels[all_endpoint_labels > 0])
-            mw.parcellation_connected_labels = set(connected_labels.tolist())
-
-            # Clear all region filter states (reset include/exclude)
-            mw.parcellation_region_states = {}
-
-            # Re-apply logic filters to restore full streamline visibility
+            self.invalidate_parcellation_cache(clear_region_states=True)
             mw.roi_manager.apply_logic_filters()
 
-            # Invalidate existing actor cache and recreate the overlay
-            self.invalidate_parcellation_cache()
+            if not self.create_parcellation_overlay():
+                return False
 
-            # Recreate the visual overlay with new actors
-            self.create_parcellation_overlay()
+            connected_labels = mw.parcellation_connected_labels
+            n_streamlines = len(mw.visible_indices)
 
             mw.vtk_panel.update_status(
                 f"Parcellation intersections recalculated ({len(connected_labels)} regions, "

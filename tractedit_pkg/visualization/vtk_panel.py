@@ -679,6 +679,8 @@ class VTKPanel:
 
     def remove_odf_actor(self) -> None:
         """Removes the ODF actor from the scene."""
+        if self.main_window is not None:
+            self.main_window._session_deferred_odf = False
         if self.odf_actor and self.scene:
             self.scene.rm(self.odf_actor)
             self.odf_actor = None
@@ -699,18 +701,6 @@ class VTKPanel:
     def _handle_draw_on_2d(self, interactor: vtk.vtkRenderWindowInteractor) -> None:
         """Handles drawing on 2D views. Delegates to DrawingManager."""
         self.drawing_manager.handle_draw_on_2d(interactor)
-
-    def _update_roi_data_fast(self, roi_name: str, data: np.ndarray) -> None:
-        """Fast in-place update of ROI data without recreating actors (no flicker)."""
-        if roi_name not in self.roi_slice_actors:
-            return
-
-        try:
-            # Just trigger a render - data is already updated in memory
-            # The VTK actors will use the updated numpy array reference
-            self._render_all()
-        except (RuntimeError, AttributeError) as e:
-            logger.error(f"Error in fast ROI update: {e}", exc_info=True)
 
     def _update_drawing_preview(self, scene: window.Scene) -> None:
         """Updates the preview line on the active 2D scene. Delegates to DrawingManager."""
@@ -797,8 +787,10 @@ class VTKPanel:
             actor_obj.Modified()
         return True
 
-    def update_roi_layer(self, key: str, data: np.ndarray, affine: np.ndarray) -> None:
-        """Update an ROI layer while retaining its slice actor pipeline."""
+    def update_roi_layer(
+        self, key: str, data: np.ndarray, affine: np.ndarray, render: bool = True
+    ) -> None:
+        """Update an ROI layer, optionally leaving the final render to the caller."""
         old_actors = self.roi_slice_actors.get(key)
         if old_actors and self._update_roi_data_in_place(key, data):
             self._sync_roi_3d_actor(key, data, affine, render=False)
@@ -806,7 +798,8 @@ class VTKPanel:
             self.add_roi_layer(key, data, affine, render=False)
         if old_actors and self.roi_slice_actors.get(key) is not old_actors:
             self._remove_actor_set(old_actors)
-        self._render_all()
+        if render:
+            self._render_all()
 
     def _show_2d_context_menu(
         self, position: QPoint, widget: QVTKRenderWindowInteractor, view_type: str
@@ -1560,10 +1553,9 @@ class VTKPanel:
                     try:
                         if slice_moved["x"]:
                             roi_vox_c = T_main_to_roi.dot(sag_plane_vox_center)
-                            # Apply +1 offset for sagittal to match drawing coordinate transform
                             new_roi_x = max(
                                 roi_x_ext[0],
-                                min(int(round(roi_vox_c[0])) + 1, roi_x_ext[1]),
+                                min(int(round(roi_vox_c[0])), roi_x_ext[1]),
                             )
                             # Update both 3D and 2D actors
                             if actor_dict.get("sagittal_3d"):
@@ -1849,31 +1841,9 @@ class VTKPanel:
         """Updates the actor for highlighted/selected streamlines. Delegates to StreamlinesManager."""
         self.streamlines_manager.update_highlight()
 
-    def _calculate_scalar_colors(
-        self,
-        streamlines_gen,
-        scalar_gen,
-        vmin: float,
-        vmax: float,
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Calculates vertex colors based on scalar arrays.
-        Delegates to StreamlinesManager.
-        """
-        return self.streamlines_manager.calculate_scalar_colors(
-            streamlines_gen, scalar_gen, vmin, vmax
-        )
-
     def _update_scalar_bar(self, lut: vtk.vtkLookupTable, title: str) -> None:
         """Creates or updates the scalar bar actor. Delegates to StreamlinesManager."""
         self.streamlines_manager.update_scalar_bar(lut, title)
-
-    def _get_streamline_actor_params(self) -> Dict[str, Any]:
-        """
-        Determines parameters for the main streamlines actor using STRIDE.
-        Delegates to StreamlinesManager.
-        """
-        return self.streamlines_manager.get_streamline_actor_params()
 
     def update_main_streamlines_actor(self, force: bool = False) -> None:
         """
@@ -1934,17 +1904,17 @@ class VTKPanel:
             min_point, max_point, check_all
         )
 
-    def _apply_selection(
-        self, indices_in_sphere: Set[int], deselect: bool = False
-    ) -> None:
-        """Apply a sphere selection result to the current selection. Delegates to SelectionManager.
-
-        Args:
-            indices_in_sphere: Set of streamline indices found within the sphere.
-            deselect: When ``True``, remove indices from the selection.
-                When ``False`` (default), add them.
-        """
-        self.selection_manager.apply_selection(indices_in_sphere, deselect=deselect)
+    def _find_streamlines_in_oriented_box(
+        self,
+        voxel_to_world: np.ndarray,
+        voxel_min: np.ndarray,
+        voxel_max: np.ndarray,
+        check_all: bool = False,
+    ) -> Set[int]:
+        """Find streamlines intersecting an affine-oriented voxel box."""
+        return self.selection_manager.find_streamlines_in_oriented_box(
+            voxel_to_world, voxel_min, voxel_max, check_all
+        )
 
     def _handle_streamline_selection(self, deselect: bool = False) -> None:
         """Handle sphere-based streamline selection. Delegates to SelectionManager.
@@ -2110,6 +2080,7 @@ class VTKPanel:
                 np.asarray(params["end"]),
                 params.get("view_type", "axial"),
                 render=render,
+                corners=params.get("corners"),
             )
             rectangle_actor = actor_set.get("rectangle_3d")
             if rectangle_actor is not None:
@@ -2208,6 +2179,9 @@ class VTKPanel:
         roi_x_ext = (0, roi_shape[0] - 1)
         roi_y_ext = (0, roi_shape[1] - 1)
         roi_z_ext = (0, roi_shape[2] - 1)
+        roi_x = max(roi_x_ext[0], min(roi_x, roi_x_ext[1]))
+        roi_y = max(roi_y_ext[0], min(roi_y, roi_y_ext[1]))
+        roi_z = max(roi_z_ext[0], min(roi_z, roi_z_ext[1]))
 
         try:
             ax_3d = create_slicer_actor(
@@ -2247,12 +2221,10 @@ class VTKPanel:
                 cor.display_extent(
                     roi_x_ext[0], roi_x_ext[1], roi_y, roi_y, roi_z_ext[0], roi_z_ext[1]
                 )
-            # Apply +1 offset for sagittal to match slice navigation behavior
-            roi_x_adjusted = roi_x + 1
             for sag in [sag_3d, sag_2d]:
                 sag.display_extent(
-                    roi_x_adjusted,
-                    roi_x_adjusted,
+                    roi_x,
+                    roi_x,
                     roi_y_ext[0],
                     roi_y_ext[1],
                     roi_z_ext[0],
@@ -2334,19 +2306,6 @@ class VTKPanel:
     ) -> None:
         """Updates the 3D sphere actor for an ROI. Delegates to DrawingManager."""
         self.drawing_manager.update_3d_sphere_visuals(roi_name, center, radius)
-
-    def _update_3d_rectangle_visuals(
-        self,
-        roi_name: str,
-        start: np.ndarray,
-        end: np.ndarray,
-        view_type: str,
-        render: bool = True,
-    ) -> None:
-        """Updates the 3D rectangle actor for an ROI. Delegates to DrawingManager."""
-        self.drawing_manager.update_3d_rectangle_visuals(
-            roi_name, start, end, view_type, render
-        )
 
     def set_roi_layer_visibility(self, key: str, visible: bool) -> None:
         """Sets visibility for all 2D and 3D actors of an ROI."""

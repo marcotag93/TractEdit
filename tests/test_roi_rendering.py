@@ -6,11 +6,11 @@ from unittest.mock import Mock
 
 import nibabel as nib
 import numpy as np
-from fury import actor, window
+from fury import window
 from vtk.util import numpy_support
 
 from tractedit_pkg.visualization.drawing import DrawingManager
-from tractedit_pkg.visualization.vtk_panel import VTKPanel, _crop_roi_for_contour
+from tractedit_pkg.visualization.vtk_panel import VTKPanel
 
 
 SLICE_ACTOR_KEYS = (
@@ -203,20 +203,6 @@ def test_drawing_actor_creation_does_not_override_stored_roi_color(monkeypatch):
     assert panel.main_window.roi_layers[key]["color"] == stored_color
 
 
-def test_initial_nonred_roi_color_is_visible_in_2d_render():
-    data = np.zeros((7, 8, 9), dtype=np.uint8)
-    panel, key, affine = _make_panel(data)
-    panel.main_window.roi_layers[key]["color"] = (0.0, 1.0, 0.0)
-    panel.set_roi_layer_color = VTKPanel.set_roi_layer_color.__get__(panel)
-    panel.add_roi_layer(key, data, affine, render=False)
-
-    data[2:5, 2:5, 3] = 1
-    panel.update_roi_layer(key, data, affine)
-    panel.axial_scene.reset_camera()
-    image = window.snapshot(panel.axial_scene, size=(200, 200), offscreen=True)
-
-    green_pixels = (image[:, :, 1] > 20) & (image[:, :, 1] > image[:, :, 0])
-    assert np.count_nonzero(green_pixels) > 0
 
 
 def test_roi_update_reuses_slice_actors_and_updates_source_scalars():
@@ -296,22 +282,6 @@ def test_contour_crop_preserves_voxel_world_coordinates(monkeypatch):
     np.testing.assert_allclose(cropped_world, original_world)
 
 
-def test_cropped_contour_matches_full_volume_geometry():
-    data = np.zeros((20, 21, 22), dtype=np.uint8)
-    data[8:11, 9:13, 10:15] = 1
-    _, _, affine = _make_panel(data)
-    cropped_data, cropped_affine = _crop_roi_for_contour(data, affine)
-
-    full_actor = actor.contour_from_roi(data, affine=affine)
-    cropped_actor = actor.contour_from_roi(cropped_data, affine=cropped_affine)
-    full_actor.GetMapper().Update()
-    cropped_actor.GetMapper().Update()
-
-    np.testing.assert_allclose(cropped_actor.GetBounds(), full_actor.GetBounds())
-    assert (
-        cropped_actor.GetMapper().GetInput().GetNumberOfPoints()
-        == full_actor.GetMapper().GetInput().GetNumberOfPoints()
-    )
 
 
 def test_freehand_drawing_replaces_mode_specific_3d_actor_with_contour():

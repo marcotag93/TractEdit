@@ -118,6 +118,33 @@ def get_asset_path(asset_name: str) -> str:
     return asset_path
 
 
+def write_vtk_polydata(writer: Any, poly_data: Any, output_path: str) -> None:
+    """Write VTK polydata and raise if the writer does not complete."""
+    errors: List[str] = []
+    observer = writer.AddObserver(
+        vtk.vtkCommand.ErrorEvent,
+        lambda _caller, event: errors.append(event),
+    )
+    try:
+        writer.SetFileName(output_path)
+        writer.SetInputData(poly_data)
+        result = writer.Write()
+        error_code = writer.GetErrorCode()
+    finally:
+        writer.RemoveObserver(observer)
+
+    if result == 0 or error_code != vtk.vtkErrorCode.NoError or errors:
+        if error_code != vtk.vtkErrorCode.NoError:
+            detail = vtk.vtkErrorCode.GetStringFromErrorCode(error_code)
+        elif result == 0:
+            detail = "writer returned failure"
+        else:
+            detail = "writer emitted an error event"
+        raise OSError(f"VTK writer failed for '{output_path}': {detail}")
+    if not os.path.isfile(output_path):
+        raise OSError(f"VTK writer did not create '{output_path}'")
+
+
 def format_tuple(data: Any, precision: int = 2) -> str:
     """Formats a tuple of numbers into a string '(num1, num2, ...)'."""
     if isinstance(data, (list, tuple)):
