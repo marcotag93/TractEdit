@@ -132,16 +132,14 @@ TractEdit lets you inspect, dissect and refine existing diffusion MRI tractogram
 
 ### Pre-built Executables
 
-Get the desktop app for your system. No Python installation is needed. The button opens the latest release; choose the matching package under **Assets**.
+Get the desktop app for your system. No Python installation is needed. You can also browse all packages and release notes on the [Releases page](https://github.com/marcotag93/TractEdit/releases).
 
-[![Download TractEdit — DMG, ZIP, AppImage, DEB](https://img.shields.io/badge/Download_TractEdit-DMG_%7C_ZIP_%7C_AppImage_%7C_DEB-24292f?style=for-the-badge&logo=github&logoColor=white)](https://github.com/marcotag93/TractEdit/releases/latest)
-
-| System | Package and launch |
+| Download (`v3.6.0`) | Package and launch |
 | --- | --- |
-| Windows | Extract the ZIP and run the included `.exe`. |
-| macOS (Apple Silicon) | Open the `.dmg` and install the app. |
-| Linux (portable) | Make the `.AppImage` executable with `chmod +x <filename>.AppImage`, then run it. |
-| Debian / Ubuntu | Install the `.deb` with `sudo dpkg -i ./TractEdit_VERSION_amd64.deb`. |
+| <a href="https://github.com/marcotag93/TractEdit/releases/download/v3.6.0/TractEdit-3.6.0-windows-x64.zip"><img src="https://img.shields.io/badge/Download_for_Windows-ZIP_(x64)-30363d?style=for-the-badge&labelColor=24292f&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0iI2ZmZmZmZiI%2BPHBhdGggZD0iTTAgMGgxMS4zdjExLjNIMHptMTIuNyAwSDI0djExLjNIMTIuN3pNMCAxMi43aDExLjNWMjRIMHptMTIuNyAwSDI0VjI0SDEyLjd6Ii8%2BPC9zdmc%2B" alt="Download for Windows (x64 ZIP)"/></a> | Extract the ZIP and run the included `.exe`. |
+| <a href="https://github.com/marcotag93/TractEdit/releases/download/v3.6.0/TractEdit-3.6.0-macos-arm64.dmg"><img src="https://img.shields.io/badge/Download_for_macOS-DMG_(Apple_Silicon)-30363d?style=for-the-badge&labelColor=24292f&logo=apple&logoColor=white" alt="Download for macOS (Apple Silicon DMG)"/></a> | Open the `.dmg` and install the app. |
+| <a href="https://github.com/marcotag93/TractEdit/releases/download/v3.6.0/TractEdit-3.6.0-x86_64.AppImage"><img src="https://img.shields.io/badge/Download_for_Linux-AppImage_(x86__64)-30363d?style=for-the-badge&labelColor=24292f&logo=linux&logoColor=white" alt="Download for Linux (AppImage x86_64)"/></a> | Make the `.AppImage` executable with `chmod +x <filename>.AppImage`, then run it. |
+| <a href="https://github.com/marcotag93/TractEdit/releases/download/v3.6.0/TractEdit_3.6.0_amd64.deb"><img src="https://img.shields.io/badge/Download_for_Linux-DEB_(amd64)-30363d?style=for-the-badge&labelColor=24292f&logo=debian&logoColor=white" alt="Download for Linux (DEB amd64)"/></a> | On Debian / Ubuntu, install the `.deb` with `sudo dpkg -i ./TractEdit_3.6.0_amd64.deb`. |
 
 **Windows first launch (optional).** Microsoft Defender may delay the first
 launch while scanning bundled libraries. To exclude the TractEdit folder from
