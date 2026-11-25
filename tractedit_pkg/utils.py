@@ -9,14 +9,12 @@ Utility functions, constants, and enums for the TractEdit application.
 # ============================================================================
 
 import os
-import ast
 import logging
-import numpy as np
 import vtk
 import enum
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime
-from typing import Optional, Any, Union, List, Tuple, Generator
+from typing import Any, List, Generator
 
 logger = logging.getLogger(__name__)
 
@@ -76,8 +74,7 @@ class ColorMode(enum.Enum):
 def signals_blocked(*widgets: Any) -> Generator[None, None, None]:
     """Context manager that blocks Qt signals for one or more widgets.
 
-    Guarantees that ``blockSignals(False)`` is called even if the body
-    raises an exception, preventing permanently muted widgets.
+    Restore each previous signal state, including in nested scopes.
 
     Args:
         *widgets: One or more Qt widgets whose signals should be blocked.
@@ -88,13 +85,80 @@ def signals_blocked(*widgets: Any) -> Generator[None, None, None]:
             spinbox.setValue(42)
             slider.setValue(50)
     """
-    for w in widgets:
-        w.blockSignals(True)
+    with ExitStack() as stack:
+        for widget in widgets:
+            previous = widget.blockSignals(True)
+            stack.callback(widget.blockSignals, previous)
+        yield
+
+
+def iter_tree_items(tree, *, mesh_only: bool = False):
+    pending = [tree.topLevelItem(i) for i in reversed(range(tree.topLevelItemCount()))]
+    while pending:
+        item = pending.pop()
+        if mesh_only and item.parent() is None and item.text(0) != "Meshes":
+            continue
+        yield item
+        pending.extend(item.child(i) for i in reversed(range(item.childCount())))
+
+
+@contextmanager
+def ui_tree_transaction(mw, *, include_camera=False, rollback=None, refresh_selection=True):
+    """Restore the tree and its controls if model or scene publication fails."""
+    from PyQt6.QtGui import QAction
+
+    tree, slider = mw.data_tree_widget, mw.opacity_slider
+    roots = [tree.topLevelItem(i).clone() for i in range(tree.topLevelItemCount())]
+    current = tree.currentItem()
+    states = [
+        (item.isExpanded(), item.isSelected(), item is current)
+        for item in iter_tree_items(tree)
+    ]
+    scroll = (tree.verticalScrollBar().value(), tree.horizontalScrollBar().value())
+    opacity = (slider.isEnabled(), slider.value())
+    actions = [(action, action.isEnabled()) for action in mw.findChildren(QAction)]
+    pending = mw._data_panel_update_pending
+    previous_active = getattr(mw, "_mesh_commit_active", False)
+    if include_camera:
+        camera = mw.vtk_panel.scene.GetActiveCamera()
+        previous_camera = vtk.vtkCamera()
+        previous_camera.DeepCopy(camera)
+    mw._mesh_commit_active = True
     try:
         yield
+    except Exception:
+        if rollback is not None:
+            rollback()
+        if include_camera:
+            camera.DeepCopy(previous_camera)
+        with signals_blocked(tree, slider):
+            tree.clear()
+            tree.addTopLevelItems(roots)
+            mw.surface_mapping_manager._refresh_tree()
+            restored = list(iter_tree_items(tree))
+            for item, (_, _, was_current) in zip(restored, states):
+                if was_current:
+                    tree.setCurrentItem(item)
+                    break
+            for item, (expanded, selected, _) in zip(restored, states):
+                item.setSelected(selected)
+                item.setExpanded(expanded)
+            tree.verticalScrollBar().setValue(scroll[0])
+            tree.horizontalScrollBar().setValue(scroll[1])
+            slider.setEnabled(opacity[0])
+            slider.setValue(opacity[1])
+        for action, enabled in actions:
+            action.setEnabled(enabled)
+        try:
+            if refresh_selection:
+                mw.data_panel_manager.on_data_item_selected()
+        finally:
+            mw._data_panel_update_pending = pending
+            if pending and mw._data_panel_debounce_timer is not None:
+                mw._data_panel_debounce_timer.start(100)
+        raise
     finally:
-        for w in widgets:
-            w.blockSignals(False)
+        mw._mesh_commit_active = previous_active
 
 
 def get_formatted_datetime() -> str:

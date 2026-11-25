@@ -15,9 +15,9 @@ from __future__ import annotations
 
 import logging
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, Any
+from typing import TYPE_CHECKING
 
-from PyQt6.QtWidgets import QApplication, QStyleFactory
+from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QPalette, QColor
 from PyQt6.QtCore import QSettings
 
@@ -45,6 +45,141 @@ class ThemeMode(Enum):
 # ============================================================================
 
 
+_THEME_VALUES = {
+    "palette_text": ("#dcdcdc", "#1e1e1e"),
+    "palette_base": ("#232323", "#ffffff"),
+    "bright": ("#ffffff", "#ff0000"),
+    "window": ("#2d2d2d", "#f0f0f0"),
+    "text": ("#dddddd", "#1e1e1e"),
+    "menubar_item_rule": (
+        "",
+        "QMenuBar::item { background-color: transparent; color: #1e1e1e; }",
+    ),
+    "raised": ("#3d3d3d", "#e0e0e0"),
+    "menubar_selected_text": ("", "color: #1e1e1e;"),
+    "base": ("#2d2d2d", "#ffffff"),
+    "border": ("#555555", "#c0c0c0"),
+    "menu_item_rule": (
+        "",
+        "QMenu::item { color: #1e1e1e; padding: 4px 20px 4px 20px; }",
+    ),
+    "highlight": ("#2a82da", "#0078d7"),
+    "menu_selected_text": ("", "color: #ffffff;"),
+    "menu_disabled_rules": (
+        "",
+        (
+            "QMenu::item:disabled { color: #a0a0a0; } QMenu::separator { height: 1px; "
+            "background-color: #d0d0d0; margin: 4px 10px; }"
+        ),
+    ),
+    "scrollbar_hover": ("#666666", "#a0a0a0"),
+    "dock_icons_rule": (
+        "QDockWidget { titlebar-close-icon: none; titlebar-normal-icon: none; }",
+        "",
+    ),
+    "tree_colors": ("background-color: #2d2d2d; color: #dddddd;", ""),
+    "selection": ("#2a82da", "#4a6984"),
+    "tree_background_color": ("rgba(255, 255, 255, 0.05)", "rgba(0, 0, 0, 0.03)"),
+    "selection_hover": ("#3a92ea", "#557ba0"),
+    "button": ("#3d3d3d", "#f0f0f0"),
+    "button_hover": ("#4d4d4d", "#e8e8e8"),
+    "button_hover_border": ("#666666", "#b0b0b0"),
+    "button_checked": ("#2d2d2d", "#d0d0d0"),
+    "button_checked_border": ("#444444", "#a0a0a0"),
+    "groove_border": ("#555555", "#bbb"),
+    "groove": ("#2d2d2d", "#e0e0e0"),
+    "label": ("#dddddd", "#333333"),
+    "spinbox_button_rules": (
+        (
+            "QDoubleSpinBox::up-button, QDoubleSpinBox::down-button { "
+            "background-color: #3d3d3d; border: 1px solid #555555; } "
+            "QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover { "
+            "background-color: #4d4d4d; }"
+        ),
+        "",
+    ),
+    "progress_border": ("#555", "#c0c0c0"),
+    "progress_background": ("#333", "#f0f0f0"),
+    "progress_text": ("white", "#333333"),
+    "dialog": ("#2b2b2b", "#f5f5f5"),
+    "dialog_track": ("#333", "#e0e0e0"),
+    "dialog_button": ("#444", "#e0e0e0"),
+    "dialog_button_text": ("#ddd", "#333333"),
+    "dialog_button_hover": ("#555", "#d0d0d0"),
+}
+_DARK_TOKENS = {name: dark for name, (dark, _) in _THEME_VALUES.items()}
+_LIGHT_TOKENS = {name: light for name, (_, light) in _THEME_VALUES.items()}
+
+
+def _tokens(is_dark):
+    return _DARK_TOKENS if is_dark else _LIGHT_TOKENS
+
+
+_MENU_QSS = """
+    QMenuBar {{ background-color: {window}; color: {text}; }}
+    {menubar_item_rule}
+    QMenuBar::item:selected {{ background-color: {raised}; {menubar_selected_text} }}
+    QMenu {{ background-color: {base}; color: {text}; border: 1px solid {border}; }}
+    {menu_item_rule}
+    QMenu::item:selected {{ background-color: {highlight}; {menu_selected_text} }}
+    {menu_disabled_rules}
+"""
+
+_TOOLTIP_QSS = "QToolTip {{ color: {text}; background-color: {base}; border: 1px solid {border}; }}"
+
+_WIDGETS_QSS = """
+    QScrollBar:vertical {{ background: {window}; width: 12px; }}
+    QScrollBar::handle:vertical {{ background: {border}; min-height: 20px; border-radius: 4px; }}
+    QScrollBar::handle:vertical:hover {{ background: {scrollbar_hover}; }}
+    QScrollBar:horizontal {{ background: {window}; height: 12px; }}
+    QScrollBar::handle:horizontal {{ background: {border}; min-width: 20px; border-radius: 4px; }}
+    QScrollBar::handle:horizontal:hover {{ background: {scrollbar_hover}; }}
+    QScrollBar::add-line, QScrollBar::sub-line {{ background: none; border: none; }}
+    {dock_icons_rule}
+    QDockWidget::title {{ background-color: {raised}; padding: 4px; }}
+"""
+
+_TREE_QSS = """
+    QTreeWidget {{ outline: 0; {tree_colors} }}
+    QTreeWidget::item {{ padding: 4px; border-radius: 4px; }}
+    QTreeWidget::item:selected {{ background-color: {selection}; color: white; border: none; }}
+    QTreeWidget::item:selected:!active {{ background-color: {selection}; color: white; border: none; }}
+    QTreeWidget::item:hover {{ background-color: {tree_background_color}; border: none; }}
+    QTreeWidget::item:selected:hover {{ background-color: {selection_hover}; color: white; }}
+"""
+
+_BUTTON_QSS = """
+    QToolButton {{ background-color: {button}; border: 1px solid {border}; border-radius: 5px; padding: 2px; margin-left: 5px; }}
+    QToolButton:hover {{ background-color: {button_hover}; border: 1px solid {button_hover_border}; }}
+    QToolButton:checked {{ background-color: {button_checked}; border: 1px inset {button_checked_border}; padding: 3px 1px 1px 3px; }}
+"""
+
+_SLIDER_QSS = """
+    QSlider::groove:horizontal {{ border: 1px solid {groove_border}; height: 6px; background: {groove}; margin: 0px; border-radius: 3px; }}
+    QSlider::handle:horizontal {{ background: #05B8CC; border: 1px solid #049dad; width: 14px; margin: -5px 0; border-radius: 7px; }}
+    QSlider::handle:horizontal:hover {{ background: #06d4eb; }}
+"""
+
+_SPINBOX_QSS = """
+    QDoubleSpinBox {{ background-color: {base}; color: {label}; border: 1px solid {border}; border-radius: 3px; padding: 2px; }}
+    {spinbox_button_rules}
+"""
+
+_BAR_QSS = """
+    QProgressBar {{ border: 1px solid {progress_border}; border-radius: 4px; background-color: {progress_background}; color: {progress_text}; text-align: center; font-size: 10px; }}
+    QProgressBar::chunk {{ background-color: #05B8CC; }}
+"""
+
+_DIALOG_QSS = """
+    QProgressDialog {{ background-color: {dialog}; color: {label}; }}
+    QLabel {{ color: {label}; font-size: 12px; font-weight: bold; margin-bottom: 5px; }}
+    QProgressBar {{ border: 1px solid {progress_border}; border-radius: 4px; background-color: {dialog_track}; color: {progress_text}; text-align: center; font-size: 12px; height: 25px; }}
+    QProgressBar::chunk {{ background-color: #05B8CC; border-radius: 3px; }}
+    QPushButton {{ background-color: {dialog_button}; color: {dialog_button_text}; border: 1px solid {progress_border}; border-radius: 4px; padding: 4px 12px; }}
+    QPushButton:hover {{ background-color: {dialog_button_hover}; }}
+"""
+
+
 class ThemeManager:
     """
     Manages application-wide theming for TractEdit.
@@ -70,7 +205,7 @@ class ThemeManager:
         self._settings = QSettings("TractEdit", "TractEdit")
 
         # Load saved preference
-        saved_theme = self._settings.value(self.SETTINGS_KEY, ThemeMode.SYSTEM.value)
+        saved_theme = self._settings.value(self.SETTINGS_KEY, ThemeMode.DARK.value)
         try:
             self._current_mode = ThemeMode(saved_theme)
         except ValueError:
@@ -105,14 +240,14 @@ class ThemeManager:
             return True
         elif self._current_mode == ThemeMode.LIGHT:
             return False
-        else:
-            # System mode - detect from palette
-            app = QApplication.instance()
-            if app:
-                palette = app.palette()
-                bg_color = palette.color(QPalette.ColorRole.Window)
-                return self._calculate_luminance(bg_color) < 128
-            return False
+        return self._system_is_dark()
+
+    def _system_is_dark(self) -> bool:
+        app = QApplication.instance()
+        if app:
+            color = app.palette().color(QPalette.ColorRole.Window)
+            return self._calculate_luminance(color) < 128
+        return False
 
     def set_theme(self, mode: ThemeMode) -> None:
         """
@@ -146,306 +281,37 @@ class ThemeManager:
         self._update_themed_components()
 
     def _apply_dark_palette(self, app: QApplication) -> None:
-        """Applies a dark color palette to the application."""
-        palette = QPalette()
-
-        # Base colors
-        dark_bg = QColor(45, 45, 45)
-        darker_bg = QColor(35, 35, 35)
-        light_text = QColor(220, 220, 220)
-        disabled_text = QColor(127, 127, 127)
-        highlight = QColor(42, 130, 218)
-        highlight_text = QColor(255, 255, 255)
-
-        # Window and base
-        palette.setColor(QPalette.ColorRole.Window, dark_bg)
-        palette.setColor(QPalette.ColorRole.WindowText, light_text)
-        palette.setColor(QPalette.ColorRole.Base, darker_bg)
-        palette.setColor(QPalette.ColorRole.AlternateBase, dark_bg)
-        palette.setColor(QPalette.ColorRole.ToolTipBase, dark_bg)
-        palette.setColor(QPalette.ColorRole.ToolTipText, light_text)
-        palette.setColor(QPalette.ColorRole.Text, light_text)
-        palette.setColor(QPalette.ColorRole.Button, dark_bg)
-        palette.setColor(QPalette.ColorRole.ButtonText, light_text)
-        palette.setColor(QPalette.ColorRole.BrightText, QColor(255, 255, 255))
-        palette.setColor(QPalette.ColorRole.Link, highlight)
-        palette.setColor(QPalette.ColorRole.Highlight, highlight)
-        palette.setColor(QPalette.ColorRole.HighlightedText, highlight_text)
-
-        # Disabled colors
-        palette.setColor(
-            QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, disabled_text
-        )
-        palette.setColor(
-            QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, disabled_text
-        )
-        palette.setColor(
-            QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, disabled_text
-        )
-        palette.setColor(
-            QPalette.ColorGroup.Disabled,
-            QPalette.ColorRole.HighlightedText,
-            disabled_text,
-        )
-
-        app.setPalette(palette)
-        app.setStyleSheet(self._get_dark_stylesheet())
+        self._apply_palette(app, True)
 
     def _apply_light_palette(self, app: QApplication) -> None:
-        """Applies a light color palette to the application."""
+        self._apply_palette(app, False)
+
+    def _apply_palette(self, app, is_dark):
+        tokens = _tokens(is_dark)
         palette = QPalette()
-
-        # Base colors
-        light_bg = QColor(240, 240, 240)
-        white_bg = QColor(255, 255, 255)
-        dark_text = QColor(30, 30, 30)
-        disabled_text = QColor(127, 127, 127)
-        highlight = QColor(0, 120, 215)
-        highlight_text = QColor(255, 255, 255)
-
-        # Window and base
-        palette.setColor(QPalette.ColorRole.Window, light_bg)
-        palette.setColor(QPalette.ColorRole.WindowText, dark_text)
-        palette.setColor(QPalette.ColorRole.Base, white_bg)
-        palette.setColor(QPalette.ColorRole.AlternateBase, light_bg)
-        palette.setColor(QPalette.ColorRole.ToolTipBase, white_bg)
-        palette.setColor(QPalette.ColorRole.ToolTipText, dark_text)
-        palette.setColor(QPalette.ColorRole.Text, dark_text)
-        palette.setColor(QPalette.ColorRole.Button, light_bg)
-        palette.setColor(QPalette.ColorRole.ButtonText, dark_text)
-        palette.setColor(QPalette.ColorRole.BrightText, QColor(255, 0, 0))
-        palette.setColor(QPalette.ColorRole.Link, highlight)
-        palette.setColor(QPalette.ColorRole.Highlight, highlight)
-        palette.setColor(QPalette.ColorRole.HighlightedText, highlight_text)
-
-        # Disabled colors
-        palette.setColor(
-            QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, disabled_text
-        )
-        palette.setColor(
-            QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, disabled_text
-        )
-        palette.setColor(
-            QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, disabled_text
-        )
-        palette.setColor(
-            QPalette.ColorGroup.Disabled,
-            QPalette.ColorRole.HighlightedText,
-            disabled_text,
-        )
-
+        role = QPalette.ColorRole
+        colors = {
+            role.Window: tokens["window"], role.WindowText: tokens["palette_text"],
+            role.Base: tokens["palette_base"], role.AlternateBase: tokens["window"],
+            role.ToolTipBase: tokens["base"], role.ToolTipText: tokens["palette_text"],
+            role.Text: tokens["palette_text"], role.Button: tokens["window"],
+            role.ButtonText: tokens["palette_text"], role.BrightText: tokens["bright"],
+            role.Link: tokens["highlight"], role.Highlight: tokens["highlight"],
+            role.HighlightedText: "#ffffff",
+        }
+        for color_role, color in colors.items():
+            palette.setColor(color_role, QColor(color))
+        for color_role in (role.WindowText, role.Text, role.ButtonText, role.HighlightedText):
+            palette.setColor(QPalette.ColorGroup.Disabled, color_role, QColor("#7f7f7f"))
         app.setPalette(palette)
-        app.setStyleSheet(self._get_light_stylesheet())
+        app.setStyleSheet(self._application_stylesheet(is_dark))
 
-    def _get_dark_stylesheet(self) -> str:
-        """Returns the dark theme stylesheet."""
-        return """
-            QToolTip {
-                color: #dddddd;
-                background-color: #2d2d2d;
-                border: 1px solid #555555;
-            }
-            QMenuBar {
-                background-color: #2d2d2d;
-                color: #dddddd;
-            }
-            QMenuBar::item:selected {
-                background-color: #3d3d3d;
-            }
-            QMenu {
-                background-color: #2d2d2d;
-                color: #dddddd;
-                border: 1px solid #555555;
-            }
-            QMenu::item:selected {
-                background-color: #2a82da;
-            }
-            QScrollBar:vertical {
-                background: #2d2d2d;
-                width: 12px;
-            }
-            QScrollBar::handle:vertical {
-                background: #555555;
-                min-height: 20px;
-                border-radius: 4px;
-            }
-            QScrollBar::handle:vertical:hover {
-                background: #666666;
-            }
-            QScrollBar:horizontal {
-                background: #2d2d2d;
-                height: 12px;
-            }
-            QScrollBar::handle:horizontal {
-                background: #555555;
-                min-width: 20px;
-                border-radius: 4px;
-            }
-            QScrollBar::handle:horizontal:hover {
-                background: #666666;
-            }
-            QScrollBar::add-line, QScrollBar::sub-line {
-                background: none;
-                border: none;
-            }
-            QDockWidget {
-                titlebar-close-icon: none;
-                titlebar-normal-icon: none;
-            }
-            QDockWidget::title {
-                background-color: #3d3d3d;
-                padding: 4px;
-            }
-        """
-
-    def _get_light_stylesheet(self) -> str:
-        """Returns the light theme stylesheet."""
-        return """
-            QToolTip {
-                color: #1e1e1e;
-                background-color: #ffffff;
-                border: 1px solid #c0c0c0;
-            }
-            QMenuBar {
-                background-color: #f0f0f0;
-                color: #1e1e1e;
-            }
-            QMenuBar::item {
-                background-color: transparent;
-                color: #1e1e1e;
-            }
-            QMenuBar::item:selected {
-                background-color: #e0e0e0;
-                color: #1e1e1e;
-            }
-            QMenu {
-                background-color: #ffffff;
-                color: #1e1e1e;
-                border: 1px solid #c0c0c0;
-            }
-            QMenu::item {
-                color: #1e1e1e;
-                padding: 4px 20px 4px 20px;
-            }
-            QMenu::item:selected {
-                background-color: #0078d7;
-                color: #ffffff;
-            }
-            QMenu::item:disabled {
-                color: #a0a0a0;
-            }
-            QMenu::separator {
-                height: 1px;
-                background-color: #d0d0d0;
-                margin: 4px 10px;
-            }
-            QScrollBar:vertical {
-                background: #f0f0f0;
-                width: 12px;
-            }
-            QScrollBar::handle:vertical {
-                background: #c0c0c0;
-                min-height: 20px;
-                border-radius: 4px;
-            }
-            QScrollBar::handle:vertical:hover {
-                background: #a0a0a0;
-            }
-            QScrollBar:horizontal {
-                background: #f0f0f0;
-                height: 12px;
-            }
-            QScrollBar::handle:horizontal {
-                background: #c0c0c0;
-                min-width: 20px;
-                border-radius: 4px;
-            }
-            QScrollBar::handle:horizontal:hover {
-                background: #a0a0a0;
-            }
-            QScrollBar::add-line, QScrollBar::sub-line {
-                background: none;
-                border: none;
-            }
-            QDockWidget::title {
-                background-color: #e0e0e0;
-                padding: 4px;
-            }
-        """
+    @staticmethod
+    def _application_stylesheet(is_dark: bool) -> str:
+        return (_TOOLTIP_QSS + _MENU_QSS + _WIDGETS_QSS).format(**_tokens(is_dark))
 
     def _get_system_menu_stylesheet(self) -> str:
-        """
-        Returns menu-only stylesheet for System theme mode.
-
-        On Windows, Qt menus don't properly inherit QPalette colors,
-        so we detect the system theme and apply appropriate menu styling.
-        This preserves the native look while ensuring menu text is visible.
-        """
-        # Detect if system theme is dark or light
-        app = QApplication.instance()
-        if app:
-            palette = app.palette()
-            bg_color = palette.color(QPalette.ColorRole.Window)
-            is_system_dark = self._calculate_luminance(bg_color) < 128
-        else:
-            is_system_dark = False
-
-        if is_system_dark:
-            # Dark system theme - light text on dark background
-            return """
-                QMenuBar {
-                    background-color: #2d2d2d;
-                    color: #dddddd;
-                }
-                QMenuBar::item:selected {
-                    background-color: #3d3d3d;
-                }
-                QMenu {
-                    background-color: #2d2d2d;
-                    color: #dddddd;
-                    border: 1px solid #555555;
-                }
-                QMenu::item:selected {
-                    background-color: #2a82da;
-                }
-            """
-        else:
-            # Light system theme - dark text on light background
-            return """
-                QMenuBar {
-                    background-color: #f0f0f0;
-                    color: #1e1e1e;
-                }
-                QMenuBar::item {
-                    background-color: transparent;
-                    color: #1e1e1e;
-                }
-                QMenuBar::item:selected {
-                    background-color: #e0e0e0;
-                    color: #1e1e1e;
-                }
-                QMenu {
-                    background-color: #ffffff;
-                    color: #1e1e1e;
-                    border: 1px solid #c0c0c0;
-                }
-                QMenu::item {
-                    color: #1e1e1e;
-                    padding: 4px 20px 4px 20px;
-                }
-                QMenu::item:selected {
-                    background-color: #0078d7;
-                    color: #ffffff;
-                }
-                QMenu::item:disabled {
-                    color: #a0a0a0;
-                }
-                QMenu::separator {
-                    height: 1px;
-                    background-color: #d0d0d0;
-                    margin: 4px 10px;
-                }
-            """
+        return _MENU_QSS.format(**_tokens(self._system_is_dark()))
 
     def _update_themed_components(self) -> None:
         """Updates all components that need theme-specific styling."""
@@ -469,55 +335,30 @@ class ThemeManager:
         """Updates drawing mode button styles and icons based on current theme."""
         mw = self.mw
 
-        # Refresh icons from toolbar manager (they are theme-aware)
-        if hasattr(mw, "toolbars_manager"):
-            tm = mw.toolbars_manager
-
-            if hasattr(mw, "draw_mode_button") and hasattr(mw, "draw_mode_action"):
-                mw.draw_mode_action.setIcon(tm._create_pencil_icon())
-
-            if hasattr(mw, "erase_mode_button") and hasattr(mw, "erase_mode_action"):
-                mw.erase_mode_action.setIcon(tm._create_eraser_icon())
-
-            if hasattr(mw, "sphere_mode_button") and hasattr(mw, "sphere_mode_action"):
-                mw.sphere_mode_action.setIcon(tm._create_sphere_icon())
-
-            if hasattr(mw, "rectangle_mode_button") and hasattr(
-                mw, "rectangle_mode_action"
-            ):
-                mw.rectangle_mode_action.setIcon(tm._create_rectangle_icon())
-
-        # Get current button states and re-apply styles
-        if hasattr(mw, "draw_mode_button"):
-            if mw.is_drawing_mode:
-                mw.draw_mode_button.setStyleSheet(self.get_button_style_active())
+        toolbar = getattr(mw, "toolbars_manager", None)
+        for mode, icon, flag in (
+            ("draw", "_create_pencil_icon", "is_drawing_mode"),
+            ("erase", "_create_eraser_icon", "is_eraser_mode"),
+            ("sphere", "_create_sphere_icon", "is_sphere_mode"),
+            ("rectangle", "_create_rectangle_icon", "is_rectangle_mode"),
+        ):
+            button = getattr(mw, f"{mode}_mode_button", None)
+            if button is None:
+                continue
+            action = getattr(mw, f"{mode}_mode_action", None)
+            if toolbar is not None and action is not None:
+                action.setIcon(getattr(toolbar, icon)())
+            if getattr(mw, flag, False):
+                button.setStyleSheet(self.get_button_style_active())
             else:
-                mw.draw_mode_button.setStyleSheet(self.get_button_style_default())
-
-        if hasattr(mw, "erase_mode_button"):
-            if mw.is_eraser_mode:
-                mw.erase_mode_button.setStyleSheet(self.get_button_style_active())
-            else:
-                mw.erase_mode_button.setStyleSheet(self.get_button_style_default())
-
-        if hasattr(mw, "sphere_mode_button"):
-            if getattr(mw, "is_sphere_mode", False):
-                mw.sphere_mode_button.setStyleSheet(self.get_button_style_active())
-            else:
-                mw.sphere_mode_button.setStyleSheet(self.get_button_style_default())
-
-        if hasattr(mw, "rectangle_mode_button"):
-            if getattr(mw, "is_rectangle_mode", False):
-                mw.rectangle_mode_button.setStyleSheet(self.get_button_style_active())
-            else:
-                mw.rectangle_mode_button.setStyleSheet(self.get_button_style_default())
+                button.setStyleSheet(self.get_button_style_default())
 
     def _update_toolbar_styles(self) -> None:
         """Updates toolbar component styles based on current theme."""
         mw = self.mw
         is_dark = self.is_dark_theme()
 
-        label_color = "#dddddd" if is_dark else "#333333"
+        label_color = _tokens(is_dark)["label"]
 
         # Update "Brush:" text label
         if hasattr(mw, "brush_label"):
@@ -553,71 +394,12 @@ class ThemeManager:
     def _update_data_panel_styles(self) -> None:
         """Updates data panel styles based on current theme."""
         mw = self.mw
-        is_dark = self.is_dark_theme()
-
         if hasattr(mw, "data_tree_widget"):
-            if is_dark:
-                mw.data_tree_widget.setStyleSheet(
-                    """
-                    QTreeWidget {
-                        outline: 0;
-                        background-color: #2d2d2d;
-                        color: #dddddd;
-                    }
-                    QTreeWidget::item {
-                        padding: 4px;
-                        border-radius: 4px;
-                    }
-                    QTreeWidget::item:selected {
-                        background-color: #2a82da;
-                        color: white;
-                        border: none;
-                    }
-                    QTreeWidget::item:selected:!active {
-                        background-color: #2a82da;
-                        color: white;
-                        border: none;
-                    }
-                    QTreeWidget::item:hover {
-                        background-color: rgba(255, 255, 255, 0.05);
-                        border: none;
-                    }
-                    QTreeWidget::item:selected:hover {
-                        background-color: #3a92ea;
-                        color: white;
-                    }
-                """
-                )
-            else:
-                mw.data_tree_widget.setStyleSheet(
-                    """
-                    QTreeWidget {
-                        outline: 0;
-                    }
-                    QTreeWidget::item {
-                        padding: 4px;
-                        border-radius: 4px;
-                    }
-                    QTreeWidget::item:selected {
-                        background-color: #4a6984;
-                        color: white;
-                        border: none;
-                    }
-                    QTreeWidget::item:selected:!active {
-                        background-color: #4a6984;
-                        color: white;
-                        border: none;
-                    }
-                    QTreeWidget::item:hover {
-                        background-color: rgba(0, 0, 0, 0.03);
-                        border: none;
-                    }
-                    QTreeWidget::item:selected:hover {
-                        background-color: #557ba0;
-                        color: white;
-                    }
-                """
-                )
+            mw.data_tree_widget.setStyleSheet(self.tree_style(self.is_dark_theme()))
+
+    @staticmethod
+    def tree_style(is_dark: bool) -> str:
+        return _TREE_QSS.format(**_tokens(is_dark))
 
     def _update_vtk_panel_styles(self) -> None:
         """Updates VTK panel overlay styles based on current theme."""
@@ -632,44 +414,11 @@ class ThemeManager:
 
     def get_button_style_default(self) -> str:
         """Returns the default button style for the current theme."""
-        if self.is_dark_theme():
-            return """
-                QToolButton {
-                    background-color: #3d3d3d;
-                    border: 1px solid #555555;
-                    border-radius: 5px;
-                    padding: 2px;
-                    margin-left: 5px;
-                }
-                QToolButton:hover {
-                    background-color: #4d4d4d;
-                    border: 1px solid #666666;
-                }
-                QToolButton:checked {
-                    background-color: #2d2d2d;
-                    border: 1px inset #444444;
-                    padding: 3px 1px 1px 3px;
-                }
-            """
-        else:
-            return """
-                QToolButton {
-                    background-color: #f0f0f0;
-                    border: 1px solid #c0c0c0;
-                    border-radius: 5px;
-                    padding: 2px;
-                    margin-left: 5px;
-                }
-                QToolButton:hover {
-                    background-color: #e8e8e8;
-                    border: 1px solid #b0b0b0;
-                }
-                QToolButton:checked {
-                    background-color: #d0d0d0;
-                    border: 1px inset #a0a0a0;
-                    padding: 3px 1px 1px 3px;
-                }
-            """
+        return self.button_style(self.is_dark_theme())
+
+    @staticmethod
+    def button_style(is_dark: bool) -> str:
+        return _BUTTON_QSS.format(**_tokens(is_dark))
 
     def get_button_style_active(self) -> str:
         """Returns the active button style for the current theme."""
@@ -695,182 +444,50 @@ class ThemeManager:
 
     def get_slider_style(self) -> str:
         """Returns the slider style for the current theme."""
-        if self.is_dark_theme():
-            return """
-                QSlider::groove:horizontal {
-                    border: 1px solid #555555;
-                    height: 6px;
-                    background: #2d2d2d;
-                    margin: 0px;
-                    border-radius: 3px;
-                }
-                QSlider::handle:horizontal {
-                    background: #05B8CC;
-                    border: 1px solid #049dad;
-                    width: 14px;
-                    margin: -5px 0;
-                    border-radius: 7px;
-                }
-                QSlider::handle:horizontal:hover {
-                    background: #06d4eb;
-                }
-            """
-        else:
-            return """
-                QSlider::groove:horizontal {
-                    border: 1px solid #bbb;
-                    height: 6px;
-                    background: #e0e0e0;
-                    margin: 0px;
-                    border-radius: 3px;
-                }
-                QSlider::handle:horizontal {
-                    background: #05B8CC;
-                    border: 1px solid #049dad;
-                    width: 14px;
-                    margin: -5px 0;
-                    border-radius: 7px;
-                }
-                QSlider::handle:horizontal:hover {
-                    background: #06d4eb;
-                }
-            """
+        return _SLIDER_QSS.format(**_tokens(self.is_dark_theme()))
 
     def get_spinbox_style(self) -> str:
         """Returns the spinbox style for the current theme."""
-        if self.is_dark_theme():
-            return """
-                QDoubleSpinBox {
-                    background-color: #2d2d2d;
-                    color: #dddddd;
-                    border: 1px solid #555555;
-                    border-radius: 3px;
-                    padding: 2px;
-                }
-                QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
-                    background-color: #3d3d3d;
-                    border: 1px solid #555555;
-                }
-                QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {
-                    background-color: #4d4d4d;
-                }
-            """
-        else:
-            return """
-                QDoubleSpinBox {
-                    background-color: #ffffff;
-                    color: #333333;
-                    border: 1px solid #c0c0c0;
-                    border-radius: 3px;
-                    padding: 2px;
-                }
-            """
+        return _SPINBOX_QSS.format(**_tokens(self.is_dark_theme()))
 
     def get_progress_bar_style(self) -> str:
         """Returns the progress bar style for the current theme."""
-        if self.is_dark_theme():
-            return """
-                QProgressBar {
-                    border: 1px solid #555;
-                    border-radius: 4px;
-                    background-color: #333;
-                    color: white;
-                    text-align: center;
-                    font-size: 10px;
-                }
-                QProgressBar::chunk {
-                    background-color: #05B8CC;
-                }
-            """
-        else:
-            return """
-                QProgressBar {
-                    border: 1px solid #c0c0c0;
-                    border-radius: 4px;
-                    background-color: #f0f0f0;
-                    color: #333333;
-                    text-align: center;
-                    font-size: 10px;
-                }
-                QProgressBar::chunk {
-                    background-color: #05B8CC;
-                }
-            """
+        return self.bar_style(self.is_dark_theme())
+
+    @staticmethod
+    def bar_style(is_dark: bool) -> str:
+        return _BAR_QSS.format(**_tokens(is_dark))
 
     def get_progress_dialog_style(self) -> str:
         """Returns the progress dialog style for the current theme."""
-        if self.is_dark_theme():
-            return """
-                QProgressDialog {
-                    background-color: #2b2b2b;
-                    color: #dddddd;
-                }
-                QLabel {
-                    color: #dddddd;
-                    font-size: 12px;
-                    font-weight: bold;
-                    margin-bottom: 5px;
-                }
-                QProgressBar {
-                    border: 1px solid #555;
-                    border-radius: 4px;
-                    background-color: #333;
-                    color: white;
-                    text-align: center;
-                    font-size: 12px;
-                    height: 25px;
-                }
-                QProgressBar::chunk {
-                    background-color: #05B8CC;
-                    border-radius: 3px;
-                }
-                QPushButton {
-                    background-color: #444;
-                    color: #ddd;
-                    border: 1px solid #555;
-                    border-radius: 4px;
-                    padding: 4px 12px;
-                }
-                QPushButton:hover {
-                    background-color: #555;
-                }
-            """
-        else:
-            return """
-                QProgressDialog {
-                    background-color: #f5f5f5;
-                    color: #333333;
-                }
-                QLabel {
-                    color: #333333;
-                    font-size: 12px;
-                    font-weight: bold;
-                    margin-bottom: 5px;
-                }
-                QProgressBar {
-                    border: 1px solid #c0c0c0;
-                    border-radius: 4px;
-                    background-color: #e0e0e0;
-                    color: #333333;
-                    text-align: center;
-                    font-size: 12px;
-                    height: 25px;
-                }
-                QProgressBar::chunk {
-                    background-color: #05B8CC;
-                    border-radius: 3px;
-                }
-                QPushButton {
-                    background-color: #e0e0e0;
-                    color: #333333;
-                    border: 1px solid #c0c0c0;
-                    border-radius: 4px;
-                    padding: 4px 12px;
-                }
-                QPushButton:hover {
-                    background-color: #d0d0d0;
-                }
-            """
+        return self.dialog_style(self.is_dark_theme())
+
+    @staticmethod
+    def dialog_style(is_dark: bool) -> str:
+        return _DIALOG_QSS.format(**_tokens(is_dark))
+
+    @staticmethod
+    def initial_slider_style() -> str:
+        return """
+            QSlider::groove:horizontal { border: 1px solid #c0c0c0; height: 6px; background: #e0e0e0; border-radius: 3px; }
+            QSlider::handle:horizontal { background: #00BCD4; border: 1px solid #00ACC1; width: 16px; height: 16px; margin: -6px 0; border-radius: 8px; }
+            QSlider::handle:horizontal:hover { background: #00ACC1; }
+        """
+
+    @staticmethod
+    def initial_spinbox_style() -> str:
+        return """
+            QDoubleSpinBox { border: 1px solid #00BCD4; border-radius: 4px; padding: 2px 5px; background: white; font-weight: bold; color: #00838F; }
+            QDoubleSpinBox:focus { border: 2px solid #00ACC1; }
+            QDoubleSpinBox::up-button, QDoubleSpinBox::down-button { width: 18px; border: none; background: #e0f7fa; }
+            QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover { background: #b2ebf2; }
+        """
+
+    @staticmethod
+    def brush_value_style() -> str:
+        return """
+            QLabel { font-weight: bold; color: #00BCD4; font-size: 13px; min-width: 15px; }
+        """
 
     def initialize_theme(self) -> None:
         """Initializes the theme on application startup."""

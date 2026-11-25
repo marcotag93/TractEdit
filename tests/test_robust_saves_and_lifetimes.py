@@ -403,11 +403,12 @@ def test_bundle_finalization_failure_restores_previous_state(monkeypatch):
         _update_data_panel_display=Mock(),
     )
 
-    def mutate_scalar_state():
+    def mutate_scalar_state(*, update_actor):
         window.scalar_min_val = -10.0
         window.scalar_max_val = 10.0
         window.scalar_data_min = -20.0
         window.scalar_data_max = 20.0
+        assert not update_actor
 
     window._auto_calculate_skip_level = mutate_scalar_state
     monkeypatch.setattr(file_io, "StreamlineLoaderThread", _ResultLoader)
@@ -424,7 +425,8 @@ def test_bundle_finalization_failure_restores_previous_state(monkeypatch):
     assert window.selected_streamline_indices == {0}
     assert window._inversion_active
     assert window._inversion_keeper_indices == {0}
-    panel.update_invert_contour.assert_called_once_with()
+    panel.stage_bundle_scene.assert_called_once()
+    panel.update_main_streamlines_actor.assert_called_once_with(loading=True)
     assert window.scalar_min_val == 0.25
     assert window.scalar_max_val == 0.75
     assert window.scalar_data_min == 0.0

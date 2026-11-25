@@ -17,11 +17,12 @@ def _temporary_sibling(destination: Path, marker: str) -> Path:
     if not parent.is_dir():
         raise FileNotFoundError(f"Destination directory does not exist: {parent}")
 
-    suffix = "".join(destination.suffixes)
-    stem = destination.name[: -len(suffix)] if suffix else destination.name
+    suffix = destination.suffix
+    if destination.name.lower().endswith(".nii.gz"):
+        suffix = destination.name[-7:]
     descriptor, temporary_name = tempfile.mkstemp(
         dir=parent,
-        prefix=f".{stem}.{marker}-",
+        prefix=f".{marker}-",
         suffix=suffix,
     )
     os.close(descriptor)
@@ -137,7 +138,7 @@ def staged_output_set(
 
         try:
             for final_path in final_paths:
-                if final_path.exists():
+                if os.path.lexists(final_path):
                     backup = _temporary_sibling(final_path, "tractedit-backup")
                     try:
                         os.replace(final_path, backup)
@@ -158,13 +159,13 @@ def staged_output_set(
                 except OSError as error:
                     rollback_errors.append(error)
             for final_path, backup in backups.items():
-                if backup.exists():
+                if os.path.lexists(backup):
                     try:
                         os.replace(backup, final_path)
                     except OSError as error:
                         rollback_errors.append(error)
             if rollback_errors:
-                retained = [str(path) for path in backups.values() if path.exists()]
+                retained = [str(path) for path in backups.values() if os.path.lexists(path)]
                 raise OSError(
                     "Output-set commit and rollback failed; inspect retained "
                     f"backups: {', '.join(retained) or 'none'}"

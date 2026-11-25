@@ -14,6 +14,7 @@ and their related UI updates.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -30,6 +31,38 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # Drawing Modes Manager Class
 # ============================================================================
+
+
+@dataclass(frozen=True)
+class _ModeSpec:
+    flag: str
+    enabled: str
+    disabled: str
+    no_target: str
+
+
+_MODE_SPECS = {
+    "draw": _ModeSpec(
+        "is_drawing_mode",
+        "Drawing mode ENABLED. Drawing on: {} (Click or Click+Drag to draw)",
+        "Drawing mode DISABLED. Navigation mode active.",
+        "Drawing mode ENABLED. No ROI selected. Create a new ROI first.",
+    ),
+    "erase": _ModeSpec(
+        "is_eraser_mode",
+        "Eraser mode ENABLED. Erasing from: {} (Click or Click+Drag to erase)",
+        "Eraser mode DISABLED. Navigation mode active.",
+        "Eraser mode ENABLED. No ROI selected. Create a new ROI first.",
+    ),
+    "sphere": _ModeSpec(
+        "is_sphere_mode", "Sphere Mode Active - Drag to draw sphere on ROI: {}",
+        "Navigation Mode", "Sphere Mode Active. No ROI selected.",
+    ),
+    "rectangle": _ModeSpec(
+        "is_rectangle_mode", "Rectangle Mode Active - Drag to draw rectangle on ROI: {}",
+        "Navigation Mode", "Rectangle Mode Active. No ROI selected.",
+    ),
+}
 
 
 class DrawingModesManager:
@@ -73,7 +106,7 @@ class DrawingModesManager:
             return
 
         # Create empty array with same shape as anatomical image
-        roi_shape = mw.anatomical_image_data.shape
+        roi_shape = mw.anatomical_image_data.shape[:3]
         new_roi_data = np.zeros(roi_shape, dtype=np.uint8)
 
         # Generate unique name
@@ -124,290 +157,107 @@ class DrawingModesManager:
         mw._update_data_panel_display()  # Show new ROI in data panel
 
     def toggle_draw_mode(self, checked: bool) -> None:
-        """Toggles between drawing mode and navigation mode."""
-        mw = self.mw
-
-        # Guard: Prevent activation when no ROIs exist
-        if checked and not mw.roi_layers:
-            mw.draw_mode_action.setChecked(False)
-            if mw.vtk_panel:
-                mw.vtk_panel.update_status(
-                    "Draw Mode: No ROI available. Create or load an ROI first."
-                )
-            return
-
-        mw.is_drawing_mode = checked
-
-        # Turn off other modes if draw mode is activated
-        if checked:
-            self._deactivate_eraser_mode()
-            self._deactivate_sphere_mode()
-            self._deactivate_rectangle_mode()
-
-        # Update button style
-        if checked:
-            mw.draw_mode_button.setStyleSheet(self._get_button_style_active())
-        else:
-            mw.draw_mode_button.setStyleSheet(self._get_button_style_default())
-
-        # Update VTK panel
-        if mw.vtk_panel:
-            mw.vtk_panel.set_drawing_mode(checked)
-
-            if checked:
-                # Select a default ROI to draw on if none selected
-                if not mw.current_drawing_roi and mw.roi_layers:
-                    mw.current_drawing_roi = next(iter(mw.roi_layers.keys()))
-
-                if mw.current_drawing_roi:
-                    mw.vtk_panel.update_status(
-                        f"Drawing mode ENABLED. Drawing on: {mw.current_drawing_roi} (Click or Click+Drag to draw)"
-                    )
-                else:
-                    mw.vtk_panel.update_status(
-                        "Drawing mode ENABLED. No ROI selected. Create a new ROI first."
-                    )
-                    mw.draw_mode_action.setChecked(False)
-                    mw.is_drawing_mode = False
-            else:
-                mw.vtk_panel.update_status(
-                    "Drawing mode DISABLED. Navigation mode active."
-                )
+        self._toggle_mode("draw", checked)
 
     def toggle_erase_mode(self, checked: bool) -> None:
-        """Toggles between eraser mode and navigation mode."""
-        mw = self.mw
-
-        # Guard: Prevent activation when no ROIs exist
-        if checked and not mw.roi_layers:
-            mw.erase_mode_action.setChecked(False)
-            if mw.vtk_panel:
-                mw.vtk_panel.update_status(
-                    "Erase Mode: No ROI available. Create or load an ROI first."
-                )
-            return
-
-        mw.is_eraser_mode = checked
-
-        # Turn off other modes if eraser mode is activated
-        if checked:
-            self._deactivate_draw_mode()
-            self._deactivate_sphere_mode()
-            self._deactivate_rectangle_mode()
-
-        # Update button style
-        if checked:
-            mw.erase_mode_button.setStyleSheet(self._get_button_style_active())
-        else:
-            mw.erase_mode_button.setStyleSheet(self._get_button_style_default())
-
-        # Update VTK panel
-        if mw.vtk_panel:
-            mw.vtk_panel.set_drawing_mode(checked, is_eraser=True)
-
-            if checked:
-                if not mw.current_drawing_roi and mw.roi_layers:
-                    mw.current_drawing_roi = next(iter(mw.roi_layers.keys()))
-
-                if mw.current_drawing_roi:
-                    mw.vtk_panel.update_status(
-                        f"Eraser mode ENABLED. Erasing from: {mw.current_drawing_roi} (Click or Click+Drag to erase)"
-                    )
-                else:
-                    mw.vtk_panel.update_status(
-                        "Eraser mode ENABLED. No ROI selected. Create a new ROI first."
-                    )
-                    mw.erase_mode_action.setChecked(False)
-                    mw.is_eraser_mode = False
-            else:
-                mw.vtk_panel.update_status(
-                    "Eraser mode DISABLED. Navigation mode active."
-                )
+        self._toggle_mode("erase", checked)
 
     def toggle_sphere_mode(self, checked: bool) -> None:
-        """Toggles between sphere drawing mode and navigation mode."""
-        mw = self.mw
-
-        # Guard: Prevent activation when no ROIs exist
-        if checked and not mw.roi_layers:
-            mw.sphere_mode_action.setChecked(False)
-            if mw.vtk_panel:
-                mw.vtk_panel.update_status(
-                    "Sphere Mode: No ROI available. Create or load an ROI first."
-                )
-            return
-
-        # Turn off other modes
-        if checked:
-            self._deactivate_draw_mode()
-            self._deactivate_eraser_mode()
-            self._deactivate_rectangle_mode()
-
-        # Update button style
-        if checked:
-            mw.sphere_mode_button.setStyleSheet(self._get_button_style_active())
-        else:
-            mw.sphere_mode_button.setStyleSheet(self._get_button_style_default())
-
-        # Show/hide sphere radius control
-        if hasattr(mw, "sphere_radius_container"):
-            mw.sphere_radius_container.setVisible(checked)
-
-            # Sync spinbox with current sphere radius if one exists
-            if (
-                checked
-                and mw.vtk_panel
-                and hasattr(mw.vtk_panel, "sphere_params_per_roi")
-                and mw.current_drawing_roi in mw.vtk_panel.sphere_params_per_roi
-            ):
-                current_radius = mw.vtk_panel.sphere_params_per_roi[
-                    mw.current_drawing_roi
-                ].get("radius", 5.0)
-                with signals_blocked(mw.sphere_radius_spinbox):
-                    mw.sphere_radius_spinbox.setValue(current_radius)
-
-        # Update VTK panel
-        if mw.vtk_panel:
-            try:
-                mw.vtk_panel.set_drawing_mode(
-                    checked, is_eraser=False, is_sphere=checked
-                )
-            except TypeError:
-                mw.vtk_panel.set_drawing_mode(checked, is_eraser=False)
-
-            if checked:
-                mw.is_sphere_mode = True
-                if not mw.current_drawing_roi and mw.roi_layers:
-                    mw.current_drawing_roi = next(iter(mw.roi_layers.keys()))
-
-                if mw.current_drawing_roi:
-                    mw.vtk_panel.update_status(
-                        f"Sphere Mode Active - Drag to draw sphere on ROI: {mw.current_drawing_roi}"
-                    )
-                else:
-                    mw.vtk_panel.update_status("Sphere Mode Active. No ROI selected.")
-            else:
-                mw.is_sphere_mode = False
-                mw.vtk_panel.update_status("Navigation Mode")
+        self._toggle_mode("sphere", checked)
 
     def toggle_rectangle_mode(self, checked: bool) -> None:
-        """Toggles between rectangle drawing mode and navigation mode."""
-        mw = self.mw
+        self._toggle_mode("rectangle", checked)
 
-        # Guard: Prevent activation when no ROIs exist
+    def _toggle_mode(self, key: str, checked: bool) -> None:
+        mw = self.mw
+        spec = _MODE_SPECS[key]
         if checked and not mw.roi_layers:
-            mw.rectangle_mode_action.setChecked(False)
+            getattr(mw, f"{key}_mode_action").setChecked(False)
             if mw.vtk_panel:
                 mw.vtk_panel.update_status(
-                    "Rectangle Mode: No ROI available. Create or load an ROI first."
+                    f"{key.title()} Mode: No ROI available. Create or load an ROI first."
                 )
             return
 
-        # Turn off other modes
+        freehand = key in ("draw", "erase")
+        if freehand:
+            setattr(mw, spec.flag, checked)
         if checked:
-            self._deactivate_draw_mode()
-            self._deactivate_eraser_mode()
-            self._deactivate_sphere_mode()
+            for other, other_spec in _MODE_SPECS.items():
+                if other != key and getattr(mw, other_spec.flag, False):
+                    self._deactivate_mode(other)
 
-        # Update button style
-        if checked:
-            mw.rectangle_mode_button.setStyleSheet(self._get_button_style_active())
+        style = (
+            self._get_button_style_active() if checked else self._get_button_style_default()
+        )
+        getattr(mw, f"{key}_mode_button").setStyleSheet(style)
+        if key == "sphere":
+            self._update_sphere_radius(checked)
+
+        panel = mw.vtk_panel
+        if not panel:
+            return
+        if key == "draw":
+            panel.set_drawing_mode(checked)
+        elif key == "erase":
+            panel.set_drawing_mode(checked, is_eraser=True)
         else:
-            mw.rectangle_mode_button.setStyleSheet(self._get_button_style_default())
-
-        # Update VTK panel
-        if mw.vtk_panel:
             try:
-                mw.vtk_panel.set_drawing_mode(
-                    checked, is_eraser=False, is_sphere=False, is_rectangle=checked
-                )
-            except TypeError:
-                mw.vtk_panel.set_drawing_mode(checked, is_eraser=False)
-
-            if checked:
-                mw.is_rectangle_mode = True
-                if not mw.current_drawing_roi and mw.roi_layers:
-                    mw.current_drawing_roi = next(iter(mw.roi_layers.keys()))
-
-                if mw.current_drawing_roi:
-                    mw.vtk_panel.update_status(
-                        f"Rectangle Mode Active - Drag to draw rectangle on ROI: {mw.current_drawing_roi}"
-                    )
+                if key == "sphere":
+                    panel.set_drawing_mode(checked, is_eraser=False, is_sphere=checked)
                 else:
-                    mw.vtk_panel.update_status(
-                        "Rectangle Mode Active. No ROI selected."
+                    panel.set_drawing_mode(
+                        checked, is_eraser=False, is_sphere=False, is_rectangle=checked
                     )
-            else:
-                mw.is_rectangle_mode = False
-                mw.vtk_panel.update_status("Navigation Mode")
+            except TypeError:
+                panel.set_drawing_mode(checked, is_eraser=False)
+            setattr(mw, spec.flag, checked)
+
+        if not checked:
+            panel.update_status(spec.disabled)
+            return
+        if not mw.current_drawing_roi and mw.roi_layers:
+            mw.current_drawing_roi = next(iter(mw.roi_layers))
+        if mw.current_drawing_roi:
+            panel.update_status(spec.enabled.format(mw.current_drawing_roi))
+        else:
+            panel.update_status(spec.no_target)
+            if freehand:
+                getattr(mw, f"{key}_mode_action").setChecked(False)
+                setattr(mw, spec.flag, False)
+
+    def _update_sphere_radius(self, checked: bool) -> None:
+        mw = self.mw
+        if not hasattr(mw, "sphere_radius_container"):
+            return
+        mw.sphere_radius_container.setVisible(checked)
+        if (
+            checked
+            and mw.vtk_panel
+            and hasattr(mw.vtk_panel, "sphere_params_per_roi")
+            and mw.current_drawing_roi in mw.vtk_panel.sphere_params_per_roi
+        ):
+            params = mw.vtk_panel.sphere_params_per_roi[mw.current_drawing_roi]
+            with signals_blocked(mw.sphere_radius_spinbox):
+                mw.sphere_radius_spinbox.setValue(params.get("radius", 5.0))
+
+    def _deactivate_mode(self, key: str) -> None:
+        mw = self.mw
+        flag = _MODE_SPECS[key].flag
+        if key in ("draw", "erase") or hasattr(mw, flag):
+            setattr(mw, flag, False)
+        getattr(mw, f"{key}_mode_action").setChecked(False)
+        getattr(mw, f"{key}_mode_button").setStyleSheet(self._get_button_style_default())
+        if key == "sphere" and hasattr(mw, "sphere_radius_container"):
+            mw.sphere_radius_container.setVisible(False)
 
     def reset_all_drawing_modes(self) -> None:
         """Resets all drawing modes to inactive state."""
+        for key in _MODE_SPECS:
+            self._deactivate_mode(key)
         mw = self.mw
-
-        # Reset Drawing Mode
-        mw.is_drawing_mode = False
-        mw.draw_mode_action.setChecked(False)
-        mw.draw_mode_button.setStyleSheet(self._get_button_style_default())
-
-        # Reset Eraser Mode
-        mw.is_eraser_mode = False
-        mw.erase_mode_action.setChecked(False)
-        mw.erase_mode_button.setStyleSheet(self._get_button_style_default())
-
-        # Reset Sphere Mode
-        if hasattr(mw, "is_sphere_mode"):
-            mw.is_sphere_mode = False
-        mw.sphere_mode_action.setChecked(False)
-        mw.sphere_mode_button.setStyleSheet(self._get_button_style_default())
-        if hasattr(mw, "sphere_radius_container"):
-            mw.sphere_radius_container.setVisible(False)
-
-        # Reset Rectangle Mode
-        if hasattr(mw, "is_rectangle_mode"):
-            mw.is_rectangle_mode = False
-        mw.rectangle_mode_action.setChecked(False)
-        mw.rectangle_mode_button.setStyleSheet(self._get_button_style_default())
-
-        # Reset current drawing ROI
         mw.current_drawing_roi = None
-
-        # Update VTK panel
         if mw.vtk_panel:
             mw.vtk_panel.set_drawing_mode(
                 False, is_eraser=False, is_sphere=False, is_rectangle=False
             )
-
-    def _deactivate_draw_mode(self) -> None:
-        """Deactivates draw mode without triggering the toggle handler."""
-        mw = self.mw
-        if mw.is_drawing_mode:
-            mw.is_drawing_mode = False
-            mw.draw_mode_action.setChecked(False)
-            mw.draw_mode_button.setStyleSheet(self._get_button_style_default())
-
-    def _deactivate_eraser_mode(self) -> None:
-        """Deactivates eraser mode without triggering the toggle handler."""
-        mw = self.mw
-        if mw.is_eraser_mode:
-            mw.is_eraser_mode = False
-            mw.erase_mode_action.setChecked(False)
-            mw.erase_mode_button.setStyleSheet(self._get_button_style_default())
-
-    def _deactivate_sphere_mode(self) -> None:
-        """Deactivates sphere mode without triggering the toggle handler."""
-        mw = self.mw
-        if getattr(mw, "is_sphere_mode", False):
-            mw.is_sphere_mode = False
-            mw.sphere_mode_action.setChecked(False)
-            mw.sphere_mode_button.setStyleSheet(self._get_button_style_default())
-            if hasattr(mw, "sphere_radius_container"):
-                mw.sphere_radius_container.setVisible(False)
-
-    def _deactivate_rectangle_mode(self) -> None:
-        """Deactivates rectangle mode without triggering the toggle handler."""
-        mw = self.mw
-        if getattr(mw, "is_rectangle_mode", False):
-            mw.is_rectangle_mode = False
-            mw.rectangle_mode_action.setChecked(False)
-            mw.rectangle_mode_button.setStyleSheet(self._get_button_style_default())

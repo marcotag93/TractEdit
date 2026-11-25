@@ -13,13 +13,12 @@ Handles creation of toolbars, status bar, and central widget setup.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from PyQt6.QtWidgets import (
     QToolBar,
     QWidget,
     QHBoxLayout,
-    QVBoxLayout,
     QLabel,
     QCheckBox,
     QSpinBox,
@@ -28,12 +27,12 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QSpacerItem,
     QSizePolicy,
-    QStatusBar,
     QLineEdit,
 )
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QAction, QIcon, QPixmap, QPainter, QImage
+from PyQt6.QtGui import QAction, QIcon, QPixmap, QImage
 
+from .theme_manager import ThemeManager
 from ..utils import get_asset_path
 
 if TYPE_CHECKING:
@@ -77,11 +76,12 @@ class ToolbarsManager:
 
     def _get_button_style_default(self) -> str:
         """Returns the default button style from theme manager."""
-        return self.mw.theme_manager.get_button_style_default()
+        manager = getattr(self.mw, "theme_manager", None)
+        return manager.get_button_style_default() if manager else ThemeManager.button_style(False)
 
     def _get_label_color(self) -> str:
         """Returns the label color based on current theme."""
-        if hasattr(self.mw, "theme_manager") and self.mw.theme_manager.is_dark_theme():
+        if getattr(self.mw, "theme_manager", None) is not None and self.mw.theme_manager.is_dark_theme():
             return "#dddddd"
         return "#333333"
 
@@ -157,16 +157,7 @@ class ToolbarsManager:
 
         # Brush size value label
         mw.brush_size_label = QLabel(f"{mw.draw_brush_size}")
-        mw.brush_size_label.setStyleSheet(
-            """
-            QLabel {
-                font-weight: bold;
-                color: #00BCD4;
-                font-size: 13px;
-                min-width: 15px;
-            }
-            """
-        )
+        mw.brush_size_label.setStyleSheet(ThemeManager.brush_value_style())
         layout.addWidget(mw.brush_size_label)
 
         # Brush size slider
@@ -176,27 +167,7 @@ class ToolbarsManager:
         mw.brush_size_slider.setToolTip("Brush size: 1-10 voxels")
         mw.brush_size_slider.setFixedWidth(100)
         mw.brush_size_slider.valueChanged.connect(mw._on_brush_size_changed)
-        mw.brush_size_slider.setStyleSheet(
-            """
-            QSlider::groove:horizontal {
-                border: 1px solid #c0c0c0;
-                height: 6px;
-                background: #e0e0e0;
-                border-radius: 3px;
-            }
-            QSlider::handle:horizontal {
-                background: #00BCD4;
-                border: 1px solid #00ACC1;
-                width: 16px;
-                height: 16px;
-                margin: -6px 0;
-                border-radius: 8px;
-            }
-            QSlider::handle:horizontal:hover {
-                background: #00ACC1;
-            }
-            """
-        )
+        mw.brush_size_slider.setStyleSheet(ThemeManager.initial_slider_style())
         layout.addWidget(mw.brush_size_slider)
 
         # Add stretch to push items to the left
@@ -212,43 +183,21 @@ class ToolbarsManager:
         # Get theme-aware button style
         button_style = self._get_button_style_default()
 
-        # Draw Mode Button
-        mw.draw_mode_button = QToolButton()
-        pencil_icon = self._create_pencil_icon()
-        mw.draw_mode_action.setIcon(pencil_icon)
-        mw.draw_mode_button.setDefaultAction(mw.draw_mode_action)
-        mw.draw_mode_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-        mw.draw_mode_button.setStyleSheet(button_style)
-        layout.addWidget(mw.draw_mode_button)
-
-        # Erase Mode Button
-        mw.erase_mode_button = QToolButton()
-        eraser_icon = self._create_eraser_icon()
-        mw.erase_mode_action.setIcon(eraser_icon)
-        mw.erase_mode_button.setDefaultAction(mw.erase_mode_action)
-        mw.erase_mode_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-        mw.erase_mode_button.setStyleSheet(button_style)
-        layout.addWidget(mw.erase_mode_button)
-
-        # Sphere Mode Button
-        mw.sphere_mode_button = QToolButton()
-        sphere_icon = self._create_sphere_icon()
-        mw.sphere_mode_action.setIcon(sphere_icon)
-        mw.sphere_mode_button.setDefaultAction(mw.sphere_mode_action)
-        mw.sphere_mode_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-        mw.sphere_mode_button.setStyleSheet(button_style)
-        layout.addWidget(mw.sphere_mode_button)
-
-        # Rectangle Mode Button
-        mw.rectangle_mode_button = QToolButton()
-        rectangle_icon = self._create_rectangle_icon()
-        mw.rectangle_mode_action.setIcon(rectangle_icon)
-        mw.rectangle_mode_button.setDefaultAction(mw.rectangle_mode_action)
-        mw.rectangle_mode_button.setToolButtonStyle(
-            Qt.ToolButtonStyle.ToolButtonIconOnly
+        modes = (
+            ("draw", self._create_pencil_icon),
+            ("erase", self._create_eraser_icon),
+            ("sphere", self._create_sphere_icon),
+            ("rectangle", self._create_rectangle_icon),
         )
-        mw.rectangle_mode_button.setStyleSheet(button_style)
-        layout.addWidget(mw.rectangle_mode_button)
+        for mode, create_icon in modes:
+            button = QToolButton()
+            setattr(mw, f"{mode}_mode_button", button)
+            action = getattr(mw, f"{mode}_mode_action")
+            action.setIcon(create_icon())
+            button.setDefaultAction(action)
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+            button.setStyleSheet(button_style)
+            layout.addWidget(button)
 
     def _add_sphere_radius_control(self, layout: QHBoxLayout) -> None:
         """
@@ -273,7 +222,7 @@ class ToolbarsManager:
 
         # Label
         radius_label = QLabel("Radius:")
-        radius_label.setStyleSheet("font-weight: bold; color: #333;")
+        radius_label.setStyleSheet(f"font-weight: bold; color: {self._get_label_color()};")
         radius_layout.addWidget(radius_label)
 
         # Spinbox for radius value
@@ -288,29 +237,7 @@ class ToolbarsManager:
             "Ctrl+Scroll over 2D views also adjusts radius."
         )
         mw.sphere_radius_spinbox.setFixedWidth(90)
-        mw.sphere_radius_spinbox.setStyleSheet(
-            """
-            QDoubleSpinBox {
-                border: 1px solid #00BCD4;
-                border-radius: 4px;
-                padding: 2px 5px;
-                background: white;
-                font-weight: bold;
-                color: #00838F;
-            }
-            QDoubleSpinBox:focus {
-                border: 2px solid #00ACC1;
-            }
-            QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
-                width: 18px;
-                border: none;
-                background: #e0f7fa;
-            }
-            QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {
-                background: #b2ebf2;
-            }
-            """
-        )
+        mw.sphere_radius_spinbox.setStyleSheet(ThemeManager.initial_spinbox_style())
         # Preview on value change, apply on editing finished
         mw.sphere_radius_spinbox.valueChanged.connect(mw._on_sphere_radius_preview)
         mw.sphere_radius_spinbox.editingFinished.connect(mw._on_sphere_radius_changed)
@@ -322,7 +249,7 @@ class ToolbarsManager:
 
     def _is_dark_theme(self) -> bool:
         """Checks if the current theme is dark."""
-        if hasattr(self.mw, "theme_manager"):
+        if getattr(self.mw, "theme_manager", None) is not None:
             return self.mw.theme_manager.is_dark_theme()
         return False
 
@@ -430,12 +357,20 @@ class ToolbarsManager:
         mw.scalar_toolbar.setVisible(False)
 
         # Connect Signals
-        mw.scalar_min_slider.valueChanged.connect(mw._slider_value_changed)
-        mw.scalar_max_slider.valueChanged.connect(mw._slider_value_changed)
-        mw.scalar_min_slider.sliderReleased.connect(mw._trigger_vtk_update)
-        mw.scalar_max_slider.sliderReleased.connect(mw._trigger_vtk_update)
-        mw.scalar_min_spinbox.editingFinished.connect(mw._spinbox_value_changed)
-        mw.scalar_max_spinbox.editingFinished.connect(mw._spinbox_value_changed)
+        mw.scalar_min_slider.valueChanged.connect(
+            lambda val: mw.scalar_manager.slider_value_changed(val, mw.scalar_min_slider)
+        )
+        mw.scalar_max_slider.valueChanged.connect(
+            lambda val: mw.scalar_manager.slider_value_changed(val, mw.scalar_max_slider)
+        )
+        mw.scalar_min_slider.sliderReleased.connect(mw.scalar_manager.trigger_vtk_update)
+        mw.scalar_max_slider.sliderReleased.connect(mw.scalar_manager.trigger_vtk_update)
+        mw.scalar_min_spinbox.editingFinished.connect(
+            lambda: mw.scalar_manager.spinbox_value_changed(mw.scalar_min_spinbox)
+        )
+        mw.scalar_max_spinbox.editingFinished.connect(
+            lambda: mw.scalar_manager.spinbox_value_changed(mw.scalar_max_spinbox)
+        )
         mw.scalar_reset_button.triggered.connect(mw._reset_scalar_range)
 
     def setup_status_bar(self) -> None:

@@ -7,6 +7,7 @@ Build with: pyinstaller .github/scripts/macos/tractedit.spec
 import sys
 import os
 from pathlib import Path
+from PIL import Image
 
 block_cipher = None
 
@@ -55,6 +56,12 @@ a = Analysis(
         'tractedit_pkg.assets',
         'tractedit_pkg.main_window',
         'tractedit_pkg.file_io',
+        'tractedit_pkg.file_io.anatomical',
+        'tractedit_pkg.file_io.bundle_gui',
+        'tractedit_pkg.file_io.bundle_stats',
+        'tractedit_pkg.file_io.bbox_cache',
+        'tractedit_pkg.file_io.tractogram',
+        'tractedit_pkg.file_io.density_map',
         'tractedit_pkg.utils',
         'tractedit_pkg.odf_utils',
         'tractedit_pkg.logic',
@@ -67,6 +74,7 @@ a = Analysis(
         # PyQt6 modules
         'PyQt6.QtCore',
         'PyQt6.QtGui',
+        'PyQt6.QtNetwork',
         'PyQt6.QtWidgets',
         # VTK - comprehensive imports
         'vtkmodules',
@@ -98,6 +106,9 @@ a = Analysis(
         # Scientific stack
         'numpy',
         'scipy',
+        'scipy._cyutility',
+        'scipy.sparse',
+        'scipy.spatial',
         'nibabel',
         'fury',
         'trx',
@@ -131,6 +142,8 @@ a = Analysis(
         'skimage',
         # Numba is build-time only (AOT extension is pre-compiled)
         'numba',
+        'tractedit_pkg._numba_aot.build_aot',
+        'tractedit_pkg._numba_aot.kernels',
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
@@ -200,42 +213,85 @@ coll = COLLECT(
     name='TractEdit',
 )
 
+bundle_icon = Path(workpath) / 'TractEdit.icns'
+with Image.open(project_root / 'tractedit_pkg/assets/logo.ico') as source_icon:
+    source_icon.save(bundle_icon)
+
 app = BUNDLE(
     coll,
     name='TractEdit.app',
-    icon=str(project_root / 'tractedit_pkg' / 'assets' / 'logo.ico'),
+    icon=str(bundle_icon),
     bundle_identifier='com.tractedit.app',
     info_plist={
         'CFBundleName': 'TractEdit',
         'CFBundleDisplayName': 'TractEdit',
-        'CFBundleVersion': '3.5.0',
-        'CFBundleShortVersionString': '3.5.0',
+        'CFBundleVersion': '3.6.0',
+        'CFBundleShortVersionString': '3.6.0',
         'NSHighResolutionCapable': True,
         'NSRequiresAquaSystemAppearance': False,
+        'UTExportedTypeDeclarations': [{
+            'UTTypeIdentifier': 'com.tractedit.session',
+            'UTTypeDescription': 'TractEdit Session',
+            'UTTypeConformsTo': ['com.pkware.zip-archive'],
+            'UTTypeTagSpecification': {'public.filename-extension': ['tractedit-session']},
+            'UTTypeIconFile': 'TractEdit.icns',
+        }],
         'CFBundleDocumentTypes': [
+            {
+                'CFBundleTypeName': 'Wavefront OBJ Mesh',
+                'CFBundleTypeExtensions': ['obj'],
+                'CFBundleTypeRole': 'Viewer',
+                'LSHandlerRank': 'Alternate',
+            },
+            {
+                'CFBundleTypeName': 'TractEdit Session',
+                'CFBundleTypeExtensions': ['tractedit-session'],
+                'CFBundleTypeIconFile': 'TractEdit.icns',
+                'CFBundleTypeRole': 'Editor',
+                'LSItemContentTypes': ['com.tractedit.session'],
+                'LSHandlerRank': 'Owner',
+            },
+            {
+                'CFBundleTypeName': 'NIfTI Image',
+                'CFBundleTypeExtensions': ['nii'],
+                'CFBundleTypeIconFile': 'TractEdit.icns',
+                'CFBundleTypeRole': 'Viewer',
+                'LSHandlerRank': 'Alternate',
+            },
+            {
+                'CFBundleTypeName': 'Compressed NIfTI Image',
+                'CFBundleTypeExtensions': ['nii.gz'],
+                'CFBundleTypeRole': 'Viewer',
+                'LSHandlerRank': 'Alternate',
+            },
             {
                 'CFBundleTypeName': 'TRK File',
                 'CFBundleTypeExtensions': ['trk'],
+                'CFBundleTypeIconFile': 'TractEdit.icns',
                 'CFBundleTypeRole': 'Editor',
             },
             {
                 'CFBundleTypeName': 'TCK File',
                 'CFBundleTypeExtensions': ['tck'],
+                'CFBundleTypeIconFile': 'TractEdit.icns',
                 'CFBundleTypeRole': 'Editor',
             },
             {
                 'CFBundleTypeName': 'TRX File',
                 'CFBundleTypeExtensions': ['trx'],
+                'CFBundleTypeIconFile': 'TractEdit.icns',
                 'CFBundleTypeRole': 'Editor',
             },
             {
                 'CFBundleTypeName': 'VTK File',
                 'CFBundleTypeExtensions': ['vtk'],
+                'CFBundleTypeIconFile': 'TractEdit.icns',
                 'CFBundleTypeRole': 'Editor',
             },
             {
                 'CFBundleTypeName': 'VTP File',
                 'CFBundleTypeExtensions': ['vtp'],
+                'CFBundleTypeIconFile': 'TractEdit.icns',
                 'CFBundleTypeRole': 'Editor',
             },
         ],

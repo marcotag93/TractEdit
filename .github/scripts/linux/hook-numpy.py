@@ -28,7 +28,6 @@ def create_dummy_numpy_config():
 
     # Check if numpy.__config__ already exists in sys.modules
     if "numpy.__config__" in sys.modules:
-        _log("numpy.__config__ already in sys.modules")
         return
 
     # Create a dummy __config__ module

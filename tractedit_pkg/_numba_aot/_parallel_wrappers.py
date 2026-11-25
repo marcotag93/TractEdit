@@ -146,24 +146,10 @@ def parallel_chunks(
         return
 
     workers = _worker_count(n_items, n_workers, _MIN_PARALLEL_ITEMS)
-    chunk_size = max(1, (n_items + workers - 1) // workers)
-
-    # Fast path: single chunk — skip pool overhead entirely.
-    if n_items <= chunk_size or workers == 1:
+    if workers == 1:
         kernel_fn(*args, 0, n_items)
         return
-
-    pool = _get_pool(workers)
-    try:
-        _submit_and_drain(
-            pool,
-            (
-                (kernel_fn, (*args, start, min(start + chunk_size, n_items)))
-                for start in range(0, n_items, chunk_size)
-            ),
-        )
-    finally:
-        _release_pool()
+    parallel_chunks_range(kernel_fn, 0, n_items, *args, n_workers=workers)
 
 
 def parallel_chunks_range(
@@ -461,28 +447,6 @@ def batch_check_oriented_box_intersection(
     return results
 
 
-def copy_streamlines_parallel(
-    src_data: np.ndarray,
-    dst_data: np.ndarray,
-    src_starts: np.ndarray,
-    dst_starts: np.ndarray,
-    lengths: np.ndarray,
-) -> None:
-    """Copy streamline data from source to destination buffer (parallel)."""
-    from . import copy_streamlines_chunk
-
-    n = len(lengths)
-    parallel_chunks(
-        copy_streamlines_chunk,
-        n,
-        src_data,
-        dst_data,
-        src_starts,
-        dst_starts,
-        lengths,
-    )
-
-
 def resample_batch(
     flat_data: np.ndarray,
     offsets: np.ndarray,
@@ -557,3 +521,118 @@ def compute_endpoint_labels(
         end_labels,
     )
     return start_labels, end_labels
+
+
+def _dispatch_mesh_chunks(start, end, workers, make_call):
+    chunk_size = (end - start + workers - 1) // workers
+    calls = [
+        make_call(first, min(first + chunk_size, end))
+        for first in range(start, end, chunk_size)
+    ]
+    pool = _get_pool(workers)
+    try:
+        _submit_and_drain(pool, calls)
+    finally:
+        _release_pool()
+
+
+def validate_mesh_points_range(
+    points: np.ndarray,
+    start: int,
+    end: int,
+) -> tuple[bool, np.ndarray]:
+    """Validate finiteness and compute bounds on ``points[start:end]`` (parallel)."""
+    from . import validate_points_f32_chunk, validate_points_f64_chunk
+
+    kernel = (
+        validate_points_f32_chunk
+        if points.dtype == np.float32
+        else validate_points_f64_chunk
+    )
+    count = end - start
+    if count <= 0:
+        bounds = np.array([np.inf, np.inf, np.inf, -np.inf, -np.inf, -np.inf])
+        return True, bounds
+    n_workers = _worker_count(count, None, 65_536)
+
+    def restore_zero_signs(bounds):
+        if np.any(bounds == 0):
+            block = points[start:end]
+            if np.any(bounds[:3] == 0):
+                bounds[:3] = block.min(axis=0)
+            if np.any(bounds[3:] == 0):
+                bounds[3:] = block.max(axis=0)
+        return bounds
+
+    if n_workers == 1:
+        out_bounds = np.empty(6, dtype=np.float64)
+        out_ok = np.zeros(1, dtype=np.uint8)
+        kernel(points, out_bounds, out_ok, start, end)
+        if not out_ok[0]:
+            return False, out_bounds
+        return True, restore_zero_signs(out_bounds)
+
+    bounds_list = []
+    ok_list = []
+
+    def make_call(first, last):
+        bounds = np.empty(6, dtype=np.float64)
+        ok = np.zeros(1, dtype=np.uint8)
+        bounds_list.append(bounds)
+        ok_list.append(ok)
+        return kernel, (points, bounds, ok, first, last)
+
+    _dispatch_mesh_chunks(start, end, n_workers, make_call)
+    if any(not ok[0] for ok in ok_list):
+        return False, np.empty(6, dtype=np.float64)
+    merged = bounds_list[0].copy()
+    for b in bounds_list[1:]:
+        np.minimum(merged[:3], b[:3], out=merged[:3])
+        np.maximum(merged[3:], b[3:], out=merged[3:])
+    return True, restore_zero_signs(merged)
+
+
+def validate_mesh_triangles_range(
+    points: np.ndarray,
+    indices: np.ndarray,
+    allow_zero_area: bool,
+    start_face: int,
+    end_face: int,
+) -> tuple[int, bool]:
+    """Validate triangle faces ``[start_face, end_face)`` (parallel).
+
+    Returns ``(error_code, has_area)`` where ``error_code`` is 0 (ok),
+    1 (repeated vertex), or 2 (zero-area face when disallowed).
+    """
+    from . import validate_triangles_f32_chunk, validate_triangles_f64_chunk
+
+    kernel = (
+        validate_triangles_f32_chunk
+        if points.dtype == np.float32
+        else validate_triangles_f64_chunk
+    )
+    count = end_face - start_face
+    if count <= 0:
+        return 0, False
+    allow_flag = np.uint8(1 if allow_zero_area else 0)
+    n_workers = _worker_count(count, None, 16_384)
+    if n_workers == 1:
+        status = np.zeros(2, dtype=np.int64)
+        kernel(points, indices, allow_flag, status, start_face, end_face)
+        return int(status[0]), bool(status[1])
+
+    statuses = []
+
+    def make_call(first, last):
+        status = np.zeros(2, dtype=np.int64)
+        statuses.append(status)
+        return kernel, (points, indices, allow_flag, status, first, last)
+
+    _dispatch_mesh_chunks(start_face, end_face, n_workers, make_call)
+    has_area = False
+    for st in statuses:
+        if st[0] != 0:
+            return int(st[0]), False
+        if st[1]:
+            has_area = True
+    return 0, has_area

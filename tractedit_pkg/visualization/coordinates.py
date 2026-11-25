@@ -11,7 +11,7 @@ world (RASmm) coordinates using affine transformation matrices.
 # Imports
 # ============================================================================
 
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 import numpy as np
 
 

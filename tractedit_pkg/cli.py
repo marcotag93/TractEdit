@@ -5,13 +5,28 @@
 import argparse
 
 
+NIFTI_SUFFIXES = (".nii", ".nii.gz")
+
+
+def gui_document_paths(
+    document: str | None, anatomical: str | None
+) -> tuple[str | None, str | None]:
+    """Separate a positional GUI document from the anatomical image path."""
+    if document and document.lower().endswith(NIFTI_SUFFIXES):
+        if anatomical:
+            raise ValueError("Specify one image via the document path or --anat.")
+        return None, document
+    return document, anatomical
+
+
 def build_argument_parser() -> argparse.ArgumentParser:
     """Build the parser shared by GUI and headless entry points."""
     parser = argparse.ArgumentParser(description="TractEdit - GUI")
     parser.add_argument(
         "bundle",
         nargs="?",
-        help="Path to the bundle file (.trk, .tck, .trx, .vtk, .vtp)",
+        help="Path to a bundle (.trk, .tck, .trx, .vtk, .vtp) "
+        "or GUI document (.nii, .nii.gz, .obj, .tractedit-session)",
     )
     parser.add_argument("--anat", help="Path to the anatomical image (T1w)")
     parser.add_argument(
@@ -37,7 +52,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
         action="append",
         help="Radius of the sphere ROI (default: 5mm). Can be used multiple times.",
     )
-    parser.add_argument(
+    exports = parser.add_mutually_exclusive_group()
+    exports.add_argument(
         "--convert-to",
         dest="convert_to",
         metavar="OUTPUT",
@@ -46,7 +62,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "Supported formats: .trk, .tck, .trx, .vtk, .vtp"
         ),
     )
-    parser.add_argument(
+    exports.add_argument(
         "--density-map",
         dest="density_map",
         metavar="OUTPUT",

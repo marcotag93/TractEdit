@@ -15,17 +15,18 @@ import zipfile
 
 import numpy as np
 
-from . import __version__
-from .transactional_io import staged_new_output
+from .. import SESSION_EXTENSION, __version__
+from ..transactional_io import staged_new_output
+from .mesh import MAX_MESH_LAYERS, mesh_source_id, validate_mesh_document
+from .mesh_texture import MAX_TEXTURE_ASSETS, texture_asset_role
 
 FORMAT = "tractedit-session"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 12
 BLOCK_BYTES = 4 * 1024 * 1024
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_ARRAY_BYTES = 2 * 1024**3
 MAX_PAYLOAD_BYTES = 8 * 1024**3
 MAX_MEMBERS = 10000
-SESSION_EXTENSION = ".tractedit-session"
 TIMESTAMP_PATTERN = r"\d{8}_\d{6}_\d{6}(?:_\d+)?"
 
 
@@ -138,12 +139,20 @@ def fingerprint(
 
 
 def validate_sources(sources):
-    if not isinstance(sources, dict) or set(sources) - {
+    fixed_roles = {
         "tractogram",
         "anatomy",
         "parcellation",
         "odf",
-    }:
+    }
+    if (
+        not isinstance(sources, dict)
+        or len(sources) > len(fixed_roles) + MAX_MESH_LAYERS + MAX_TEXTURE_ASSETS
+        or any(
+            role not in fixed_roles and mesh_source_id(role) is None
+            and not texture_asset_role(role) for role in sources
+        )
+    ):
         raise SessionError("Invalid source table")
     for record in sources.values():
         if not isinstance(record, dict) or set(record) != {"path", "size", "sha256"}:
@@ -160,14 +169,6 @@ def validate_sources(sources):
             or re.fullmatch(r"[0-9a-f]{64}", record["sha256"]) is None
         ):
             raise SessionError("Session sources must use absolute paths")
-
-
-def verify_sources(sources, cancelled=lambda: False, progress=lambda message: None):
-    validate_sources(sources)
-    for record in sources.values():
-        actual = fingerprint(record["path"], cancelled, progress)
-        if actual != record:
-            raise SessionError(f"Source has changed: {record['path']}")
 
 
 def resolve_session_sources(
@@ -204,6 +205,8 @@ def resolve_session_sources(
             checkpoint(cancelled)
             try:
                 candidate = candidate.resolve(strict=True)
+                if not candidate.is_file():
+                    continue
                 receipt = receipts.get(role)
                 if (
                     receipt
@@ -260,6 +263,66 @@ def write_session(path, document, cancelled=lambda: False, progress=lambda text:
     """Publish one complete archive, leaving an existing destination on failure."""
     destination = Path(path).resolve()
     validate_sources(document["sources"])
+    validate_mesh_document(document)
+    state, views = document.get("state"), document.get("views")
+    has_meshes = isinstance(state, dict) and bool(state.get("mesh_layers"))
+    schema = 2
+    if has_meshes:
+        schema = (
+            8 if any("polylines" in r for r in state["mesh_layers"])
+            else 6 if any("bounding_box" in r.get("presentation", {})
+                                  for r in state["mesh_layers"])
+            else 5 if any("presentation" in r for r in state["mesh_layers"])
+            or "components" in views["mesh_tree"]
+            else 4 if any("texture" in r for r in state["mesh_layers"]) else 3
+        )
+    if isinstance(state, dict) and (
+        "standalone_polylines" in state or any(
+            any("line_width" in line for line in layer.get("polylines", []))
+            for layer in state.get("mesh_layers", [])
+        )
+    ):
+        schema = 9
+    if has_meshes:
+        hierarchical = any(r.get("parent_id") is not None for r in state["mesh_layers"])
+        if hierarchical:
+            schema = 10
+        records = [
+            dict(record, parent_id=record.get("parent_id")) if hierarchical else
+            {key: value for key, value in record.items() if key != "parent_id"}
+            for record in state["mesh_layers"]
+        ]
+        state = dict(state, mesh_layers=records)
+        document = dict(document, state=state)
+    has_regions = has_meshes and any(
+        "region" in line for layer in state["mesh_layers"] for line in layer.get("polylines", ())
+    )
+    if has_regions:
+        schema = 12
+    if has_meshes or schema == 9:
+        validate_mesh_document(document, schema)
+    if isinstance(state, dict) and "surface_mapping_recipe" in state:
+        from .surface_mapping import validate_recipe
+
+        validate_recipe(state["surface_mapping_recipe"], state)
+        if not has_meshes or "tractogram" not in document["sources"]:
+            raise SessionError("Surface mapping recipes require mesh and tractogram sources")
+        schema = max(schema, 7)
+        validate_mesh_document(document, schema)
+    if isinstance(state, dict) and "scalar_display" in state:
+        from ..tractogram_arrays import validate_scalar_display
+
+        try:
+            validate_scalar_display(state["scalar_display"])
+        except ValueError as error:
+            raise SessionError(str(error)) from error
+        schema = max(schema, 11)
+    payload = {k: v for k, v in document.items() if k != "sources"}
+    if not has_meshes:
+        if isinstance(state, dict):
+            payload["state"] = {k: v for k, v in state.items() if k != "mesh_layers"}
+        if isinstance(views, dict):
+            payload["views"] = {k: v for k, v in views.items() if k != "mesh_tree"}
     for record in document["sources"].values():
         source = Path(record["path"])
         if destination == source or (
@@ -321,13 +384,11 @@ def write_session(path, document, cancelled=lambda: False, progress=lambda text:
 
             manifest = {
                 "format": FORMAT,
-                "schema": SCHEMA_VERSION,
+                "schema": schema,
                 "application_version": __version__,
                 "conventions": "RASmm; ROI>0; MRtrix3/Tournier; native-reference-grid",
                 "sources": document["sources"],
-                "payload": encode(
-                    {k: v for k, v in document.items() if k != "sources"}
-                ),
+                "payload": encode(payload),
             }
             relative_sources = {}
             for role, record in document["sources"].items():
@@ -406,12 +467,16 @@ def read_session(
                 result[key] = value
             return result
 
-        manifest = json.loads(archive.read("manifest.json"), object_pairs_hook=pairs)
+        with archive.open("manifest.json") as stream:
+            payload = stream.read(MAX_MANIFEST_BYTES + 1)
+        if len(payload) > MAX_MANIFEST_BYTES:
+            raise SessionError("Session manifest is too large")
+        manifest = json.loads(payload, object_pairs_hook=pairs)
         if (
             not isinstance(manifest, dict)
             or manifest.get("format") != FORMAT
             or type(manifest.get("schema")) is not int
-            or manifest["schema"] not in (1, SCHEMA_VERSION)
+            or not 1 <= manifest["schema"] <= SCHEMA_VERSION
         ):
             raise SessionError("Unsupported session format or schema version")
         if manifest["schema"] == 1 and (
@@ -461,16 +526,21 @@ def read_session(
                 progress(f"Reading {body}")
                 with archive.open(body) as stream:
                     version = np.lib.format.read_magic(stream)
+                    if version not in ((1, 0), (2, 0)):
+                        raise SessionError("Unsupported NumPy header")
+                    width = 2 if version == (1, 0) else 4
+                    start = stream.tell()
+                    if int.from_bytes(stream.read(width), "little") > 10000:
+                        raise SessionError("Session array header limit exceeded")
+                    stream.seek(start)
                     if version == (1, 0):
                         shape, fortran, dtype = np.lib.format.read_array_header_1_0(
                             stream
                         )
-                    elif version == (2, 0):
+                    else:
                         shape, fortran, dtype = np.lib.format.read_array_header_2_0(
                             stream
                         )
-                    else:
-                        raise SessionError("Unsupported NumPy header")
                     if dtype.kind not in "biufc" or dtype.hasobject or len(shape) > 8:
                         raise SessionError("Unsafe array dtype or dimensions")
                     size = math.prod(shape) * dtype.itemsize
@@ -486,8 +556,11 @@ def read_session(
                         if len(block) != min(BLOCK_BYTES, size - start):
                             raise SessionError("Truncated array")
                         target[start : start + len(block)] = block
-                    stream.read(1)
+                    if stream.read(1):
+                        raise SessionError("Trailing array payload")
                     return result
+            if kind in ("mapping", "tuple", "set") and not isinstance(body, list):
+                raise SessionError("Invalid session container")
             if kind == "mapping":
                 result = {}
                 for key, item in body:
@@ -511,11 +584,62 @@ def read_session(
                 return set(array.tolist())
             raise SessionError("Unknown value encoding")
 
-        document = decode(manifest["payload"])
+        try:
+            document = decode(manifest["payload"])
+        except SessionError:
+            raise
+        except (TypeError, ValueError) as error:
+            raise SessionError("Invalid session payload") from error
         if set(names) != used or not isinstance(document, dict):
             raise SessionError("Unreferenced archive members or invalid document")
         document = VerifiedDocument(document)
         document["sources"] = manifest["sources"]
+        state = document.get("state", {})
+        if not isinstance(state, dict):
+            if manifest["schema"] > 2:
+                raise SessionError("Invalid session state")
+            state = {}
+        validate_mesh_document(document, manifest["schema"])
+        if manifest["schema"] < 12 and ("scalar_display" in state) != (manifest["schema"] == 11):
+            raise SessionError("Scalar component display requires session schema 11")
+        if "scalar_display" in state:
+            from ..tractogram_arrays import validate_scalar_display
+
+            try:
+                validate_scalar_display(state["scalar_display"])
+            except ValueError as error:
+                raise SessionError(str(error)) from error
+        if "surface_mapping_recipe" in state:
+            from .surface_mapping import validate_recipe
+
+            if (
+                manifest["schema"] not in (7, 8, 9, 10, 11, 12)
+                or "tractogram" not in document["sources"]
+            ):
+                raise SessionError("Surface mapping recipes require session schema 7 and sources")
+            validate_recipe(state["surface_mapping_recipe"], state)
+        elif manifest["schema"] == 7:
+            raise SessionError("Missing schema 7 surface mapping recipe")
+        if manifest["schema"] == 8:
+            from ..mesh.polylines import normalize_legacy_polylines
+
+            state["mesh_layers"] = [
+                dict(layer, polylines=normalize_legacy_polylines(layer["polylines"]))
+                if "polylines" in layer else layer
+                for layer in state.get("mesh_layers", [])
+            ]
+        if manifest["schema"] < 10 and isinstance(state, dict):
+            for record in state.get("mesh_layers", []):
+                record["parent_id"] = None
+        if (
+            isinstance(document.get("state"), dict)
+            and "streamline_count" in document["state"]
+        ):
+            document["state"].setdefault("mesh_layers", [])
+            if isinstance(document.get("views"), dict):
+                document["views"].setdefault(
+                    "mesh_tree", {"items": {}, "current": None, "expanded": True}
+                )
         document.relative_sources = relative
         if verify:
             resolve_session_sources(document, path, source_paths, cancelled, progress)

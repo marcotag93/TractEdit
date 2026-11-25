@@ -181,6 +181,33 @@ def test_sparse_segment_intersects_oblique_rectangle_prism():
     assert result == {0}
 
 
+@pytest.mark.parametrize(
+    ("visible", "expected"),
+    [({17}, {17}), ({2, 7, 12, 17}, {7, 17})],
+)
+def test_oriented_box_returns_original_visible_ids(visible, expected):
+    lines = [
+        nib.affines.apply_affine(
+            OBLIQUE_AFFINE,
+            [[-2, 0, 0], [2, 0, 0]] if i in {3, 7, 17} else [[0, 3, 0], [2, 3, 0]],
+        )
+        for i in range(20)
+    ]
+    window = SimpleNamespace(
+        tractogram_data=lines,
+        streamline_bboxes=np.array([[line.min(axis=0), line.max(axis=0)] for line in lines]),
+        visible_indices=visible,
+        _visibility_version=0,
+    )
+    manager = SelectionManager(SimpleNamespace(main_window=window))
+
+    result = manager.find_streamlines_in_oriented_box(
+        OBLIQUE_AFFINE, np.zeros(3), np.zeros(3)
+    )
+
+    assert result == expected
+
+
 def test_analytic_sphere_tangency_keeps_open_boundary_contract():
     points = np.array([[-2.0, 1.0, 0.0], [2.0, 1.0, 0.0]])
     result = batch_check_sphere_intersection(

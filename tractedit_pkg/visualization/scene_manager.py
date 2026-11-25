@@ -12,7 +12,7 @@ initialization for the axial, coronal, sagittal, and 3D views.
 # ============================================================================
 
 import logging
-from typing import TYPE_CHECKING, Optional, Dict, List, Tuple, Any
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import numpy as np
 import vtk
@@ -334,72 +334,34 @@ class SceneManager:
         """Creates the crosshair actors for all three views."""
         vp = self.vtk_panel
 
-        # --- Axial ---
-        vp.crosshair_lines["ax_x"] = vtk.vtkLineSource()
-        vp.crosshair_lines["ax_y"] = vtk.vtkLineSource()
-        vp.crosshair_appenders["axial"] = vtk.vtkAppendPolyData()
-        vp.crosshair_appenders["axial"].AddInputConnection(
-            vp.crosshair_lines["ax_x"].GetOutputPort()
-        )
-        vp.crosshair_appenders["axial"].AddInputConnection(
-            vp.crosshair_lines["ax_y"].GetOutputPort()
-        )
-        ax_mapper = vtk.vtkPolyDataMapper()
-        ax_mapper.SetInputConnection(vp.crosshair_appenders["axial"].GetOutputPort())
-        ax_mapper.SetResolveCoincidentTopologyToPolygonOffset()
-        ax_mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(-1, -1)
-        vp.axial_crosshair_actor = vtk.vtkActor()
-        vp.axial_crosshair_actor.SetMapper(ax_mapper)
-        vp.axial_crosshair_actor.GetProperty().SetColor(1, 1, 0)  # Yellow
-        vp.axial_crosshair_actor.GetProperty().SetLineWidth(1.0)
-        vp.axial_crosshair_actor.GetProperty().SetOpacity(0.8)
-        # Radiological convention: match the slice actor's mirrored user matrix.
-        vp.axial_crosshair_actor.SetScale(-1, 1, 1)
-        vp.axial_scene.add(vp.axial_crosshair_actor)
-
-        # --- Coronal ---
-        vp.crosshair_lines["co_x"] = vtk.vtkLineSource()
-        vp.crosshair_lines["co_z"] = vtk.vtkLineSource()
-        vp.crosshair_appenders["coronal"] = vtk.vtkAppendPolyData()
-        vp.crosshair_appenders["coronal"].AddInputConnection(
-            vp.crosshair_lines["co_x"].GetOutputPort()
-        )
-        vp.crosshair_appenders["coronal"].AddInputConnection(
-            vp.crosshair_lines["co_z"].GetOutputPort()
-        )
-        co_mapper = vtk.vtkPolyDataMapper()
-        co_mapper.SetInputConnection(vp.crosshair_appenders["coronal"].GetOutputPort())
-        co_mapper.SetResolveCoincidentTopologyToPolygonOffset()
-        co_mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(-1, -1)
-        vp.coronal_crosshair_actor = vtk.vtkActor()
-        vp.coronal_crosshair_actor.SetMapper(co_mapper)
-        vp.coronal_crosshair_actor.GetProperty().SetColor(1, 1, 0)
-        vp.coronal_crosshair_actor.GetProperty().SetLineWidth(1.0)
-        vp.coronal_crosshair_actor.GetProperty().SetOpacity(0.8)
-        # Radiological convention: match the slice actor's mirrored user matrix.
-        vp.coronal_crosshair_actor.SetScale(-1, 1, 1)
-        vp.coronal_scene.add(vp.coronal_crosshair_actor)
-
-        # --- Sagittal ---
-        vp.crosshair_lines["sa_y"] = vtk.vtkLineSource()
-        vp.crosshair_lines["sa_z"] = vtk.vtkLineSource()
-        vp.crosshair_appenders["sagittal"] = vtk.vtkAppendPolyData()
-        vp.crosshair_appenders["sagittal"].AddInputConnection(
-            vp.crosshair_lines["sa_y"].GetOutputPort()
-        )
-        vp.crosshair_appenders["sagittal"].AddInputConnection(
-            vp.crosshair_lines["sa_z"].GetOutputPort()
-        )
-        sa_mapper = vtk.vtkPolyDataMapper()
-        sa_mapper.SetInputConnection(vp.crosshair_appenders["sagittal"].GetOutputPort())
-        vp.sagittal_crosshair_actor = vtk.vtkActor()
-        vp.sagittal_crosshair_actor.SetMapper(sa_mapper)
-        vp.sagittal_crosshair_actor.GetProperty().SetColor(1, 1, 0)
-        vp.sagittal_crosshair_actor.GetProperty().SetLineWidth(1.0)
-        vp.sagittal_crosshair_actor.GetProperty().SetOpacity(0.8)
-        # Disable depth testing so crosshair always renders on top
-        vp.sagittal_crosshair_actor.GetProperty().SetLighting(False)
-        vp.sagittal_overlay_renderer.AddActor(vp.sagittal_crosshair_actor)
+        for plane, line_names in (
+            ("axial", ("ax_x", "ax_y")),
+            ("coronal", ("co_x", "co_z")),
+            ("sagittal", ("sa_y", "sa_z")),
+        ):
+            appender = vtk.vtkAppendPolyData()
+            vp.crosshair_appenders[plane] = appender
+            for name in line_names:
+                line = vtk.vtkLineSource()
+                vp.crosshair_lines[name] = line
+                appender.AddInputConnection(line.GetOutputPort())
+            mapper = vtk.vtkPolyDataMapper()
+            mapper.SetInputConnection(appender.GetOutputPort())
+            actor = vtk.vtkActor()
+            setattr(vp, f"{plane}_crosshair_actor", actor)
+            actor.SetMapper(mapper)
+            prop = actor.GetProperty()
+            prop.SetColor(1, 1, 0)
+            prop.SetLineWidth(1.0)
+            prop.SetOpacity(0.8)
+            if plane == "sagittal":
+                prop.SetLighting(False)
+                vp.sagittal_overlay_renderer.AddActor(actor)
+            else:
+                mapper.SetResolveCoincidentTopologyToPolygonOffset()
+                mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(-1, -1)
+                actor.SetScale(-1, 1, 1)
+                getattr(vp, f"{plane}_scene").add(actor)
 
     # =========================================================================
     # Scene UI Creation
@@ -419,7 +381,9 @@ class SceneManager:
 
         # Axes Actor
         vp.axes_actor = actors.create_axes_actor()
-        vp.scene.add(vp.axes_actor)
+        vp.axes_widget = actors.create_orientation_widget(
+            vp.axes_actor, vp.interactor, viewport=(0.85, 0.85, 1.0, 1.0)
+        )
 
         # 3D Orientation Cube
         try:
@@ -439,21 +403,13 @@ class SceneManager:
 
         # Clear any existing labels
         for label_actor in vp.orientation_labels:
-            if vp.axial_scene:
-                try:
-                    vp.axial_scene.rm(label_actor)
-                except (ValueError, RuntimeError):
-                    logger.debug("Failed to remove label actor from axial scene.")
-            if vp.coronal_scene:
-                try:
-                    vp.coronal_scene.rm(label_actor)
-                except (ValueError, RuntimeError):
-                    logger.debug("Failed to remove label actor from coronal scene.")
-            if vp.sagittal_scene:
-                try:
-                    vp.sagittal_scene.rm(label_actor)
-                except (ValueError, RuntimeError):
-                    logger.debug("Failed to remove label actor from sagittal scene.")
+            for plane in ("axial", "coronal", "sagittal"):
+                scene = getattr(vp, f"{plane}_scene")
+                if scene:
+                    try:
+                        scene.rm(label_actor)
+                    except (ValueError, RuntimeError):
+                        logger.debug("Failed to remove label actor from %s scene.", plane)
         vp.orientation_labels = []
 
         # Axial View (A/P, R/L)

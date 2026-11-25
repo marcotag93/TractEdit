@@ -18,11 +18,11 @@ Handles scalar-related operations including:
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
-from PyQt6.QtCore import pyqtSlot
 
+from ..render_batch import batch_render
 from ..utils import ColorMode, SLIDER_PRECISION, signals_blocked
 
 if TYPE_CHECKING:
@@ -104,16 +104,20 @@ class ScalarManager:
             for scalar_values in scalar_sequence:
                 if scalar_values is None or scalar_values.size == 0:
                     continue
-                values = np.asarray(scalar_values).reshape(-1)
-                if not np.all(np.isfinite(values)):
-                    raise ValueError("Active scalar data contains non-finite values.")
+                values = np.asarray(scalar_values)
+                if values.ndim > 1:
+                    values = values.reshape(len(values), -1)[:, 0]
+                finite = np.isfinite(values)
+                if not finite.all():
+                    values = values[finite]
+                if not values.size:
+                    continue
                 data_min_val = min(data_min_val, float(np.min(values)))
                 data_max_val = max(data_max_val, float(np.max(values)))
                 has_values = True
 
             if not has_values:
-                logger.info("Scalar range: Concatenated scalar data is empty.")
-                return
+                raise ValueError("Active scalar data has no finite values.")
 
             # Handle edge case where all data is the same value
             if data_min_val == data_max_val:
@@ -162,15 +166,16 @@ class ScalarManager:
             mw.scalar_min_slider.setValue(self.float_to_int_slider(mw.scalar_min_val))
             mw.scalar_max_slider.setValue(self.float_to_int_slider(mw.scalar_max_val))
 
-    def slider_value_changed(self, slider_val: int) -> None:
+    def slider_value_changed(self, slider_val: int, sender: Any = None) -> None:
         """
         Slot for when slider value changes.
         Updates the corresponding spinbox, but does NOT trigger VTK update.
         """
         mw = self.mw
+        src = sender if sender is not None else mw.sender()
         float_val = self.int_slider_to_float(slider_val)
 
-        if mw.sender() == mw.scalar_min_slider:
+        if src == mw.scalar_min_slider:
             mw.scalar_min_val = float_val
             with signals_blocked(mw.scalar_min_spinbox):
                 mw.scalar_min_spinbox.setValue(float_val)
@@ -179,7 +184,7 @@ class ScalarManager:
                 with signals_blocked(mw.scalar_max_slider):
                     mw.scalar_max_slider.setValue(slider_val)
 
-        elif mw.sender() == mw.scalar_max_slider:
+        elif src == mw.scalar_max_slider:
             mw.scalar_max_val = float_val
             with signals_blocked(mw.scalar_max_spinbox):
                 mw.scalar_max_spinbox.setValue(float_val)
@@ -188,18 +193,19 @@ class ScalarManager:
                 with signals_blocked(mw.scalar_min_slider):
                     mw.scalar_min_slider.setValue(slider_val)
 
-    def spinbox_value_changed(self) -> None:
+    def spinbox_value_changed(self, sender: Any = None) -> None:
         """
         Slot for when spinbox editing is finished.
         Updates sliders and triggers VTK update.
         """
         mw = self.mw
+        src = sender if sender is not None else mw.sender()
         min_val = mw.scalar_min_spinbox.value()
         max_val = mw.scalar_max_spinbox.value()
 
         # Ensure min <= max
         if min_val > max_val:
-            if mw.sender() == mw.scalar_min_spinbox:
+            if src == mw.scalar_min_spinbox:
                 max_val = min_val
             else:
                 min_val = max_val
@@ -218,6 +224,7 @@ class ScalarManager:
         self.update_scalar_range_widgets()
         self.trigger_vtk_update()
 
+    @batch_render(lambda self: self.mw.vtk_panel)
     def trigger_vtk_update(self) -> None:
         """
         Validates range and triggers the (slow) VTK actor update.
@@ -263,7 +270,6 @@ class ScalarManager:
             else:
                 mw.ras_coordinate_input.setText("--, --, --")
 
-    @pyqtSlot()
     def on_ras_coordinate_entered(self) -> None:
         """
         Parses the RAS coordinate QLineEdit and tells VTKPanel to move the slices.

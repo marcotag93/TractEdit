@@ -10,20 +10,8 @@ import pytest
 from tractedit_pkg.reference_grid import ReferenceGrid
 
 
-def _oblique_affine() -> np.ndarray:
-    return np.array(
-        [
-            [0.0, -3.0, 0.4, 10.0],
-            [2.0, 0.0, 0.0, -5.0],
-            [0.2, 0.5, 4.0, 2.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ],
-        dtype=np.float64,
-    )
-
-
-def test_trx_header_is_normalized_with_affine_column_norms():
-    affine = _oblique_affine()
+def test_trx_header_is_normalized_with_affine_column_norms(sheared_oblique_affine):
+    affine = sheared_oblique_affine
     grid = ReferenceGrid.from_header(
         {
             "DIMENSIONS": np.array([7, 8, 9]),
@@ -51,8 +39,8 @@ def test_incomplete_header_does_not_create_a_reference_grid():
     )
 
 
-def test_string_header_serializes_to_both_format_conventions():
-    affine = _oblique_affine()
+def test_string_header_serializes_to_both_format_conventions(sheared_oblique_affine):
+    affine = sheared_oblique_affine
     grid = ReferenceGrid.from_header(
         {
             "dimensions": "(7, 8, 9)",
@@ -89,8 +77,8 @@ def test_synthetic_grid_contains_negative_voxel_coordinates():
     np.testing.assert_array_equal(grid.affine[:3, 3], [-3.0, 0.0, 0.0])
 
 
-def test_synthetic_grid_with_rotated_affine_contains_all_points():
-    affine = _oblique_affine()
+def test_synthetic_grid_with_rotated_affine_contains_all_points(sheared_oblique_affine):
+    affine = sheared_oblique_affine
     voxel_points = np.array(
         [[-2.2, -1.0, 0.0], [1.1, 2.0, 3.0]],
         dtype=np.float64,
@@ -111,8 +99,8 @@ def test_synthetic_grid_with_rotated_affine_contains_all_points():
     assert np.all(normalized < np.asarray(grid.shape))
 
 
-def test_oblique_grid_from_world_bounds_contains_all_corners():
-    affine = _oblique_affine()
+def test_oblique_grid_from_world_bounds_contains_all_corners(sheared_oblique_affine):
+    affine = sheared_oblique_affine
     minimum = np.array([-10.0, -8.0, -6.0])
     maximum = np.array([12.0, 14.0, 16.0])
     corners = (
@@ -131,8 +119,8 @@ def test_oblique_grid_from_world_bounds_contains_all_corners():
     assert np.all(normalized < np.asarray(grid.shape))
 
 
-def test_nifti_output_uses_affine_zooms_and_reference_units():
-    affine = _oblique_affine()
+def test_nifti_output_uses_affine_zooms_and_reference_units(sheared_oblique_affine):
+    affine = sheared_oblique_affine
     source = nib.Nifti1Image(np.zeros((7, 8, 9), dtype=np.uint8), affine)
     source.header.set_xyzt_units("mm", "sec")
     grid = ReferenceGrid.from_nifti(source, provenance="anatomical")
@@ -168,11 +156,11 @@ def test_nifti_data_must_match_reference_shape():
         grid.create_nifti(np.zeros((7, 8, 8), dtype=np.float32))
 
 
-def test_header_preparation_uses_complete_fallback_grid():
+def test_header_preparation_uses_complete_fallback_grid(sheared_oblique_affine):
     from tractedit_pkg import file_io
 
     grid = ReferenceGrid(
-        affine=_oblique_affine(),
+        affine=sheared_oblique_affine,
         shape=(7, 8, 9),
         provenance="anatomical",
     )
@@ -197,6 +185,7 @@ def test_header_preparation_uses_complete_fallback_grid():
 def test_trx_save_passes_metadata_reference_without_dummy_volume(
     monkeypatch,
     tmp_path,
+    sheared_oblique_affine,
 ):
     from tractedit_pkg import file_io
 
@@ -216,7 +205,7 @@ def test_trx_save_passes_metadata_reference_without_dummy_volume(
         "save",
         lambda _obj, path: Path(path).write_bytes(b"trx"),
     )
-    affine = _oblique_affine()
+    affine = sheared_oblique_affine
     tractogram = nib.streamlines.Tractogram(
         [np.array([[0.0, 0.0, 0.0]], dtype=np.float32)],
         affine_to_rasmm=np.eye(4),

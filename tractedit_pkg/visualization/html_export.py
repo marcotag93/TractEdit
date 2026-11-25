@@ -22,6 +22,8 @@ if TYPE_CHECKING:
     from ..main_window import MainWindow
 
 logger = logging.getLogger(__name__)
+MESH_EXCLUSION_NOTE = "Visible surface meshes are excluded from this HTML export."
+POLYLINE_EXCLUSION_NOTE = "Polyline annotations are excluded from this HTML export."
 
 DEFAULT_OPTIONS = {
     "max_streamlines": 1000,
@@ -122,6 +124,16 @@ def _collect_visualization_data(
         data["rois"] = _collect_roi_data(main_window, options)
         data["metadata"]["num_rois"] = len(data["rois"])
 
+    if any(
+        layer["visible"] for layer in getattr(main_window, "mesh_layers", {}).values()
+    ):
+        data["metadata"]["surface_meshes_excluded"] = True
+    if getattr(main_window, "standalone_polylines", None) or any(
+        layer.get("polylines")
+        for layer in getattr(main_window, "mesh_layers", {}).values()
+    ):
+        data["metadata"]["polyline_annotations_excluded"] = True
+
     return data
 
 
@@ -218,21 +230,25 @@ def _slice_to_data_url(
     row_step = max(1, int(np.ceil(array.shape[0] / max_size)))
     column_step = max(1, int(np.ceil(array.shape[1] / max_size)))
     array = array[::row_step, ::column_step]
-    finite = np.isfinite(array)
-    if finite.any():
-        values = array[finite]
-        lower, upper = np.percentile(values, (1.0, 99.0))
-        if upper <= lower:
-            lower = float(values.min())
-            upper = float(values.max())
-        if upper > lower:
-            scaled = np.clip((array - lower) / (upper - lower), 0.0, 1.0)
+    if array.ndim == 3 and array.shape[-1] == 3:
+        array = np.where(np.isfinite(array), array, 0.0)
+        pixels = np.rint(np.clip(array, 0, 255)).astype(np.uint8)
+    else:
+        finite = np.isfinite(array)
+        if finite.any():
+            values = array[finite]
+            lower, upper = np.percentile(values, (1.0, 99.0))
+            if upper <= lower:
+                lower = float(values.min())
+                upper = float(values.max())
+            if upper > lower:
+                scaled = np.clip((array - lower) / (upper - lower), 0.0, 1.0)
+            else:
+                scaled = np.zeros_like(array)
         else:
             scaled = np.zeros_like(array)
-    else:
-        scaled = np.zeros_like(array)
-    scaled[~finite] = 0.0
-    pixels = np.rint(scaled * 255).astype(np.uint8)
+        scaled[~finite] = 0.0
+        pixels = np.rint(scaled * 255).astype(np.uint8)
 
     buffer = io.BytesIO()
     Image.fromarray(pixels).save(
@@ -252,9 +268,13 @@ def _capture_slice_images(
     affine = getattr(main_window, "anatomical_image_affine", None)
     if image_data is None or affine is None:
         return {}, {}
-    validate_volume_geometry(image_data, affine, "Anatomical image")
+    validate_volume_geometry(image_data, affine, "Anatomical image", allow_rgb=True)
+    if image_data.ndim == 4:
+        from ..image_volume import rgb_display_values
 
-    shape = tuple(int(value) for value in image_data.shape)
+        image_data = rgb_display_values(image_data)
+
+    shape = tuple(int(value) for value in image_data.shape[:3])
     current = getattr(main_window.vtk_panel, "current_slice_indices", {})
     indices = {
         "sagittal": int(current.get("x", shape[0] // 2)),
@@ -266,9 +286,9 @@ def _capture_slice_images(
     indices["axial"] = int(np.clip(indices["axial"], 0, shape[2] - 1))
 
     planes = {
-        "axial": np.asarray(image_data[:, :, indices["axial"]]).T,
-        "coronal": np.asarray(image_data[:, indices["coronal"], :]).T,
-        "sagittal": np.asarray(image_data[indices["sagittal"], :, :]).T,
+        "axial": np.asarray(image_data[:, :, indices["axial"]]).swapaxes(0, 1),
+        "coronal": np.asarray(image_data[:, indices["coronal"], :]).swapaxes(0, 1),
+        "sagittal": np.asarray(image_data[indices["sagittal"], :, :]).swapaxes(0, 1),
     }
     axes = {"axial": 2, "coronal": 1, "sagittal": 0}
     slices = {
@@ -558,7 +578,16 @@ def _json_for_script(value: Any) -> str:
 def _generate_html(data: dict[str, Any], options: dict[str, Any]) -> str:
     """Return a dependency-free WebGL document containing the scene payload."""
     del options
-    return _HTML_TEMPLATE.replace("__SCENE_DATA__", _json_for_script(data))
+    template = _HTML_TEMPLATE
+    if data["metadata"].get("surface_meshes_excluded"):
+        template = template.replace(
+            "</aside>", f'<p class="note">{MESH_EXCLUSION_NOTE}</p></aside>'
+        )
+    if data["metadata"].get("polyline_annotations_excluded"):
+        template = template.replace(
+            "</aside>", f'<p class="note">{POLYLINE_EXCLUSION_NOTE}</p></aside>'
+        )
+    return template.replace("__SCENE_DATA__", _json_for_script(data))
 
 
 _HTML_TEMPLATE = r"""<!DOCTYPE html>

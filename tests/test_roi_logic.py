@@ -20,27 +20,18 @@ from tractedit_pkg.logic.roi_manager import ROIManager
 
 
 @pytest.fixture
-def mock_main_window():
+def mock_main_window(make_mock_main_window):
     """Creates a mock MainWindow with ROI-related state."""
-    mw = MagicMock()
+    mw = make_mock_main_window()
 
     # Core streamline state
-    mw.tractogram_data = MagicMock()
     mw.tractogram_data.__len__ = MagicMock(return_value=10)
     mw.manual_visible_indices = set(range(10))
     mw.visible_indices = set(range(10))
 
-    # ROI state
-    mw.roi_layers = {}
-    mw.roi_states = {}
-    mw.roi_intersection_cache = {}
-
     # Parcellation state
     mw.parcellation_region_states = {}
     mw.parcellation_region_intersection_cache = {}
-
-    # VTK panel
-    mw.vtk_panel = MagicMock()
 
     return mw
 

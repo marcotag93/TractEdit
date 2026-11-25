@@ -6,5 +6,5 @@ Icon=tractedit
 Terminal=false
 Type=Application
 Categories=Science;Education;Graphics;
-MimeType=application/x-trk;application/x-tck;application/x-trx;
+MimeType=application/x-trk;application/x-tck;application/x-trx;application/x-vtk;application/x-vtp;application/x-nifti;application/x-nifti-gzip;application/x-tractedit-session;model/obj;
 StartupWMClass=tractedit

@@ -4,7 +4,7 @@
 Drawing manager for ROI drawing operations on 2D views.
 
 Handles pencil, eraser, sphere, and rectangle drawing modes,
-including preview visualization and rasterization to 3D volumes.
+preview visualization, and 3D shape actors.
 """
 
 # ============================================================================
@@ -15,18 +15,20 @@ from __future__ import annotations
 
 import logging
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 import vtk
-from fury import actor, window
+from fury import window
 from PyQt6.QtCore import Qt
 
-from ..utils import signals_blocked
-from . import coordinates
+from ...render_batch import batch_render, request_render
+from ...utils import signals_blocked
+from .. import coordinates
+from .rasterizer import DrawingRasterizerMixin
 
 if TYPE_CHECKING:
-    from .vtk_panel import VTKPanel
+    from ..vtk_panel import VTKPanel
 
 logger = logging.getLogger(__name__)
 
@@ -38,132 +40,16 @@ _PREVIEW_VIEW_AXES = {
 _PREVIEW_DEPTH_MM = 0.25
 
 
-def _clear_roi_for_shape(roi_data: np.ndarray) -> None:
-    """Clear the old positive ROI, preserving legacy behavior for other dtypes."""
-    if roi_data.dtype == np.uint8:
-        # All nonzero uint8 values are positive. The old bounding box therefore
-        # contained every nonzero voxel, so clearing the array is equivalent.
-        roi_data.fill(0)
+def _remove_actor_from_2d_scenes(panel: "VTKPanel", actor_obj: Any) -> None:
+    """Remove an actor from all active 2D slice scenes."""
+    if actor_obj is None:
         return
-
-    old_nonzero = np.argwhere(roi_data > 0)
-    if len(old_nonzero):
-        old_min = old_nonzero.min(axis=0)
-        old_max = old_nonzero.max(axis=0)
-        roi_data[
-            old_min[0] : old_max[0] + 1,
-            old_min[1] : old_max[1] + 1,
-            old_min[2] : old_max[2] + 1,
-        ] = 0
-
-
-def _rasterize_world_sphere(
-    roi_data: np.ndarray,
-    center_voxel: np.ndarray,
-    radius_world: float,
-    affine: np.ndarray,
-    shape: Tuple[int, ...],
-    fill_value: int,
-) -> bool:
-    """Rasterize a world-space sphere into an arbitrary voxel grid."""
-    linear = affine[:3, :3]
-    inverse_linear = np.linalg.inv(linear)
-    half_extents = radius_world * np.linalg.norm(inverse_linear, axis=1)
-    minimum = np.floor(center_voxel - half_extents).astype(int)
-    maximum = np.ceil(center_voxel + half_extents).astype(int)
-    minimum = np.maximum(minimum, 0)
-    maximum = np.minimum(maximum, np.asarray(shape[:3]) - 1)
-    if np.any(minimum > maximum):
-        return False
-
-    dx = (
-        np.arange(minimum[0], maximum[0] + 1, dtype=float)[:, None, None]
-        - center_voxel[0]
-    )
-    dy = (
-        np.arange(minimum[1], maximum[1] + 1, dtype=float)[None, :, None]
-        - center_voxel[1]
-    )
-    dz = (
-        np.arange(minimum[2], maximum[2] + 1, dtype=float)[None, None, :]
-        - center_voxel[2]
-    )
-    distance_squared = np.zeros(tuple(maximum - minimum + 1), dtype=float)
-    for row in linear:
-        world_component = row[0] * dx + row[1] * dy + row[2] * dz
-        distance_squared += world_component * world_component
-
-    roi_patch = roi_data[
-        minimum[0] : maximum[0] + 1,
-        minimum[1] : maximum[1] + 1,
-        minimum[2] : maximum[2] + 1,
-    ]
-    sphere_mask = distance_squared <= radius_world**2
-    if not np.any(sphere_mask):
-        return False
-    roi_patch[sphere_mask] = fill_value
-    return True
-
-
-def _rectangle_grid_geometry(
-    voxel_points: np.ndarray,
-    affine: np.ndarray,
-    shape: Tuple[int, ...],
-    view_type: str,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
-    """Return inclusive voxel bounds and world corners for a drawn rectangle."""
-    if len(voxel_points) < 2:
-        return None
-
-    axis = {"sagittal": 0, "coronal": 1, "axial": 2}.get(view_type)
-    if axis is None:
-        return None
-
-    first = np.rint(voxel_points[0]).astype(np.int64)
-    second = np.rint(voxel_points[1]).astype(np.int64)
-    plane_index = int(np.rint((voxel_points[0, axis] + voxel_points[1, axis]) / 2))
-    first[axis] = plane_index
-    second[axis] = plane_index
-    minimum = np.maximum(np.minimum(first, second), 0)
-    maximum = np.minimum(np.maximum(first, second), np.asarray(shape[:3]) - 1)
-    if np.any(minimum > maximum):
-        return None
-    plane_index = int(minimum[axis])
-
-    if axis == 2:
-        corners_voxel = np.array(
-            [
-                [minimum[0], minimum[1], plane_index],
-                [maximum[0], minimum[1], plane_index],
-                [maximum[0], maximum[1], plane_index],
-                [minimum[0], maximum[1], plane_index],
-            ],
-            dtype=float,
-        )
-    elif axis == 1:
-        corners_voxel = np.array(
-            [
-                [minimum[0], plane_index, minimum[2]],
-                [maximum[0], plane_index, minimum[2]],
-                [maximum[0], plane_index, maximum[2]],
-                [minimum[0], plane_index, maximum[2]],
-            ],
-            dtype=float,
-        )
-    else:
-        corners_voxel = np.array(
-            [
-                [plane_index, minimum[1], minimum[2]],
-                [plane_index, maximum[1], minimum[2]],
-                [plane_index, maximum[1], maximum[2]],
-                [plane_index, minimum[1], maximum[2]],
-            ],
-            dtype=float,
-        )
-
-    homogeneous = np.column_stack((corners_voxel, np.ones(4)))
-    corners_world = (affine @ homogeneous.T).T[:, :3]
-    return minimum, maximum, corners_world
+    for scene in (panel.axial_scene, panel.coronal_scene, panel.sagittal_scene):
+        if scene:
+            try:
+                scene.rm(actor_obj)
+            except (ValueError, RuntimeError):
+                logger.debug("Failed to remove preview actor from scene.")
 
 
 # ============================================================================
@@ -171,7 +57,7 @@ def _rectangle_grid_geometry(
 # ============================================================================
 
 
-class DrawingManager:
+class DrawingManager(DrawingRasterizerMixin):
     """
     Manages ROI drawing operations on 2D views.
 
@@ -271,14 +157,14 @@ class DrawingManager:
                 # Normal drawing: append points
                 self.panel.drawing_preview_points.append(world_pos)
 
-            # Update the preview line
-            self._update_drawing_preview(active_scene)
-
-            # Real-time ROI effect update for sphere mode
-            if (
+            sphere_preview = (
                 getattr(self.panel, "is_sphere_mode", False)
                 and len(self.panel.drawing_preview_points) >= 2
-            ):
+            )
+            if not (sphere_preview and getattr(self.panel, "is_moving_sphere", False)):
+                self._update_drawing_preview(active_scene)
+
+            if sphere_preview:
                 self._update_sphere_realtime(roi_name, view_type)
 
         except (ValueError, IndexError, RuntimeError, AttributeError) as e:
@@ -345,7 +231,7 @@ class DrawingManager:
             if old_sphere:
                 self.panel.scene.rm(old_sphere)
                 self.panel.roi_slice_actors[roi_name]["sphere_3d"] = None
-                self.panel.render_window.Render()
+                request_render(self.panel, self.panel.render_window)
 
         is_ctrl = interactor.GetControlKey()
         rect_params = self.panel.rectangle_params_per_roi.get(roi_name)
@@ -435,24 +321,26 @@ class DrawingManager:
 
         # For large tractograms, defer intersection calculation to mouse release
         LARGE_TRACTOGRAM_THRESHOLD = 100000
+        mw = self.panel.main_window
         if (
-            self.panel.main_window
-            and self.panel.main_window.tractogram_data
-            and len(self.panel.main_window.tractogram_data) > LARGE_TRACTOGRAM_THRESHOLD
+            mw
+            and mw.tractogram_data
+            and len(mw.tractogram_data) > LARGE_TRACTOGRAM_THRESHOLD
         ):
             return
 
         # Throttled intersection update
-        # ##TODO to refactor, also a bit laggy during preview
+        # ##TODO to refactor
         self._sphere_update_counter += 1
         if self._sphere_update_counter >= 15:
             self._sphere_update_counter = 0
-            if self.panel.main_window and hasattr(
-                self.panel.main_window, "update_sphere_roi_intersection"
-            ):
-                self.panel.main_window.update_sphere_roi_intersection(
+            roi_mgr = getattr(mw, "roi_manager", None) if mw else None
+            if roi_mgr is not None:
+                roi_mgr.update_sphere_roi_intersection(
                     roi_name, center_corrected, radius
                 )
+            elif mw and hasattr(mw, "update_sphere_roi_intersection"):
+                mw.update_sphere_roi_intersection(roi_name, center_corrected, radius)
 
     def _update_drawing_preview(self, scene: window.Scene) -> None:
         """Updates the preview line/shape on the active 2D scene."""
@@ -472,16 +360,7 @@ class DrawingManager:
 
             # Remove old preview from ALL scenes
             if self.panel.preview_line_actor:
-                for s in [
-                    self.panel.axial_scene,
-                    self.panel.coronal_scene,
-                    self.panel.sagittal_scene,
-                ]:
-                    if s:
-                        try:
-                            s.rm(self.panel.preview_line_actor)
-                        except (ValueError, RuntimeError):
-                            logger.debug("Failed to remove preview actor from scene.")
+                _remove_actor_from_2d_scenes(self.panel, self.panel.preview_line_actor)
                 self.panel.preview_line_actor = None
 
             # Create new preview actor
@@ -546,19 +425,22 @@ class DrawingManager:
         self, center: np.ndarray, radius: float, view_type: str
     ) -> vtk.vtkPolyData:
         """Place a world-mm circle parallel to and in front of the 2D slice."""
+        circle = vtk.vtkRegularPolygonSource()
+        self._set_preview_circle(circle, center, radius, view_type)
+        circle.Update()
+        return circle.GetOutput()
+
+    def _set_preview_circle(self, circle, center, radius, view_type):
         _, direction, plane_point, _ = self._preview_slice_frame(view_type, center)
         center = np.asarray(center, dtype=float)
         center = center - np.dot(center - plane_point, direction) * direction
         center += _PREVIEW_DEPTH_MM * direction
 
-        circle = vtk.vtkRegularPolygonSource()
         circle.SetCenter(*center)
         circle.SetRadius(float(radius))
         circle.SetNumberOfSides(50)
         circle.GeneratePolygonOff()
         circle.SetNormal(*direction)
-        circle.Update()
-        return circle.GetOutput()
 
     def _show_radius_preview(
         self,
@@ -579,25 +461,28 @@ class DrawingManager:
             scene: The 2D scene to add the preview to.
         """
         try:
-            polydata = self._circle_preview_polydata(center, radius, view_type)
+            preview = self.panel.preview_line_actor
+            if preview is not None and scene.HasViewProp(preview):
+                mapper = preview.GetMapper()
+                circle = mapper.GetInputAlgorithm()
+                if not isinstance(circle, vtk.vtkRegularPolygonSource):
+                    circle = vtk.vtkRegularPolygonSource()
+                    mapper.SetInputConnection(circle.GetOutputPort())
+                self._set_preview_circle(circle, center, radius, view_type)
+                preview.GetProperty().SetLineWidth(3)
+                scene.GetRenderWindow().Render()
+                return
 
             # Remove old preview from ALL scenes
             if self.panel.preview_line_actor:
-                for s in [
-                    self.panel.axial_scene,
-                    self.panel.coronal_scene,
-                    self.panel.sagittal_scene,
-                ]:
-                    if s:
-                        try:
-                            s.rm(self.panel.preview_line_actor)
-                        except (ValueError, RuntimeError):
-                            logger.debug("Failed to remove preview actor from scene.")
+                _remove_actor_from_2d_scenes(self.panel, self.panel.preview_line_actor)
                 self.panel.preview_line_actor = None
 
             # Create new preview actor
             mapper = vtk.vtkPolyDataMapper()
-            mapper.SetInputData(polydata)
+            circle = vtk.vtkRegularPolygonSource()
+            self._set_preview_circle(circle, center, radius, view_type)
+            mapper.SetInputConnection(circle.GetOutputPort())
 
             self.panel.preview_line_actor = vtk.vtkActor()
             self.panel.preview_line_actor.SetMapper(mapper)
@@ -673,6 +558,7 @@ class DrawingManager:
         polydata.SetLines(cells)
         return polydata
 
+    @batch_render(lambda self: self.panel)
     def finish_drawing(self) -> None:
         """
         Called when mouse is released.
@@ -780,6 +666,8 @@ class DrawingManager:
         if not mw:
             return
 
+        roi_mgr = getattr(mw, "roi_manager", None)
+
         if is_sphere:
             center = points[0]
             edge = points[1]
@@ -789,328 +677,29 @@ class DrawingManager:
             if view_type in ["axial", "coronal"]:
                 center_corrected[0] = -center_corrected[0]
 
-            if hasattr(mw, "update_sphere_roi_intersection"):
+            if roi_mgr is not None:
+                roi_mgr.update_sphere_roi_intersection(
+                    roi_name, center_corrected, radius
+                )
+            elif hasattr(mw, "update_sphere_roi_intersection"):
                 mw.update_sphere_roi_intersection(roi_name, center_corrected, radius)
 
         elif is_rectangle:
-            if hasattr(mw, "update_rectangle_roi_intersection"):
+            if roi_mgr is not None:
+                roi_mgr.update_rectangle_roi_intersection(roi_name)
+            elif hasattr(mw, "update_rectangle_roi_intersection"):
                 mw.update_rectangle_roi_intersection(roi_name)
-
-    def _world_to_voxel_points(
-        self,
-        roi_name: str,
-        roi_inv_affine: np.ndarray,
-        shape: Tuple[int, ...],
-        view_type: str,
-    ) -> np.ndarray:
-        """Convert world points to voxel coordinates."""
-        actor_key = f"{view_type}_2d"
-        roi_actors = self.panel.roi_slice_actors.get(roi_name)
-
-        points_world = np.array(self.panel.drawing_preview_points)
-        homog_points = np.hstack([points_world, np.ones((len(points_world), 1))])
-
-        if not roi_actors or actor_key not in roi_actors:
-            # Fallback to affine (RAS+ data — inv_affine gives correct voxel indices)
-            vox_points_float = np.dot(roi_inv_affine, homog_points.T).T[:, :3]
-        else:
-            actor_obj = roi_actors[actor_key]
-            matrix = actor_obj.GetMatrix()
-
-            inv_matrix = vtk.vtkMatrix4x4()
-            inv_matrix.DeepCopy(matrix)
-            inv_matrix.Invert()
-
-            mat_np = np.zeros((4, 4))
-            for r in range(4):
-                for c in range(4):
-                    mat_np[r, c] = inv_matrix.GetElement(r, c)
-
-            model_points = np.dot(mat_np, homog_points.T).T[:, :3]
-
-            # Get image data for spacing/origin
-            mapper = actor_obj.GetMapper()
-            image_data = mapper.GetInput()
-
-            if not image_data or not isinstance(image_data, vtk.vtkImageData):
-                try:
-                    conn = mapper.GetInputConnection(0, 0)
-                    if conn:
-                        producer = conn.GetProducer()
-                        if hasattr(producer, "GetInputConnection"):
-                            input_conn = producer.GetInputConnection(0, 0)
-                            if input_conn:
-                                image_data = input_conn.GetProducer().GetOutput()
-                except (AttributeError, RuntimeError):
-                    logger.debug("Failed to traverse VTK pipeline for image data.")
-
-            if image_data and isinstance(image_data, vtk.vtkImageData):
-                spacing = image_data.GetSpacing()
-                origin = image_data.GetOrigin()
-                vox_points_float = (model_points - np.array(origin)) / np.array(spacing)
-            else:
-                vox_points_float = model_points
-
-        return vox_points_float
-
-    def _rasterize_sphere(
-        self,
-        roi_name: str,
-        roi_data: np.ndarray,
-        vox_points_float: np.ndarray,
-        shape: Tuple[int, ...],
-        view_type: str,
-    ) -> bool:
-        """Rasterize a sphere ROI."""
-        if len(vox_points_float) < 2:
-            return False
-
-        center_vox = vox_points_float[0]
-        radius_world = np.linalg.norm(
-            self.panel.drawing_preview_points[0] - self.panel.drawing_preview_points[1]
-        )
-
-        # Remove any existing 3D rectangle actor
-        if roi_name in self.panel.roi_slice_actors:
-            old_rect = self.panel.roi_slice_actors[roi_name].get("rectangle_3d")
-            if old_rect:
-                self.panel.scene.rm(old_rect)
-                self.panel.roi_slice_actors[roi_name]["rectangle_3d"] = None
-            old_pts = self.panel.roi_slice_actors[roi_name].get("rectangle_points")
-            if old_pts is not None:
-                self.panel.roi_slice_actors[roi_name]["rectangle_points"] = None
-
-        # Clear rectangle params
-        self.panel.rectangle_params_per_roi.pop(roi_name, None)
-
-        _clear_roi_for_shape(roi_data)
-
-        roi_affine = self.panel.main_window.roi_layers[roi_name]["affine"]
-        _rasterize_world_sphere(
-            roi_data,
-            center_vox,
-            radius_world,
-            roi_affine,
-            shape,
-            1,
-        )
-
-        center_to_store = self.panel.drawing_preview_points[0].copy()
-        if view_type in ["axial", "coronal"]:
-            center_to_store[0] = -center_to_store[0]
-
-        self.panel.sphere_params_per_roi[roi_name] = {
-            "center": center_to_store,
-            "radius": radius_world,
-            "roi_name": roi_name,
-            "view_type": view_type,
-        }
-
-        return True
-
-    def _rasterize_rectangle(
-        self,
-        roi_name: str,
-        roi_data: np.ndarray,
-        vox_points_float: np.ndarray,
-        shape: Tuple[int, ...],
-        view_type: str,
-    ) -> bool:
-        """Rasterize a rectangle ROI."""
-        # Remove any existing 3D sphere actor and source
-        if roi_name in self.panel.roi_slice_actors:
-            old_sphere = self.panel.roi_slice_actors[roi_name].get("sphere_3d")
-            if old_sphere:
-                self.panel.scene.rm(old_sphere)
-                self.panel.roi_slice_actors[roi_name]["sphere_3d"] = None
-            old_src = self.panel.roi_slice_actors[roi_name].get("sphere_source")
-            if old_src is not None:
-                self.panel.roi_slice_actors[roi_name]["sphere_source"] = None
-
-        # Clear sphere params
-        self.panel.sphere_params_per_roi.pop(roi_name, None)
-
-        if len(vox_points_float) < 2:
-            return False
-
-        roi_affine = self.panel.main_window.roi_layers[roi_name]["affine"]
-        geometry = _rectangle_grid_geometry(
-            vox_points_float, roi_affine, shape, view_type
-        )
-        if geometry is None:
-            return False
-        min_v, max_v, corners_world = geometry
-
-        _clear_roi_for_shape(roi_data)
-
-        roi_data[
-            min_v[0] : max_v[0] + 1,
-            min_v[1] : max_v[1] + 1,
-            min_v[2] : max_v[2] + 1,
-        ] = 1
-
-        # Store params with 3D-corrected coordinates
-        start_to_store = self.panel.drawing_preview_points[0].copy()
-        end_to_store = self.panel.drawing_preview_points[1].copy()
-        if view_type in ["axial", "coronal"]:
-            start_to_store[0] = -start_to_store[0]
-            end_to_store[0] = -end_to_store[0]
-
-        self.panel.rectangle_params_per_roi[roi_name] = {
-            "start": start_to_store,
-            "end": end_to_store,
-            "view_type": view_type,
-            "voxel_min": min_v.copy(),
-            "voxel_max": max_v.copy(),
-            "corners": corners_world,
-        }
-
-        return True
-
-    def _rasterize_freehand(
-        self,
-        roi_data: np.ndarray,
-        vox_points_float: np.ndarray,
-        shape: Tuple[int, ...],
-        view_type: str,
-    ) -> bool:
-        """Rasterize freehand drawing (pencil/eraser)."""
-        all_indices = []
-
-        if len(vox_points_float) == 1:
-            all_indices.append(vox_points_float)
-        else:
-            for i in range(len(vox_points_float) - 1):
-                p0 = vox_points_float[i]
-                p1 = vox_points_float[i + 1]
-                dist = np.linalg.norm(p1 - p0)
-                n_steps = int(np.ceil(dist * 10))
-
-                MAX_STEPS = 100000
-                if n_steps > MAX_STEPS:
-                    logger.debug(
-                        f"Ignoring draw stroke with excessive distance: {dist}"
-                    )
-                    continue
-
-                if n_steps > 0:
-                    try:
-                        segment_points = np.linspace(p0, p1, num=n_steps + 1)
-                        all_indices.append(segment_points)
-                    except (ValueError, MemoryError) as e:
-                        logger.debug(f"Skipping invalid segment: {e}")
-                        continue
-
-        if not all_indices:
-            return False
-
-        full_path = np.vstack(all_indices)
-        indices = np.round(full_path).astype(int)
-
-        valid_mask = (
-            (indices[:, 0] >= 0)
-            & (indices[:, 0] < shape[0])
-            & (indices[:, 1] >= 0)
-            & (indices[:, 1] < shape[1])
-            & (indices[:, 2] >= 0)
-            & (indices[:, 2] < shape[2])
-        )
-        valid_indices = indices[valid_mask]
-
-        if len(valid_indices) == 0:
-            return False
-
-        # Apply brush size
-        brush_size = getattr(self.panel.main_window, "draw_brush_size", 1)
-        if brush_size > 1:
-            valid_indices = self._expand_brush(
-                valid_indices, shape, view_type, brush_size
-            )
-
-        if len(valid_indices) == 0:
-            return False
-
-        # Get current values
-        current_values = roi_data[
-            valid_indices[:, 0], valid_indices[:, 1], valid_indices[:, 2]
-        ]
-
-        is_eraser = getattr(self.panel, "is_eraser_mode", False)
-
-        if is_eraser:
-            if np.any(current_values == 1):
-                roi_data[
-                    valid_indices[:, 0], valid_indices[:, 1], valid_indices[:, 2]
-                ] = 0
-                return True
-        else:
-            if np.any(current_values == 0):
-                roi_data[
-                    valid_indices[:, 0], valid_indices[:, 1], valid_indices[:, 2]
-                ] = 1
-                return True
-
-        return False
-
-    def _expand_brush(
-        self,
-        valid_indices: np.ndarray,
-        shape: Tuple[int, ...],
-        view_type: str,
-        brush_size: int,
-    ) -> np.ndarray:
-        """Expand indices based on brush size."""
-        lower = -((brush_size - 1) // 2)
-        upper = (brush_size // 2) + 1
-        r_full = range(lower, upper)
-        r_flat = range(0, 1)
-
-        rx, ry, rz = r_full, r_full, r_full
-
-        if view_type == "axial":
-            rz = r_flat
-        elif view_type == "coronal":
-            ry = r_flat
-        elif view_type == "sagittal":
-            rx = r_flat
-
-        offsets = []
-        for dx in rx:
-            for dy in ry:
-                for dz in rz:
-                    offsets.append([dx, dy, dz])
-        offsets = np.array(offsets)
-
-        expanded_indices = valid_indices[:, np.newaxis, :] + offsets[np.newaxis, :, :]
-        valid_indices = expanded_indices.reshape(-1, 3)
-
-        valid_mask = (
-            (valid_indices[:, 0] >= 0)
-            & (valid_indices[:, 0] < shape[0])
-            & (valid_indices[:, 1] >= 0)
-            & (valid_indices[:, 1] < shape[1])
-            & (valid_indices[:, 2] >= 0)
-            & (valid_indices[:, 2] < shape[2])
-        )
-        return valid_indices[valid_mask]
 
     def _cleanup_preview(self) -> None:
         """Clean up preview actor and reset state."""
         if self.panel.preview_line_actor:
-            for s in [
-                self.panel.axial_scene,
-                self.panel.coronal_scene,
-                self.panel.sagittal_scene,
-            ]:
-                try:
-                    s.rm(self.panel.preview_line_actor)
-                except (ValueError, RuntimeError):
-                    logger.debug("Failed to remove preview actor from scene.")
+            _remove_actor_from_2d_scenes(self.panel, self.panel.preview_line_actor)
             self.panel.preview_line_actor = None
 
         self.panel.drawing_preview_points = []
         self.panel.current_drawing_view_type = None
 
+    @batch_render(lambda self: self.panel)
     def adjust_sphere_radius(self, delta: float, view_type: str = "axial") -> None:
         """Adjusts the radius of the last created sphere."""
         if not self.panel.main_window or not self.panel.main_window.current_drawing_roi:
@@ -1185,81 +774,14 @@ class DrawingManager:
         center_for_3d = center_world.copy()
         if stored_view_type in ["axial", "coronal"]:
             center_for_3d[0] = -center_for_3d[0]
-        if mw and hasattr(mw, "update_sphere_roi_intersection"):
+        roi_mgr = getattr(mw, "roi_manager", None) if mw else None
+        if roi_mgr is not None:
+            roi_mgr.update_sphere_roi_intersection(roi_name, center_for_3d, new_radius)
+        elif mw and hasattr(mw, "update_sphere_roi_intersection"):
             mw.update_sphere_roi_intersection(roi_name, center_for_3d, new_radius)
 
         self.panel.update_status(f"Sphere radius adjusted to {new_radius:.2f}")
         self.panel._render_all()
-
-    def _rasterize_sphere_at_position(
-        self,
-        roi_name: str,
-        roi_data: np.ndarray,
-        center_w: np.ndarray,
-        radius_w: float,
-        shape: Tuple[int, ...],
-        view_type: str,
-        fill_val: int,
-    ) -> None:
-        """Rasterize a sphere at the given world position."""
-        roi_layer = self.panel.main_window.roi_layers[roi_name]
-        roi_inv_affine = roi_layer["inv_affine"]
-
-        actor_key = f"{view_type}_2d"
-        roi_actors = self.panel.roi_slice_actors.get(roi_name)
-
-        center_vox = None
-
-        if roi_actors and actor_key in roi_actors:
-            actor_obj = roi_actors[actor_key]
-            matrix = actor_obj.GetMatrix()
-
-            inv_matrix = vtk.vtkMatrix4x4()
-            inv_matrix.DeepCopy(matrix)
-            inv_matrix.Invert()
-
-            mat_np = np.zeros((4, 4))
-            for r in range(4):
-                for c in range(4):
-                    mat_np[r, c] = inv_matrix.GetElement(r, c)
-
-            p_h = np.append(center_w, 1.0)
-            model_point = np.dot(mat_np, p_h)[:3]
-
-            mapper = actor_obj.GetMapper()
-            image_data = mapper.GetInput()
-
-            if not image_data or not isinstance(image_data, vtk.vtkImageData):
-                try:
-                    conn = mapper.GetInputConnection(0, 0)
-                    if conn:
-                        producer = conn.GetProducer()
-                        if hasattr(producer, "GetInputConnection"):
-                            input_conn = producer.GetInputConnection(0, 0)
-                            if input_conn:
-                                image_data = input_conn.GetProducer().GetOutput()
-                except (AttributeError, RuntimeError):
-                    logger.debug("Failed to traverse VTK pipeline for image data.")
-
-            if image_data and isinstance(image_data, vtk.vtkImageData):
-                spacing = image_data.GetSpacing()
-                origin = image_data.GetOrigin()
-                center_vox = (model_point - np.array(origin)) / np.array(spacing)
-            else:
-                center_vox = model_point
-
-        else:
-            p_h = np.append(center_w, 1.0)
-            center_vox = np.dot(roi_inv_affine, p_h)[:3]
-
-        _rasterize_world_sphere(
-            roi_data,
-            center_vox,
-            radius_w,
-            roi_layer["affine"],
-            shape,
-            fill_val,
-        )
 
     def update_3d_sphere_visuals(
         self,
@@ -1300,7 +822,7 @@ class DrawingManager:
             # Mark actor as modified and render
             existing_sphere.Modified()
             if render:
-                self.panel.render_window.Render()
+                request_render(self.panel, self.panel.render_window)
             return
 
         # Need to create a new sphere actor
@@ -1332,7 +854,7 @@ class DrawingManager:
         self.panel.roi_slice_actors[roi_name]["sphere_3d"] = sphere_actor
         self.panel.roi_slice_actors[roi_name]["sphere_source"] = sphere_source
         if render:
-            self.panel.render_window.Render()
+            request_render(self.panel, self.panel.render_window)
 
     def update_3d_rectangle_visuals(
         self,
@@ -1415,7 +937,7 @@ class DrawingManager:
             existing_rect.Modified()
 
             if render:
-                self.panel.render_window.Render()
+                request_render(self.panel, self.panel.render_window)
             return
 
         # Need to create a new rectangle actor (first time)
@@ -1467,105 +989,4 @@ class DrawingManager:
         self.panel.roi_slice_actors[roi_name]["rectangle_points"] = points
 
         if render:
-            self.panel.render_window.Render()
-
-    def _fill_polygon(
-        self,
-        roi_name: str,
-        roi_data: np.ndarray,
-        vox_points_float: np.ndarray,
-        shape: Tuple[int, ...],
-        view_type: str,
-    ) -> bool:
-        """Fills the interior of the drawn polygon using ray casting."""
-        if len(vox_points_float) < 3:
-            return False
-
-        # Determine indices (columns) for 2D plane
-        const_axis = 2  # Default axial
-        plane_axes = (0, 1)
-
-        if view_type == "axial":
-            const_axis = 2
-            plane_axes = (0, 1)
-        elif view_type == "coronal":
-            const_axis = 1
-            plane_axes = (0, 2)
-        elif view_type == "sagittal":
-            const_axis = 0
-            plane_axes = (1, 2)
-
-        # Get the slice index (average of all points in const axis)
-        const_val = int(np.round(np.mean(vox_points_float[:, const_axis])))
-        if const_val < 0 or const_val >= shape[const_axis]:
-            return False
-
-        # Get 2D polygon vertices
-        poly = vox_points_float[:, plane_axes]
-
-        # Bounding Box
-        min_x = int(np.floor(np.min(poly[:, 0])))
-        max_x = int(np.ceil(np.max(poly[:, 0])))
-        min_y = int(np.floor(np.min(poly[:, 1])))
-        max_y = int(np.ceil(np.max(poly[:, 1])))
-
-        min_x = max(0, min_x)
-        max_x = min(shape[plane_axes[0]] - 1, max_x)
-        min_y = max(0, min_y)
-        max_y = min(shape[plane_axes[1]] - 1, max_y)
-
-        # Create grid points
-        x_range = np.arange(min_x, max_x + 1)
-        y_range = np.arange(min_y, max_y + 1)
-
-        if len(x_range) == 0 or len(y_range) == 0:
-            return False
-
-        xx, yy = np.meshgrid(x_range, y_range)
-        points = np.vstack((xx.flatten(), yy.flatten())).T
-
-        if len(points) == 0:
-            return False
-
-        # Ray Casting Algorithm (Vectorized)
-        path = poly
-        n_vertices = len(path)
-        j = n_vertices - 1
-
-        x = points[:, 0]
-        y = points[:, 1]
-
-        mask = np.zeros(len(points), dtype=bool)
-
-        for i in range(n_vertices):
-            xi, yi = path[i]
-            xj, yj = path[j]
-
-            # Intersection condition
-            # 1. Edge must cross the horizontal ray line (yi > y) != (yj > y)
-            # 2. Intersection x-coordinate must be less than point x (ray to the right)
-
-            intersect = ((yi > y) != (yj > y)) & (
-                x < (xj - xi) * (y - yi) / (yj - yi + 1e-10) + xi
-            )
-
-            mask ^= intersect
-            j = i
-
-        # Reshape mask back to grid shape (rows=y, cols=x)
-        mask_grid = mask.reshape(len(y_range), len(x_range))
-
-        # Transpose to match (X, Y) indexing for ROI data assignment
-        mask_transposed = mask_grid.T
-
-        # Build slicing tuple
-        slices = [slice(None)] * 3
-        slices[const_axis] = const_val
-        slices[plane_axes[0]] = slice(min_x, max_x + 1)
-        slices[plane_axes[1]] = slice(min_y, max_y + 1)
-
-        # Fill
-        roi_patch = roi_data[tuple(slices)]
-        roi_patch[mask_transposed] = 1
-
-        return True
+            request_render(self.panel, self.panel.render_window)

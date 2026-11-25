@@ -9,6 +9,7 @@ import numpy as np
 from fury import window
 from vtk.util import numpy_support
 
+from tests.conftest import vtk_matrix_to_numpy as _vtk_matrix_to_numpy
 from tractedit_pkg.visualization.drawing import DrawingManager
 from tractedit_pkg.visualization.vtk_panel import VTKPanel
 
@@ -67,12 +68,6 @@ def _source_image(actor_obj):
     while algorithm.GetInputAlgorithm() is not None:
         algorithm = algorithm.GetInputAlgorithm()
     return algorithm.GetOutputDataObject(0)
-
-
-def _vtk_matrix_to_numpy(matrix) -> np.ndarray:
-    return np.array(
-        [[matrix.GetElement(row, col) for col in range(4)] for row in range(4)]
-    )
 
 
 def test_roi_slice_actors_share_one_pipeline():

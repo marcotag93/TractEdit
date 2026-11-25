@@ -5,8 +5,6 @@ on:
   push:
     branches:
       - main
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       build_macos:
@@ -26,9 +24,13 @@ on:
         type: boolean
         default: true
 
-# Release files are uploaded manually; this workflow only builds and tests artifacts.
+# Release builds run manually via workflow_dispatch; tagging and release uploads are manual.
 permissions:
   contents: read
+
+env:
+  POETRY_REQUESTS_TIMEOUT: '120'
+  POETRY_REQUESTS_MAX_RETRIES: '3'
 
 # ========== Common Test and Distribution Gates ==========
 jobs:
@@ -55,8 +57,7 @@ jobs:
       - name: Install Linux GUI runtime libraries
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libegl1 libgl1 libxcb-cursor0 \
+          bash .github/scripts/linux/install-apt-dependencies.sh libegl1 libgl1 libxcb-cursor0 \
             libxcb-xinerama0 libxkbcommon-x11-0
 
       - name: Install test environment
@@ -78,7 +79,7 @@ jobs:
 
   distribution:
     name: Distribution gate (${{ matrix.os }})
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'workflow_dispatch'
     needs: test
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -102,8 +103,7 @@ jobs:
       - name: Install Linux GUI runtime libraries
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libegl1 libgl1 libxcb-cursor0 \
+          bash .github/scripts/linux/install-apt-dependencies.sh libegl1 libgl1 libxcb-cursor0 \
             libxcb-xinerama0 libxkbcommon-x11-0
 
       - name: Build wheel from sdist
@@ -310,7 +310,7 @@ jobs:
 
   # ========== Four-Target Build Matrix ==========
   build:
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'workflow_dispatch'
     needs:
       - test
       - distribution
@@ -345,13 +345,7 @@ jobs:
         id: check
         shell: bash
         run: |
-          # Default to true for tag pushes
-          if [ "${{ github.event_name }}" == "push" ]; then
-            echo "should_build=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          
-          # For workflow_dispatch, check the relevant input
+          # Check the relevant workflow_dispatch input
           case "${{ matrix.target }}" in
             dmg)
               echo "should_build=${{ github.event.inputs.build_macos }}" >> $GITHUB_OUTPUT
@@ -415,8 +409,7 @@ jobs:
       - name: Install Linux system dependencies
         if: steps.check.outputs.should_build == 'true' && matrix.target == 'deb'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          bash .github/scripts/linux/install-apt-dependencies.sh \
             libgl1-mesa-dev \
             libxcb-xinerama0 \
             libxcb-cursor0 \
@@ -428,8 +421,7 @@ jobs:
       - name: Install AppImage system dependencies (Jammy)
         if: steps.check.outputs.should_build == 'true' && matrix.target == 'appimage'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libgl1-mesa-dev libxcb-xinerama0 \
+          bash .github/scripts/linux/install-apt-dependencies.sh libgl1-mesa-dev libxcb-xinerama0 \
             libxcb-cursor0 libxkbcommon-x11-0 libegl1 imagemagick binutils file \
             libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libgtk-3-0 \
             libwayland-cursor0 libwayland-egl1
@@ -439,13 +431,13 @@ jobs:
         if: steps.check.outputs.should_build == 'true' && matrix.target != 'appimage'
         run: |
           python -m pip install --upgrade pip
-          pip install poetry
+          pip install poetry==2.2.1
 
       - name: Install Python dependencies
         if: steps.check.outputs.should_build == 'true' && matrix.target != 'appimage'
         run: |
           poetry install --with build --no-interaction --no-root
-          poetry run pip install pyinstaller
+          poetry run pip install pyinstaller==6.16.0 pyinstaller-hooks-contrib==2025.9
 
       - name: Install AppImage Python build tools and locked dependencies
         if: steps.check.outputs.should_build == 'true' && matrix.target == 'appimage'
@@ -511,6 +503,14 @@ jobs:
             --app-drop-link 450 190 \
             "TractEdit-${{ steps.version.outputs.VERSION }}-macos-arm64.dmg" \
             "dist/TractEdit.app"
+
+      - name: Prepare Linux document icons
+        if: steps.check.outputs.should_build == 'true' && runner.os == 'Linux'
+        run: |
+          mkdir -p build/document-icons
+          for type in trk trx tck vtk vtp nifti tractedit-session; do
+            ln -sfn ../apps/tractedit.png "build/document-icons/application-x-$type.png"
+          done
 
       # ========== Linux AppImage Packaging ==========
       - name: Download appimagetool
@@ -592,10 +592,13 @@ jobs:
           # Copy desktop file and appdata
           cp ".github/scripts/linux/tractedit.desktop" "$APPDIR/usr/share/applications/"
           cp ".github/scripts/linux/tractedit.desktop" "$APPDIR/"
+          install -Dm644 .github/scripts/linux/tractedit-mime.xml "$APPDIR/usr/share/mime/packages/tractedit-mime.xml"
+          cp tractedit_pkg/linux_appimage_integration.py "$APPDIR/register-appimage.py"
           cp ".github/scripts/linux/io.github.tractedit.appdata.xml" "$APPDIR/usr/share/metainfo/"
           
           # Copy and resize icons
           cp "tractedit_pkg/assets/tractedit.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/tractedit.png"
+          cp -a build/document-icons "$APPDIR/usr/share/icons/hicolor/256x256/mimetypes"
           convert "tractedit_pkg/assets/tractedit.png" -resize 128x128 "$APPDIR/usr/share/icons/hicolor/128x128/apps/tractedit.png"
           convert "tractedit_pkg/assets/tractedit.png" -resize 64x64 "$APPDIR/usr/share/icons/hicolor/64x64/apps/tractedit.png"
           convert "tractedit_pkg/assets/tractedit.png" -resize 48x48 "$APPDIR/usr/share/icons/hicolor/48x48/apps/tractedit.png"
@@ -609,6 +612,12 @@ jobs:
           #!/bin/bash
           SELF=$(readlink -f "$0")
           HERE=${SELF%/*}
+          if [ "$#" -eq 1 ] && [ "$1" = "--register-file-types" ]; then
+              if command -v python3 >/dev/null 2>&1; then
+                  exec python3 "$HERE/register-appimage.py" "$HERE"
+              fi
+              exec "${HERE}/usr/bin/tractedit" --register-file-types
+          fi
           export PATH="${HERE}/usr/bin:${PATH}"
           export LD_LIBRARY_PATH="${HERE}/usr/bin:${LD_LIBRARY_PATH}"
           export GIO_LAUNCHED_DESKTOP_FILE="${HERE}/tractedit.desktop"
@@ -633,6 +642,13 @@ jobs:
               exec "${HERE}/usr/bin/tractedit" "$@"
           fi
           
+          for arg in "$@"; do
+              case "$arg" in
+                  --) break ;;
+                  --convert-to|--convert-to=*|--density-map|--density-map=*|-h|--help|-V|-v|--version)
+                      exec "${HERE}/usr/bin/tractedit" "$@" ;;
+              esac
+          done
           "${HERE}/usr/bin/tractedit" "$@"
           EXIT_CODE=$?
           
@@ -697,7 +713,14 @@ jobs:
               exec /opt/tractedit/tractedit "$@"
           fi
           
-          /opt/tractedit/tractedit "$@" 2>/dev/null
+          for arg in "$@"; do
+              case "$arg" in
+                  --) break ;;
+                  --convert-to|--convert-to=*|--density-map|--density-map=*|-h|--help|-V|-v|--version)
+                      exec /opt/tractedit/tractedit "$@" ;;
+              esac
+          done
+          /opt/tractedit/tractedit "$@"
           EXIT_CODE=$?
           
           if [ $EXIT_CODE -ne 0 ]; then
@@ -713,9 +736,11 @@ jobs:
           
           # Copy desktop file
           cp ".github/scripts/linux/tractedit.desktop" "$DEB_DIR/usr/share/applications/"
+          install -Dm644 .github/scripts/linux/tractedit-mime.xml "$DEB_DIR/usr/share/mime/packages/tractedit-mime.xml"
           
           # Copy and resize icons
           cp "tractedit_pkg/assets/tractedit.png" "$DEB_DIR/usr/share/icons/hicolor/256x256/apps/"
+          cp -a build/document-icons "$DEB_DIR/usr/share/icons/hicolor/256x256/mimetypes"
           convert "tractedit_pkg/assets/tractedit.png" -resize 128x128 "$DEB_DIR/usr/share/icons/hicolor/128x128/apps/tractedit.png"
           convert "tractedit_pkg/assets/tractedit.png" -resize 64x64 "$DEB_DIR/usr/share/icons/hicolor/64x64/apps/tractedit.png"
           convert "tractedit_pkg/assets/tractedit.png" -resize 48x48 "$DEB_DIR/usr/share/icons/hicolor/48x48/apps/tractedit.png"
@@ -727,6 +752,7 @@ jobs:
           Section: science
           Priority: optional
           Architecture: amd64
+          Depends: shared-mime-info
           Maintainer: Marco Tagliaferri <marco.tagliaferri@unitn.it>
           Description: Interactive tractography bundle editor
            TractEdit is a Python-based graphical interface for interactively
@@ -816,6 +842,10 @@ jobs:
         run: |
           mkdir -p build/deb-smoke
           dpkg-deb --extract "dist/TractEdit_${{ steps.version.outputs.VERSION }}_amd64.deb" build/deb-smoke
+          entry=build/deb-smoke/usr/share/applications/tractedit.desktop
+          grep -Fx 'Exec=tractedit %f' "$entry"
+          grep -Eq '^MimeType=([^;]+;)*model/obj(;|$)' "$entry"
+          cmp .github/scripts/linux/tractedit-mime.xml build/deb-smoke/usr/share/mime/packages/tractedit-mime.xml
           build/deb-smoke/opt/tractedit/tractedit --version
 
       - name: Smoke-test Windows ZIP payload
@@ -872,7 +902,7 @@ jobs:
   appimage-compatibility:
     name: AppImage ABI and desktop (${{ matrix.os }})
     needs: build
-    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.build_appimage)
+    if: github.event_name == 'workflow_dispatch' && inputs.build_appimage
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -954,8 +984,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y xvfb xauth xdotool x11-apps firejail binutils fuse3 \
+          bash .github/scripts/linux/install-apt-dependencies.sh xvfb xauth xdotool x11-apps firejail binutils fuse3 desktop-file-utils shared-mime-info libglib2.0-bin \
             libgl1 libegl1 libxcb-cursor0 libxcb-xinerama0 libxkbcommon-x11-0
           for package in libfuse2 libfuse2t64; do
             status=$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)
@@ -996,6 +1025,7 @@ jobs:
             > evidence/fuse-check.txt
 
       - name: Audit final runtime and every payload ELF
+        id: abi-audit
         shell: bash
         env:
           IMAGE: ${{ steps.identity.outputs.image }}
@@ -1005,6 +1035,60 @@ jobs:
           cd artifact
           timeout 120s "$IMAGE" --appimage-extract > ../evidence/extract.log 2>&1
           cd ..
+          data=$(mktemp -d)
+          probe_image="$data/TractEdit 100%.AppImage"
+          ln "$IMAGE" "$probe_image" || cp --reflink=auto "$IMAGE" "$probe_image"
+          XDG_DATA_HOME="$data" "$probe_image" --register-file-types
+          entry="$data/applications/tractedit-appimage.desktop"
+          desktop-file-validate "$entry"
+          grep '^Exec=' "$entry" | grep -F 'TractEdit 100%%.AppImage" %f'
+          grep -Fx "TryExec=$probe_image" "$entry"
+          grep -Eq '^MimeType=([^;]+;)*model/obj(;|$)' "$entry"
+          cmp .github/scripts/linux/tractedit-mime.xml "$data/mime/packages/tractedit-mime.xml"
+          test -s "$data/mime/mime.cache"
+          grep -q 'tractedit-appimage.desktop' "$data/applications/mimeinfo.cache"
+          probe_files=$(mktemp -d)
+          python3 - "$probe_files" <<'PY'
+          import gzip
+          from pathlib import Path
+          import sys
+
+          folder = Path(sys.argv[1])
+          raw = b"nifti-probe"
+          compressed = gzip.compress(raw)
+          (folder / "Anatomia è.nii").write_bytes(raw)
+          (folder / "Anatomia è.NII.GZ").write_bytes(compressed)
+          (folder / "archive.gz").write_bytes(compressed)
+          (folder / "bundle.trk").write_bytes(b"TRACK")
+          (folder / "mesh.obj").write_text("v 0 0 0\n")
+          PY
+          check_type() {
+            local actual
+            actual=$(XDG_DATA_HOME="$data" gio info -a standard::content-type "$probe_files/$1" |
+              sed -n 's/^  standard::content-type: //p')
+            if [[ "$actual" != "$2" ]]; then
+              printf '::error::%s has MIME type %s, expected %s\n' "$1" "$actual" "$2"
+              return 1
+            fi
+            printf '%s: %s\n' "$1" "$actual"
+          }
+          check_type "Anatomia è.nii" application/x-nifti
+          check_type "Anatomia è.NII.GZ" application/x-nifti-gzip
+          check_type archive.gz application/gzip
+          check_type bundle.trk application/x-trk
+          check_type mesh.obj model/obj
+          for type in application/x-nifti application/x-nifti-gzip; do
+            XDG_DATA_HOME="$data" gio mime "$type" | grep -F 'tractedit-appimage.desktop'
+          done
+          appdir="$PWD/artifact/squashfs-root"
+          mkdir "$probe_files/bin"
+          for tool in readlink update-mime-database update-desktop-database; do
+            ln -s "$(command -v "$tool")" "$probe_files/bin/$tool"
+          done
+          APPIMAGE="$probe_image" APPDIR="$appdir" XDG_DATA_HOME="$probe_files/data" \
+            PATH="$probe_files/bin" "$appdir/AppRun" --register-file-types
+          cmp "$entry" "$probe_files/data/applications/tractedit-appimage.desktop"
+          rm -rf "$probe_files" "$data"
           python3 - <<'PY'
           """Audit the final AppImage ELF and every distinct extracted ELF."""
 
@@ -1281,7 +1365,7 @@ jobs:
                           )
                       result = subprocess.run(
                           ["xdotool", "search", "--onlyvisible", "--name",
-                           "^TractEdit GUI - Interactive Editor$"],
+                           "^TractEdit GUI - Interactive Editor( — TractEdit)?$"],
                           capture_output=True, text=True, timeout=5
                       )
                       for candidate in result.stdout.split():
@@ -1323,7 +1407,7 @@ jobs:
                       time.sleep(1)
                   visible = subprocess.run(
                       ["xdotool", "search", "--onlyvisible", "--name",
-                       "^TractEdit GUI - Interactive Editor$"],
+                       "^TractEdit GUI - Interactive Editor( — TractEdit)?$"],
                       capture_output=True, text=True, timeout=5
                   ).stdout.split()
                   if window not in visible or not (
@@ -1406,6 +1490,9 @@ jobs:
           cat > "$RUNNER_TEMP/appimage-gui-probe.sh" <<'SH'
           set -euo pipefail
           mode=$1
+          export XDG_DATA_HOME
+          XDG_DATA_HOME=$(mktemp -d "$RUNNER_TEMP/xdg-$mode.XXXXXX")
+          trap 'rm -rf "$XDG_DATA_HOME"' EXIT
           # Keep Xvfb alive while the Python supervisor handles TERM and cleans up.
           # Allow a bounded in-flight query (20s) plus group cleanup before KILL.
           if ! xvfb-run -a timeout --signal=TERM --kill-after=35s 180s \
@@ -1418,11 +1505,14 @@ jobs:
             exit 1
           fi
           test -s "evidence/$mode.pass"
+          test ! -e "$XDG_DATA_HOME/applications/tractedit-appimage.desktop"
+          test ! -e "$XDG_DATA_HOME/mime/packages/tractedit-mime.xml"
           SH
 
       # ========== AppImage Desktop and Firejail Probes ==========
       # Extraction cannot compensate for a mount failure.
       - name: Probe ordinary FUSE and extraction launches
+        id: fuse-launch
         shell: bash
         env:
           IMAGE: ${{ steps.identity.outputs.image }}
@@ -1432,6 +1522,7 @@ jobs:
           bash "$RUNNER_TEMP/appimage-gui-probe.sh" plain-extract
 
       - name: Probe ordinary Firejail launches
+        id: firejail-launch
         shell: bash
         env:
           IMAGE: ${{ steps.identity.outputs.image }}
@@ -1441,6 +1532,7 @@ jobs:
           bash "$RUNNER_TEMP/appimage-gui-probe.sh" firejail-extract
 
       - name: Probe catalog Firejail AppImage launch
+        id: catalog-launch
         shell: bash
         env:
           IMAGE: ${{ steps.identity.outputs.image }}
@@ -1451,10 +1543,31 @@ jobs:
       - name: Report validation diagnostics
         if: always()
         shell: python {0}
+        env:
+          VALIDATION_STEPS: ${{ toJSON(steps) }}
         run: |
+          import json
           import os
           from pathlib import Path
 
+          steps = json.loads(os.environ["VALIDATION_STEPS"])
+
+          def result(*identities):
+              outcomes = [steps.get(key, {}).get("outcome") for key in identities]
+              for outcome, label in (("failure", "FAIL"), ("cancelled", "CANCELLED")):
+                  if outcome in outcomes:
+                      return label
+              if all(outcome == "success" for outcome in outcomes):
+                  return "PASS"
+              return "SKIP" if "skipped" in outcomes else "NOT RUN"
+
+          checks = (
+              ("AppImage identity and provenance", result("identity")),
+              ("ABI and GLIBC compatibility", result("abi-audit")),
+              ("GUI via FUSE and extraction", result("fuse-launch")),
+              ("GUI via Firejail", result("firejail-launch")),
+              ("Catalog AppImage launch", result("catalog-launch")),
+          )
           root = Path("evidence")
           reports = sorted(
               path for path in root.rglob("*")
@@ -1472,16 +1585,18 @@ jobs:
               print(tail)
               remaining -= limit
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
-              summary.write("### Validation diagnostics\n\n")
-              summary.write(f"{len(reports)} text reports/logs generated; bounded excerpts are in this step's log.\n\n")
-              summary.write("Only application packages are uploaded as artifacts. Screenshots remain temporary runner files.\n")
+              summary.write("### Validation results\n\n")
+              summary.write("| Check | Result |\n| --- | --- |\n")
+              for label, status in checks:
+                  summary.write(f"| {label} | {status} |\n")
+              summary.write("\nDetails are in the **Report validation diagnostics** step log.\n")
 
   # ========== Shared Package Validation Across All Four Formats ==========
-  # Scientific fixtures and oracles are shared; AppImage GUI checks stay in appimage-compatibility.
+  # Scientific/mesh checks are shared; extra AppImage GUI checks stay in appimage-compatibility.
   validate-packages:
     name: Validate package (${{ matrix.target }}, ${{ matrix.os }})
     needs: build
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     strategy:
@@ -1491,23 +1606,23 @@ jobs:
           - os: macos-26
             target: dmg
             artifact_name: TractEdit-macOS-arm64
-            enabled: ${{ github.event_name != 'workflow_dispatch' || inputs.build_macos }}
+            enabled: ${{ inputs.build_macos }}
           - os: ubuntu-24.04
             target: deb
             artifact_name: TractEdit-Linux-DEB
-            enabled: ${{ github.event_name != 'workflow_dispatch' || inputs.build_deb }}
+            enabled: ${{ inputs.build_deb }}
           - os: windows-latest
             target: exe
             artifact_name: TractEdit-Windows-x64
-            enabled: ${{ github.event_name != 'workflow_dispatch' || inputs.build_windows }}
+            enabled: ${{ inputs.build_windows }}
           - os: ubuntu-22.04
             target: appimage
             artifact_name: TractEdit-Linux-AppImage
-            enabled: ${{ github.event_name != 'workflow_dispatch' || inputs.build_appimage }}
+            enabled: ${{ inputs.build_appimage }}
           - os: ubuntu-24.04
             target: appimage
             artifact_name: TractEdit-Linux-AppImage
-            enabled: ${{ github.event_name != 'workflow_dispatch' || inputs.build_appimage }}
+            enabled: ${{ inputs.build_appimage }}
     steps:
       - name: Checkout verification inputs
         if: matrix.enabled
@@ -1524,6 +1639,7 @@ jobs:
           name: ${{ matrix.artifact_name }}
           path: artifact
       - name: Prepare isolated package and record identity
+        id: package-identity
         if: matrix.enabled && matrix.target != 'appimage'
         env:
           TARGET: ${{ matrix.target }}
@@ -1568,7 +1684,13 @@ jobs:
                   output.write(f"DMG_MOUNT={root.as_posix()}\n")
               bundle = root / "TractEdit.app"
               with (bundle / "Contents/Info.plist").open("rb") as stream:
-                  executable_name = plistlib.load(stream)["CFBundleExecutable"]
+                  plist = plistlib.load(stream)
+              executable_name = plist["CFBundleExecutable"]
+              obj_types = [doc for doc in plist["CFBundleDocumentTypes"]
+                           if "obj" in doc.get("CFBundleTypeExtensions", [])]
+              if len(obj_types) != 1 or (obj_types[0].get("CFBundleTypeRole"),
+                                         obj_types[0].get("LSHandlerRank")) != ("Viewer", "Alternate"):
+                  raise RuntimeError("Expected one alternate OBJ viewer in packaged Info.plist")
               executable = bundle / "Contents/MacOS" / executable_name
           if not executable.is_file():
               raise RuntimeError(f"Missing packaged executable: {executable}")
@@ -1641,18 +1763,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y libgl1 libegl1 libxcb-cursor0 \
+          bash .github/scripts/linux/install-apt-dependencies.sh libgl1 libegl1 libxcb-cursor0 \
             libxcb-xinerama0 libxkbcommon-x11-0 \
             libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 \
-            xvfb xauth xdotool x11-apps
+            xvfb xauth xdotool x11-apps x11-utils
       - name: Install headless Linux runtime libraries
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y libgl1 libegl1 libxcb-cursor0 \
-            libxcb-xinerama0 libxkbcommon-x11-0
+          bash .github/scripts/linux/install-apt-dependencies.sh libgl1 libegl1 libxcb-cursor0 \
+            libxcb-xinerama0 libxkbcommon-x11-0 xvfb xauth xdotool x11-apps x11-utils
         if: matrix.enabled && matrix.target == 'appimage'
       - name: Install isolated verification tools
         if: matrix.enabled
@@ -1667,14 +1787,12 @@ jobs:
           root = Path(os.environ["RUNNER_TEMP"]) / "verification-venv"
           venv.EnvBuilder(with_pip=True).create(root)
           python = root / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
-          packages = ["numpy==2.3.5", "nibabel==5.3.3", "trx-python==0.3"]
-          if os.environ["TARGET"] != "appimage":
-              packages += ["psutil==7.1.0"]
+          packages = ["numpy==2.3.5", "nibabel==5.3.3", "trx-python==0.3",
+                      "psutil==7.1.0", "Pillow==11.3.0"]
           if sys.platform == "darwin":
               packages += ["pyobjc-core==12.2.2", "pyobjc-framework-Cocoa==12.2.2",
-                           "pyobjc-framework-Quartz==12.2.2"]
-          if sys.platform == "win32":
-              packages += ["Pillow==11.3.0"]
+                           "pyobjc-framework-Quartz==12.2.2",
+                           "pyobjc-framework-ApplicationServices==12.2.2"]
           with open("evidence/verifier-install.log", "w") as log:
               subprocess.run([str(python), "-m", "pip", "install", "--only-binary=:all:", *packages],
                              stdout=log, stderr=subprocess.STDOUT, check=True, timeout=300)
@@ -1735,6 +1853,7 @@ jobs:
           )
           PY
       - name: Run packaged conversion TDI and negative input
+        id: scientific-run
         if: matrix.enabled
         shell: python {0}
         run: |
@@ -1766,6 +1885,7 @@ jobs:
           if (root / "invalid.trx").exists():
               raise RuntimeError("Invalid tractogram produced an output")
       - name: Check outputs with independent numeric oracles
+        id: scientific-checks
         if: matrix.enabled
         shell: bash
         run: |
@@ -1869,8 +1989,149 @@ jobs:
           if failed:
               raise RuntimeError("Unresolved DEB XCB dependencies; see xcb-dependencies.log")
 
+      - name: Check packaged Advanced worker
+        id: advanced-worker
+        if: matrix.enabled
+        shell: python {0}
+        run: |
+          import os
+          from pathlib import Path
+          import subprocess
+          import textwrap
+
+          script = Path(os.environ["RUNNER_TEMP"]) / "package-overlay-probe.py"
+          script.write_text(textwrap.dedent(r'''
+          import json
+          import multiprocessing
+          import multiprocessing.spawn
+          from pathlib import Path
+          import sys
+
+          def check_worker(executable, source_root, root):
+              import numpy as np
+
+              # Only the verifier imports checkout code to identify the spawn target.
+              sys.path.insert(0, str(source_root))
+              from tractedit_pkg.mesh.process import _prepare_overlay
+              sys.path.pop(0)
+              if sys.platform != "win32":
+                  from multiprocessing import resource_tracker
+
+                  resource_tracker.ensure_running()
+              multiprocessing.set_executable(str(executable))
+              context = multiprocessing.get_context("spawn")
+              count = 250_002
+              points = np.column_stack((np.arange(count) // 2, np.arange(count) % 2,
+                                        np.zeros(count)))
+              for component in ("boundary_edges", "surface_normals"):
+                  folder = root / component
+                  (folder / "input").mkdir(parents=True)
+                  (folder / "output").mkdir()
+                  arrays = []
+
+                  def save(values, vtk_type, components=1):
+                      index = len(arrays)
+                      np.save(folder / "input" / f"{index}.npy", values, allow_pickle=False)
+                      arrays.append({"name": None, "type": vtk_type, "components": components})
+                      return index
+
+                  point_array = save(points, 11, 3)
+                  cells = []
+                  for index in range(4):
+                      offsets = np.array([0, count] if index == 1 else [0], dtype=np.int64)
+                      ids = np.arange(count if index == 1 else 0, dtype=np.int64)
+                      cells.append((save(offsets, 12), save(ids, 12)))
+                  document = {
+                      "result": {"path": "", "point_count": count, "polygon_count": 0,
+                                 "strip_count": 1, "source_bounds": [0, count // 2 - 1, 0, 1, 0, 0],
+                                 "space_metadata": {"source": "vtp_field_data", "declarations": [],
+                                                    "status": "missing", "coordinate_system": None}},
+                      "points": point_array, "cells": cells, "arrays": arrays,
+                      "attributes": [{"arrays": [], "active": {}} for _ in range(3)],
+                  }
+                  (folder / "input/result.json").write_text(json.dumps(document), "utf-8")
+                  process = context.Process(target=_prepare_overlay, args=(str(folder), component))
+                  frozen = getattr(sys, "frozen", None)
+                  original_preparation = multiprocessing.spawn.get_preparation_data
+
+                  def packaged_preparation(name):
+                      data = original_preparation(name)
+                      # Preserve the child's bundled paths; never replay this verifier.
+                      for key in ("sys_path", "init_main_from_name", "init_main_from_path"):
+                          data.pop(key, None)
+                      return data
+
+                  try:
+                      try:
+                          sys.frozen = True
+                          multiprocessing.spawn.get_preparation_data = packaged_preparation
+                          process.start()
+                      finally:
+                          multiprocessing.spawn.get_preparation_data = original_preparation
+                          if frozen is None:
+                              del sys.frozen
+                          else:
+                              sys.frozen = frozen
+                      process.join(60)
+                      if process.is_alive():
+                          raise RuntimeError(f"Packaged {component} worker timed out")
+                      if process.exitcode != 0:
+                          raise RuntimeError(f"Packaged {component} worker exited {process.exitcode}")
+                      error = folder / "error.json"
+                      if error.exists():
+                          raise RuntimeError(error.read_text("utf-8"))
+                      output = json.loads((folder / "output/result.json").read_text("utf-8"))
+
+                      def read(index):
+                          return np.load(folder / "output" / f"{index}.npy", allow_pickle=False)
+
+                      actual_points = read(output["points"])
+                      if component == "boundary_edges":
+                          offsets, connectivity = map(read, output["cells"][2])
+                          np.testing.assert_array_equal(np.diff(offsets), np.full(count, 2))
+                          ids = (actual_points[:, 0] * 2 + actual_points[:, 1]).astype(np.int64)
+                          edges = np.sort(ids[connectivity].reshape(-1, 2), axis=1)
+                          expected = np.vstack(([[0, 1], [count - 2, count - 1]],
+                                                np.column_stack((np.arange(count - 2), np.arange(2, count)))))
+                          def order(values):
+                              return values[np.lexsort((values[:, 1], values[:, 0]))]
+
+                          np.testing.assert_array_equal(order(edges), order(expected))
+                      else:
+                          assert json.loads((folder / "faces.json").read_text("utf-8")) == count - 2
+                          assert actual_points.shape == (10_000, 3)
+                          vector_id = output["attributes"][0]["arrays"][0]
+                          np.testing.assert_allclose(read(vector_id), np.tile([0, 0, -1], (10_000, 1)))
+                      print(f"Packaged {component}: PASS", flush=True)
+                  finally:
+                      if process.pid is not None:
+                          if process.is_alive():
+                              process.kill()
+                          process.join()
+                      process.close()
+
+          if __name__ == "__main__":
+              check_worker(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]))
+          '''), encoding="utf-8")
+          env = os.environ.copy()
+          for key in ("PYTHONPATH", "PYTHONHOME", "QT_QPA_PLATFORM", "APPIMAGE_EXTRACT_AND_RUN"):
+              env.pop(key, None)
+          if os.environ["TARGET"] == "appimage":
+              env["APPIMAGE_EXTRACT_AND_RUN"] = "1"
+          log_path = Path("evidence/advanced-worker.log")
+          try:
+              with log_path.open("w") as log:
+                  subprocess.run([os.environ["VERIFIER"], "-B", str(script), os.environ["EXECUTABLE"],
+                                  str(Path.cwd()), str(script.parent / "overlay-smoke")],
+                                 cwd=script.parent, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                 check=True, timeout=150)
+          finally:
+              with log_path.open("rb") as log:
+                  log.seek(max(0, log_path.stat().st_size - 8000))
+                  print(log.read().decode("utf-8", errors="replace"), flush=True)
+
       - name: Prepare native GUI probe
-        if: matrix.enabled && matrix.target != 'appimage'
+        if: matrix.enabled
         shell: python {0}
         run: |
           import os
@@ -1887,6 +2148,8 @@ jobs:
           import sys
           import time
           import psutil
+          import numpy as np
+          from PIL import Image, ImageGrab
 
           evidence = Path(os.environ["GITHUB_WORKSPACE"]) / "evidence"
           title = "TractEdit GUI - Interactive Editor"
@@ -1920,7 +2183,7 @@ jobs:
                       pass
               return {item.pid for item in owned if live(item)}
 
-          def windows(pids):
+          def windows(pids, name=title):
               if sys.platform == "win32":
                   from ctypes import wintypes
                   user = ctypes.WinDLL("user32", use_last_error=True)
@@ -1930,6 +2193,7 @@ jobs:
                   user.IsWindowVisible.argtypes = [wintypes.HWND]
                   user.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
                   user.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+                  user.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
                   user.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
                   found = []
                   @callback_type
@@ -1938,11 +2202,14 @@ jobs:
                       user.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
                       text = ctypes.create_unicode_buffer(1024)
                       user.GetWindowTextW(hwnd, text, len(text))
+                      window_class = ctypes.create_unicode_buffer(256)
+                      user.GetClassNameW(hwnd, window_class, len(window_class))
                       rect = wintypes.RECT()
-                      if (pid.value in pids and user.IsWindowVisible(hwnd) and text.value == title
+                      if (pid.value in pids and user.IsWindowVisible(hwnd) and (name is None or text.value == name)
                               and user.GetWindowRect(hwnd, ctypes.byref(rect))
                               and rect.right > rect.left and rect.bottom > rect.top):
-                          found.append({"id": int(hwnd), "pid": pid.value,
+                          found.append({"id": int(hwnd), "pid": pid.value, "title": text.value,
+                                        "class": window_class.value,
                                         "bounds": [rect.left, rect.top, rect.right, rect.bottom]})
                       return True
                   if not user.EnumWindows(visit, 0):
@@ -1957,21 +2224,551 @@ jobs:
                   for record in records or []:
                       bounds = record.get(q.kCGWindowBounds, {})
                       if (record.get(q.kCGWindowOwnerPID) in pids
-                              and record.get(q.kCGWindowName) == title
+                              and (name is None or record.get(q.kCGWindowName) == name)
                               and record.get(q.kCGWindowLayer) == 0
                               and bounds.get("Width", 0) > 0 and bounds.get("Height", 0) > 0):
                           found.append({"id": int(record[q.kCGWindowNumber]),
-                                        "pid": int(record[q.kCGWindowOwnerPID])})
+                                        "pid": int(record[q.kCGWindowOwnerPID]),
+                                        "title": record.get(q.kCGWindowName, "")})
+                  if not found and name == "Mesh coordinates":
+                      for pid in pids:
+                          result = subprocess.run(
+                              ["osascript", "-e", 'tell application "System Events" to tell '
+                               f'(first application process whose unix id is {pid}) '
+                               'to get exists window "Mesh coordinates"'],
+                              capture_output=True, text=True, check=True, timeout=5)
+                          if result.stdout.strip() == "true":
+                              found.append({"pid": pid, "title": name})
                   return found
-              result = subprocess.run(["xdotool", "search", "--onlyvisible", "--name",
-                                       "^" + title + "$"], capture_output=True, text=True, timeout=5)
+              command = ["xdotool", "search", "--onlyvisible"]
+              command += ["--class", ".*"] if name is None else ["--name", "^" + name + "$"]
+              result = subprocess.run(command, capture_output=True, text=True, timeout=5)
               found = []
               for window in result.stdout.split():
                   pid = subprocess.run(["xdotool", "getwindowpid", window],
                                        capture_output=True, text=True, timeout=5).stdout.strip()
                   if pid.isdecimal() and int(pid) in pids:
-                      found.append({"id": int(window), "pid": int(pid)})
+                      caption = subprocess.run(["xdotool", "getwindowname", window],
+                                               capture_output=True, text=True, timeout=5).stdout.strip()
+                      found.append({"id": int(window), "pid": int(pid), "title": caption})
               return found
+
+          def send_keys(*keys):
+              require_owned_focus()
+              if sys.platform == "win32":
+                  codes = {"alt": 0x12, "ctrl": 0x11, "shift": 0x10, "return": 0x0d,
+                           "home": 0x24, "down": 0x28}
+                  values = [codes.get(k, ord(k.upper()) if len(k) == 1 else 0) for k in keys]
+                  user = ctypes.WinDLL("user32", use_last_error=True)
+                  for value in values:
+                      user.keybd_event(value, user.MapVirtualKeyW(value, 0), 0, 0)
+                      time.sleep(0.05)
+                  for value in reversed(values):
+                      user.keybd_event(value, user.MapVirtualKeyW(value, 0), 2, 0)
+                      time.sleep(0.05)
+              elif sys.platform == "linux":
+                  symbols = [{"return": "Return", "home": "Home", "down": "Down"}.get(k, k) for k in keys]
+                  subprocess.run(["xdotool", "key", "--clearmodifiers", "--delay", "100", "+".join(symbols)],
+                                 check=True, timeout=5)
+              else:
+                  modifiers = {"ctrl": "command down", "shift": "shift down", "alt": "option down"}
+                  codes = {"return": 36, "home": 115, "down": 125}
+                  action = ("key code " + str(codes[keys[-1]]) if keys[-1] in codes
+                            else "keystroke " + json.dumps(keys[-1]))
+                  if len(keys) > 1:
+                      action += " using {" + ", ".join(modifiers[k] for k in keys[:-1]) + "}"
+                  subprocess.run(["osascript", "-e", 'tell application "System Events" to ' + action],
+                                 check=True, timeout=5)
+
+          def type_path(path):
+              require_owned_focus()
+              if sys.platform == "win32":
+                  user = ctypes.WinDLL("user32", use_last_error=True)
+                  from ctypes import wintypes as w
+                  class Keyboard(ctypes.Structure):
+                      _fields_ = [("vk", w.WORD), ("scan", w.WORD), ("flags", w.DWORD),
+                                  ("time", w.DWORD), ("extra", ctypes.c_size_t)]
+                  class Mouse(ctypes.Structure):
+                      _fields_ = [("x", w.LONG), ("y", w.LONG), ("data", w.DWORD),
+                                  ("flags", w.DWORD), ("time", w.DWORD), ("extra", ctypes.c_size_t)]
+                  class Payload(ctypes.Union):
+                      _fields_ = [("keyboard", Keyboard), ("mouse", Mouse)]
+                  class Input(ctypes.Structure):
+                      _fields_ = [("kind", w.DWORD), ("payload", Payload)]
+                  encoded = str(path).encode("utf-16-le")
+                  units = [int.from_bytes(encoded[i:i + 2], "little") for i in range(0, len(encoded), 2)]
+                  events = (Input * (len(units) * 2))()
+                  for i, unit in enumerate(units):
+                      for j, flags in enumerate((4, 6)):
+                          events[i * 2 + j].kind = 1
+                          events[i * 2 + j].payload.keyboard = Keyboard(0, unit, flags, 0, 0)
+                  user.SendInput.argtypes = [w.UINT, ctypes.POINTER(Input), ctypes.c_int]
+                  user.SendInput.restype = w.UINT
+                  if user.SendInput(len(events), events, ctypes.sizeof(Input)) != len(events):
+                      raise ctypes.WinError(ctypes.get_last_error())
+              elif sys.platform == "linux":
+                  subprocess.run(["xdotool", "type", "--clearmodifiers", "--delay", "1", str(path)],
+                                 check=True, timeout=10)
+              else:
+                  subprocess.run(["osascript", "-e", 'tell application "System Events" to keystroke ' + json.dumps(str(path))],
+                                 check=True, timeout=10)
+
+          def capture(path):
+              require_owned_focus()
+              if sys.platform == "darwin":
+                  subprocess.run(["screencapture", "-x", "-l", str(window["id"]), str(path)],
+                                 check=True, timeout=20)
+                  return np.asarray(Image.open(path).convert("RGB"))
+              pixels = ImageGrab.grab(bbox=window.get("bounds"))
+              pixels.save(path)
+              return np.asarray(pixels.convert("RGB"))
+
+          def require_owned_focus():
+              if sys.platform == "win32":
+                  from ctypes import wintypes as w
+                  user = ctypes.WinDLL("user32", use_last_error=True)
+                  user.GetForegroundWindow.restype = w.HWND
+                  user.GetWindowThreadProcessId.argtypes = [w.HWND, ctypes.POINTER(w.DWORD)]
+                  pid = w.DWORD()
+                  user.GetWindowThreadProcessId(user.GetForegroundWindow(), ctypes.byref(pid))
+                  owner = pid.value
+              elif sys.platform == "linux":
+                  active = subprocess.run(["xdotool", "getwindowfocus"], capture_output=True,
+                                          text=True, check=True, timeout=5).stdout.strip()
+                  owner = int(subprocess.run(["xdotool", "getwindowpid", active], capture_output=True,
+                                             text=True, check=True, timeout=5).stdout.strip())
+              else:
+                  owner = int(subprocess.run(["osascript", "-e", 'tell application "System Events" '
+                                              'to get unix id of first application process whose frontmost is true'],
+                                             capture_output=True, text=True, check=True, timeout=5).stdout.strip())
+              if owner not in refresh_owned():
+                  raise RuntimeError("Desktop focus belongs to another application; no input sent")
+
+          def focus_main_window():
+              if sys.platform == "win32":
+                  from ctypes import wintypes as w
+                  user = ctypes.WinDLL("user32", use_last_error=True)
+                  user.SetForegroundWindow.argtypes = [w.HWND]
+                  user.SetForegroundWindow.restype = w.BOOL
+                  user.GetForegroundWindow.restype = w.HWND
+                  user.SetWindowPos.argtypes = [w.HWND, w.HWND, ctypes.c_int, ctypes.c_int,
+                                               ctypes.c_int, ctypes.c_int, w.UINT]
+                  user.SetWindowPos(window["id"], 0, 0, 0, 0, 0, 0x43)
+                  if not user.SetForegroundWindow(window["id"]):
+                      kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+                      kernel.GetCurrentThreadId.restype = w.DWORD
+                      current = kernel.GetCurrentThreadId()
+                      user.GetWindowThreadProcessId.argtypes = [w.HWND, ctypes.POINTER(w.DWORD)]
+                      user.GetWindowThreadProcessId.restype = w.DWORD
+                      foreground = user.GetWindowThreadProcessId(user.GetForegroundWindow(), None)
+                      user.AttachThreadInput.argtypes = [w.DWORD, w.DWORD, w.BOOL]
+                      user.AttachThreadInput.restype = w.BOOL
+                      attached = foreground != current and user.AttachThreadInput(current, foreground, True)
+                      try:
+                          user.SetForegroundWindow(window["id"])
+                      finally:
+                          if attached:
+                              user.AttachThreadInput(current, foreground, False)
+                  # Activation crosses input queues; wait before checking ownership.
+                  deadline = time.monotonic() + 2
+                  while user.GetForegroundWindow() != window["id"] and time.monotonic() < deadline:
+                      check_signal()
+                      time.sleep(0.05)
+              elif sys.platform == "linux":
+                  subprocess.run(["xdotool", "windowfocus", "--sync", str(window["id"])], check=True, timeout=5)
+              else:
+                  subprocess.run(["osascript", "-e", 'tell application "System Events" to set frontmost of '
+                                  f'(first application process whose unix id is {window["pid"]}) to true'],
+                                 check=True, timeout=5)
+              require_owned_focus()
+
+          def mac_file_dialog(action):
+              require_owned_focus()
+              script = ('tell application "System Events"\n'
+                        f'tell (first application process whose unix id is {window["pid"]})\n'
+                        'log "Checking coordinate window"\n'
+                        'if exists window "Mesh coordinates" then return "coordinates"\n'
+                        'log "Checking front window"\n'
+                        'if not (exists front window) then return "waiting"\n'
+                        'set uiDialog to get front window\n'
+                        'log ("Front window: " & (name of uiDialog))\n'
+                        'set uiHasSheet to false\n'
+                        'repeat 2 times\n'
+                        'log "Checking attached sheet"\n'
+                        'if not (exists sheet 1 of uiDialog) then exit repeat\n'
+                        'set uiDialog to get sheet 1 of uiDialog\n'
+                        'set uiHasSheet to true\n'
+                        'log "Attached sheet found"\n'
+                        'end repeat\n'
+                        'set uiContainers to {uiDialog}\n'
+                        'set uiLevel to {uiDialog}\n'
+                        'repeat 3 times\n'
+                        'set uiNextLevel to {}\n'
+                        'repeat with uiParent in uiLevel\n'
+                        'log "Checking dialog groups"\n'
+                        'set uiGroups to get groups of uiParent\n'
+                        'set uiSplitGroups to get splitter groups of uiParent\n'
+                        'log ("Containers: groups=" & (count uiGroups) & ", split groups=" & (count uiSplitGroups))\n'
+                        'set uiGroups to uiGroups & uiSplitGroups\n'
+                        'repeat with uiGroup in uiGroups\n'
+                        'if (count uiContainers) >= 24 then error "Dialog group limit exceeded"\n'
+                        'set end of uiNextLevel to contents of uiGroup\n'
+                        'set end of uiContainers to contents of uiGroup\n'
+                        'end repeat\n'
+                        'end repeat\n'
+                        'if (count uiNextLevel) = 0 then exit repeat\n'
+                        'set uiLevel to uiNextLevel\n'
+                        'end repeat\n'
+                        'repeat with uiDialog in uiContainers\n'
+                        'log "Checking Go button"\n'
+                        'if exists button "Go" of uiDialog then return "go"\n'
+                        'end repeat\n')
+              if action == "go":
+                  script += ('if not uiHasSheet then return "waiting"\n'
+                             'repeat with uiDialog in uiContainers\n'
+                             'if exists button "Open" of uiDialog then return "waiting"\n'
+                             'end repeat\n'
+                             'repeat with uiDialog in uiContainers\n'
+                             'log "Checking focused path input"\n'
+                             'set uiFields to get text fields of uiDialog\n'
+                             'set uiCombos to get combo boxes of uiDialog\n'
+                             'repeat with uiField in (uiFields & uiCombos)\n'
+                             'if enabled of uiField then\n'
+                             'if value of attribute "AXFocused" of uiField then return "go"\n'
+                             'end if\n'
+                             'end repeat\n'
+                             'end repeat\n'
+                             'return "waiting"\n')
+              else:
+                  script += ('repeat with uiDialog in uiContainers\n'
+                             'log "Checking Open button"\nif exists button "Open" of uiDialog then\n')
+                  if action == "open":
+                      script += ('if not (enabled of button "Open" of uiDialog) then return "waiting"\n'
+                                 'log "Clicking Open button"\n'
+                                 'click button "Open" of uiDialog\n')
+                  script += 'return "open"\nend if\nend repeat\nreturn "waiting"\n'
+              script += 'end tell\nend tell'
+              try:
+                  result = subprocess.run(["osascript", "-e", script], capture_output=True,
+                                          text=True, check=False, timeout=5)
+              except subprocess.TimeoutExpired as error:
+                  detail = error.stderr or "No diagnostic output"
+                  if isinstance(detail, bytes):
+                      detail = detail.decode("utf-8", errors="replace")
+                  raise RuntimeError(
+                      f"macOS file dialog {action}: targeted Accessibility query timed out after 5s; "
+                      f"the action was not retried. Last progress: {detail.strip()}") from error
+              if result.returncode:
+                  detail = result.stderr.strip() or result.stdout.strip() or "No diagnostic output"
+                  raise RuntimeError(
+                      f"macOS file dialog {action}: osascript exited {result.returncode}: {detail}")
+              report["mac_file_dialog"] = {
+                  "action": action, "state": result.stdout.strip(),
+                  "diagnostics": result.stderr.strip(),
+              }
+              return result.stdout.strip()
+
+          def mac_select_mesh(path):
+              def wait_for(action, expected):
+                  deadline = time.monotonic() + 30
+                  state = "waiting"
+                  while time.monotonic() < deadline:
+                      check_signal()
+                      if process.poll() is not None:
+                          raise RuntimeError("Application exited during macOS file selection")
+                      state = mac_file_dialog(action)
+                      if state in expected:
+                          return state
+                      time.sleep(0.2)
+                  raise RuntimeError(f"macOS file dialog timed out: {action=}, {state=}, {path=}")
+
+              wait_for("ready", {"open"})
+              send_keys("ctrl", "shift", "g")
+              wait_for("go", {"go"})
+              send_keys("ctrl", "a")
+              type_path(path)
+              send_keys("return")
+              # Click only Open; a second Return could accept the coordinate dialog.
+              wait_for("open", {"open", "coordinates"})
+
+          def mac_mesh_coordinates(choice):
+              require_owned_focus()
+              script = ('tell application "System Events"\n'
+                        f'set uiProcess to first application process whose unix id is {window["pid"]}\n'
+                        'tell uiProcess\n'
+                        'if not (exists window "Mesh coordinates") then error "Mesh coordinate dialog missing"\n'
+                        'set uiDialog to window "Mesh coordinates"\n'
+                        'set uiCombo to missing value\n'
+                        'set uiOK to missing value\n'
+                        'set uiLevel to {uiDialog}\n'
+                        'set uiCount to 0\n'
+                        'repeat 4 times\n'
+                        'set uiNextLevel to {}\n'
+                        'repeat with uiParent in uiLevel\n'
+                        'set uiChildren to get UI elements of uiParent\n'
+                        'repeat with uiChild in uiChildren\n'
+                        'set uiCount to uiCount + 1\n'
+                        'if uiCount > 64 then error "Coordinate dialog element limit exceeded"\n'
+                        'set uiRole to role of uiChild\n'
+                        'log {uiRole, name of uiChild}\n'
+                        'if uiRole is "AXComboBox" or uiRole is "AXPopUpButton" '
+                        'or uiRole is "AXMenuButton" then\n'
+                        'set uiCombo to contents of uiChild\n'
+                        'else if uiRole is "AXButton" then\n'
+                        'if name of uiChild is "OK" then set uiOK to contents of uiChild\n'
+                        'else if uiRole is "AXGroup" or uiRole is "AXSplitGroup" '
+                        'or uiRole is "AXScrollArea" or uiRole is "AXSheet" then\n'
+                        'set end of uiNextLevel to contents of uiChild\n'
+                        'end if\n'
+                        'end repeat\n'
+                        'end repeat\n'
+                        'if uiCombo is not missing value and uiOK is not missing value then exit repeat\n'
+                        'if (count uiNextLevel) = 0 then exit repeat\n'
+                        'set uiLevel to uiNextLevel\n'
+                        'end repeat\n'
+                        'if uiCombo is missing value then error "Coordinate combo not found"\n'
+                        'if uiOK is missing value then error "Coordinate OK button not found"\n')
+
+              def run_script(source, phase):
+                  try:
+                      result = subprocess.run(["osascript", "-e", source], capture_output=True,
+                                              text=True, check=False, timeout=5)
+                  except subprocess.TimeoutExpired as error:
+                      detail = error.stderr or "No diagnostic output"
+                      if isinstance(detail, bytes):
+                          detail = detail.decode("utf-8", errors="replace")
+                      raise RuntimeError(
+                          f"macOS coordinate choice {choice} ({phase}): timed out; {detail}") from error
+                  if result.returncode:
+                      raise RuntimeError(
+                          f"macOS coordinate choice {choice} ({phase}): {result.stderr.strip()}")
+                  return result
+
+              # Qt 6.7's Cocoa accessibility cells can crash on popup destruction.
+              # Navigate the open popup without enumerating its rows or cells, then
+              # verify the committed label before accepting the coordinate dialog.
+              run_script(script + 'click uiCombo\nend tell\nend tell', "open combo")
+              time.sleep(0.2)
+              send_keys("home")
+              send_keys("down")
+              if choice == "LPS":
+                  send_keys("down")
+              send_keys("return")
+              time.sleep(0.2)
+              require_owned_focus()
+              script += ('if role of uiCombo is "AXMenuButton" then\n'
+                         'set uiChoice to get name of uiCombo\n'
+                         'else\n'
+                         'set uiChoice to get value of uiCombo\n'
+                         'end if\n'
+                         f'if uiChoice is not "{choice} (mm)" then '
+                         'error ("Coordinate selection mismatch: " & uiChoice)\n'
+                         'if not (enabled of uiOK) then '
+                         'error "Coordinate acceptance is disabled"\n'
+                         'click uiOK\nend tell\nend tell')
+              run_script(script, "accept coordinates")
+
+          def accept_mesh_coordinates(path):
+              choice = "from_file"
+              send_keys("return")
+              if path.suffix.lower() == ".obj":
+                  time.sleep(0.3)
+                  if not windows(refresh_owned(), "Mesh coordinates"):
+                      raise RuntimeError("OBJ accepted missing SPACE metadata without an explicit choice")
+                  choice = "LPS" if path.suffix == ".OBJ" else "RAS"
+                  if sys.platform == "darwin":
+                      mac_mesh_coordinates(choice)
+                  else:
+                      # QDialog initially focuses its first input, the coordinate combo.
+                      send_keys("home")
+                      send_keys("down")
+                      if choice == "LPS":
+                          send_keys("down")
+                      send_keys("return")
+              time.sleep(2)
+              if windows(refresh_owned(), "Mesh coordinates"):
+                  raise RuntimeError(f"Mesh coordinate dialog did not accept {choice}")
+              return choice
+
+          def mac_wait_for_main_window(path):
+              import ApplicationServices as ax
+
+              state = {"file": path.name, "pid": window["pid"]}
+              report["mac_mesh_window"] = state
+              application = ax.AXUIElementCreateApplication(window["pid"])
+              error = ax.AXUIElementSetMessagingTimeout(application, 0.5)
+              if error:
+                  raise RuntimeError(f"macOS main-window AX timeout setup failed: {error}")
+              deadline = time.monotonic() + 10
+              while time.monotonic() < deadline:
+                  check_signal()
+                  state["returncode"] = process.poll()
+                  if state["returncode"] is not None:
+                      raise RuntimeError(f"Mesh {path.name}: application exited with code {state['returncode']}")
+                  pids = refresh_owned()
+                  if window["pid"] not in pids:
+                      raise RuntimeError(f"Mesh {path.name}: owned GUI process disappeared")
+                  error, focused = ax.AXUIElementCopyAttributeValue(application, "AXFocusedWindow", None)
+                  state.update(ax_error=error, title="")
+                  if not error and focused is not None:
+                      error, caption = ax.AXUIElementCopyAttributeValue(focused, "AXTitle", None)
+                      state.update(ax_error=error, title=caption or "")
+                      if error and error not in (ax.kAXErrorNoValue, ax.kAXErrorAttributeUnsupported):
+                          raise RuntimeError(f"Mesh {path.name}: AXTitle failed with AX error {error}")
+                  elif error not in (0, ax.kAXErrorNoValue, ax.kAXErrorAttributeUnsupported):
+                      raise RuntimeError(f"Mesh {path.name}: AXFocusedWindow failed with AX error {error}")
+                  if state["title"] == title:
+                      visible = windows(pids)
+                      if any(item["id"] == window["id"] and item["pid"] == window["pid"] for item in visible):
+                          focus_main_window()
+                          return True
+                  elif state["title"]:
+                      raise RuntimeError(f"Mesh {path.name}: unexpected window {state['title']!r}")
+                  time.sleep(0.1)
+              raise RuntimeError(f"Mesh {path.name}: main window did not return; {state}")
+
+          def has_mesh_file_dialog(visible):
+              for item in visible:
+                  caption = item["title"].removesuffix(" \u2014 TractEdit")
+                  if caption == "Load Mesh" or (
+                      caption.startswith("Load Mesh (destination: ") and caption.endswith(")")
+                  ):
+                      return True
+              return False
+
+          def windows_open_mesh_dialog():
+              focus_main_window()
+              send_keys("alt", "f")
+              deadline = time.monotonic() + 15
+              phase = "file_menu"
+              confirm_after = 0
+              while time.monotonic() < deadline:
+                  check_signal()
+                  if process.poll() is not None:
+                      raise RuntimeError("Application exited while opening Load Mesh")
+                  visible = windows(refresh_owned(), None)
+                  report["mesh_file_dialog"] = {"phase": phase, "windows": visible}
+                  if has_mesh_file_dialog(visible):
+                      return
+                  menu_visible = any("QWindowPopup" in item.get("class", "") for item in visible)
+                  if menu_visible and phase == "file_menu":
+                      send_keys("m")
+                      phase = "mesh_mnemonic"
+                      confirm_after = time.monotonic() + 0.3
+                  elif menu_visible and phase == "mesh_mnemonic" and time.monotonic() >= confirm_after:
+                      # Confirm only while the mnemonic still leaves a Qt menu open.
+                      send_keys("return")
+                      phase = "file_dialog"
+                  time.sleep(0.1)
+              raise RuntimeError(f"Load Mesh file dialog did not open; no path entered ({phase=})")
+
+          def mesh_smoke():
+              folder = Path(os.environ["RUNNER_TEMP"]) / "mesh-smoke"
+              folder.mkdir()
+              ply = folder / "surface.ply"
+              # Coplanar, separated bands stay observable with opaque surfaces.
+              ply.write_text("ply\nformat ascii 1.0\ncomment SPACE=RAS\nelement vertex 8\n"
+                             "property float x\nproperty float y\nproperty float z\nelement face 4\n"
+                             "property list uchar int vertex_indices\nend_header\n"
+                             "-30 -30 0\n30 -30 0\n30 -24 0\n-30 -24 0\n"
+                             "-30 24 0\n30 24 0\n30 30 0\n-30 30 0\n"
+                             "3 0 1 2\n3 0 2 3\n3 4 5 6\n3 4 6 7\n")
+              vtp = folder / "surface.vtp"
+              vtp.write_text('<VTKFile type="PolyData" version="0.1" byte_order="LittleEndian"><PolyData>'
+                             '<FieldData><Array type="String" Name="SPACE" NumberOfTuples="1" format="ascii">'
+                             '82 65 83 0</Array></FieldData><Piece NumberOfPoints="4" NumberOfPolys="2">'
+                             '<Points><DataArray type="Float32" NumberOfComponents="3" format="ascii">'
+                             '-30 -22 0 30 -22 0 30 -8 0 -30 -8 0</DataArray></Points>'
+                             '<Polys><DataArray type="Int32" Name="connectivity" format="ascii">0 1 2 0 2 3</DataArray>'
+                             '<DataArray type="Int32" Name="offsets" format="ascii">3 6</DataArray></Polys>'
+                             '</Piece></PolyData></VTKFile>')
+              obj = folder / "surface.obj"
+              obj.write_text("# SPACE=LPS is not authoritative OBJ metadata\n"
+                             "o cortex\ng surface\nv -30 -7 0\nv 30 -7 0\n"
+                             "v 30 7 0\nv -30 7 0\nf 1 2 3 4\n", encoding="ascii")
+              obj_lps = folder / "surface_lps.OBJ"
+              obj_lps.write_text("v -30 -22 0\nv 30 -22 0\nv 30 -8 0\nv -30 -8 0\n"
+                                 "f -4 -3 -2\nf -4 -2 -1\n", encoding="ascii")
+              focus_main_window()
+              baseline = capture(evidence / "mesh-before.png")
+              report["mesh_smoke"] = []
+              for path in (ply, vtp, obj, obj_lps):
+                  if sys.platform == "darwin":
+                      subprocess.run(["osascript", "-e", 'tell application "System Events" to tell '
+                                      f'(first application process whose unix id is {window["pid"]})\n'
+                                      'click menu bar item "File" of menu bar 1\n'
+                                      'click menu item "Load Mesh..." of menu 1 of menu bar item "File" of menu bar 1\n'
+                                      'end tell'],
+                                     check=True, timeout=10)
+                  elif sys.platform == "win32":
+                      windows_open_mesh_dialog()
+                  else:
+                      send_keys("alt", "f")
+                      send_keys("m")
+                  if sys.platform == "linux":
+                      # The Medoid action shares M, so Qt highlights before triggering.
+                      time.sleep(0.2)
+                      send_keys("return")
+                  time.sleep(1)
+                  if (
+                      sys.platform != "darwin"
+                      and not has_mesh_file_dialog(windows(refresh_owned(), None))
+                  ):
+                      raise RuntimeError("Load Mesh file dialog did not open; no path entered")
+                  if sys.platform == "darwin":
+                      mac_select_mesh(path)
+                  else:
+                      if sys.platform == "win32":
+                          send_keys("alt", "n")
+                          send_keys("ctrl", "a")
+                      else:
+                          send_keys("ctrl", "l")
+                      type_path(path)
+                      send_keys("return")
+                  deadline = time.monotonic() + 30
+                  while not windows(refresh_owned(), "Mesh coordinates"):
+                      check_signal()
+                      if process.poll() is not None or time.monotonic() > deadline:
+                          raise RuntimeError(f"Mesh coordinate dialog missing for {path.suffix}")
+                      time.sleep(0.2)
+                  coordinate_choice = accept_mesh_coordinates(path)
+                  if sys.platform == "win32":
+                      user = ctypes.WinDLL("user32")
+                      user.GetForegroundWindow.restype = ctypes.c_void_p
+                      main_active = user.GetForegroundWindow() == window["id"]
+                  elif sys.platform == "linux":
+                      unexpected = []
+                      for candidate in windows(refresh_owned(), None):
+                          if candidate["id"] == window["id"]:
+                              continue
+                          properties = subprocess.run(
+                              ["xprop", "-id", str(candidate["id"]), "_NET_WM_WINDOW_TYPE"],
+                              capture_output=True, text=True, check=True, timeout=5).stdout
+                          if "_NET_WM_WINDOW_TYPE_DIALOG" in properties:
+                              unexpected.append(candidate)
+                      if unexpected:
+                          raise RuntimeError(f"Mesh import left a dialog: {unexpected}")
+                      # Xvfb without a window manager returns focus to the root.
+                      focus_main_window()
+                      focused = subprocess.run(["xdotool", "getwindowfocus"], capture_output=True,
+                                               text=True, check=True, timeout=5).stdout.strip()
+                      main_active = int(focused) == window["id"]
+                  else:
+                      main_active = mac_wait_for_main_window(path)
+                  if not main_active:
+                      raise RuntimeError("Mesh import left an error dialog or lost main-window focus")
+                  after = capture(evidence / ("mesh-after-" + path.name + ".png"))
+                  if after.shape != baseline.shape:
+                      raise RuntimeError("Window geometry changed during mesh smoke")
+                  # Exclude menu/status and either docking side of the Data Panel.
+                  delta = np.any(after[100:-70, 300:-300] != baseline[100:-70, 300:-300], axis=-1)
+                  changed = int(np.count_nonzero(delta))
+                  report["mesh_smoke"].append({"file": path.name, "format": path.suffix,
+                                               "coordinate_choice": coordinate_choice,
+                                               "changed_scene_pixels": changed})
+                  if changed < 5000:
+                      raise RuntimeError(f"Mesh {path.name} did not change the rendered scene: {changed} pixels")
+                  baseline = after
 
           try:
               env = os.environ.copy()
@@ -1980,6 +2777,8 @@ jobs:
               if sys.platform == "linux":
                   env["QT_QPA_PLATFORM"] = "xcb"
                   env["QT_DEBUG_PLUGINS"] = "1"
+                  if os.environ.get("TARGET") == "appimage":
+                      env["APPIMAGE_EXTRACT_AND_RUN"] = "1"
               check_signal()
               started = time.monotonic()
               with (evidence / "gui.log").open("w") as log:
@@ -2012,6 +2811,7 @@ jobs:
                   if not any(x["id"] == window["id"] and x["pid"] == window["pid"] for x in visible):
                       raise RuntimeError("Main window disappeared")
                   screenshot = evidence / ("gui.xwd" if sys.platform == "linux" else "gui.png")
+                  focus_main_window()
                   if sys.platform == "win32":
                       from PIL import ImageGrab
                       ImageGrab.grab(bbox=window["bounds"], all_screens=True).save(screenshot)
@@ -2023,11 +2823,19 @@ jobs:
                                      check=True, timeout=20)
                   if screenshot.stat().st_size == 0:
                       raise RuntimeError("Empty GUI screenshot")
+                  mesh_smoke()
                   check_signal()
                   report["observed_seconds"] = round(time.monotonic() - started, 3)
                   report["passed"] = True
           except BaseException as error:
               report["error"] = str(error)
+              if globals().get("window"):
+                  try:
+                      report["visible_windows"] = windows(refresh_owned(), None)
+                      capture(evidence / "gui-failure.png")
+                  except Exception as diagnostic_error:
+                      report["diagnostic_error"] = str(diagnostic_error)
+              print(json.dumps(report, indent=2), flush=True)
               raise
           finally:
               try:
@@ -2197,7 +3005,7 @@ jobs:
 
       - name: Observe real packaged GUI
         id: packaged-gui
-        if: matrix.enabled && matrix.target != 'appimage'
+        if: matrix.enabled
         shell: bash
         timeout-minutes: 4
         run: |
@@ -2208,6 +3016,317 @@ jobs:
           else
             "$VERIFIER" "$RUNNER_TEMP/package-gui-probe.py"
           fi
+      - name: Check packaged surface mapping and writers
+        id: surface-mapping
+        if: matrix.enabled
+        shell: python {0}
+        timeout-minutes: 4
+        run: |
+          import os
+          from pathlib import Path
+          import subprocess
+          import textwrap
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "surface-mapping-smoke"
+          root.mkdir()
+          payload = root / "payload.py"
+          payload.write_text(textwrap.dedent(r'''
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+          import tempfile
+          import time
+          import traceback
+
+          root = Path(__file__).parent
+
+          def phase(name):
+              (root / "phase.txt").write_text(name, "utf-8")
+
+          def check_mapping():
+              phase("imports")
+              import numpy as np
+              import nibabel as nib
+              import vtk
+              from vtk.util.numpy_support import numpy_to_vtk, vtk_to_numpy
+              from PyQt6.QtWidgets import QApplication
+              import tractedit_pkg.surface_mapping.process as worker
+              from tractedit_pkg.main_window import MainWindow
+              from tractedit_pkg.surface_mapping import SurfaceMappingParameters, SurfaceMappingRequest
+              from tractedit_pkg.visualization.surface_mapping_export import FigureOptions
+
+              assert getattr(sys, "frozen", False), "Source Python is not a native package gate"
+              assert Path(worker.__file__).resolve().is_relative_to(Path(sys._MEIPASS).resolve())
+              assert vtk.vtkVersion.GetVTKVersion() == "9.2.6"
+              # Exercise aliased TEMP paths even when the runner uses long names.
+              temporary = root / "temporary" / "alias"
+              temporary.mkdir(parents=True)
+              tempfile.tempdir = str(temporary / "..")
+              phase("GUI setup")
+              app = QApplication.instance() or QApplication([])
+              window = MainWindow()
+              window.show()
+
+              def wait(predicate):
+                  deadline = time.monotonic() + 60
+                  while not predicate():
+                      if time.monotonic() > deadline:
+                          raise TimeoutError("Packaged mapping did not complete")
+                      app.processEvents()
+                      time.sleep(0.005)
+                  app.processEvents()
+
+              try:
+                  phase("mesh loading")
+                  points = vtk.vtkPoints()
+                  coordinates = np.array([[0., 0., 0.], [2., 0., 0.], [0., 2., 0.]], dtype=np.float64)
+                  points.SetData(numpy_to_vtk(coordinates, deep=True))
+                  cells = vtk.vtkCellArray()
+                  cells.InsertNextCell(3, [0, 1, 2])
+                  data = vtk.vtkPolyData()
+                  data.SetPoints(points)
+                  data.SetPolys(cells)
+                  path = root / "target.vtp"
+                  writer = vtk.vtkXMLPolyDataWriter()
+                  writer.SetFileName(str(path))
+                  writer.SetInputData(data)
+                  assert writer.Write() == 1
+                  window.mesh_manager.load(str(path), "RAS")
+                  wait(lambda: window._mesh_loader_thread is None)
+                  key = next(iter(window.mesh_layers))
+                  window.tractogram_data = nib.streamlines.ArraySequence([
+                      np.array([[0.25, 0.25, -0.1], [0.25, 0.25, 0.1]], dtype=np.float32)])
+                  window.visible_indices = {0}
+                  window.manual_visible_indices = {0}
+                  window._tractogram_data_version += 1
+                  window._visibility_version += 1
+                  manager = window.surface_mapping_manager
+                  phase("endpoint computation")
+                  assert manager.start(key, SurfaceMappingParameters())
+                  wait(lambda: not manager.busy)
+                  assert manager.current, manager.message
+                  assert manager.bundle.result.diagnostics.assigned_endpoints == 2
+                  manager.set_display("map_enabled", True)
+                  manager.set_display("density_enabled", True)
+                  window.mesh_manager.fit(key)
+                  panel = window.vtk_panel
+                  camera = panel.scene.GetActiveCamera()
+
+                  def state():
+                      return (camera.GetPosition(), camera.GetFocalPoint(), camera.GetViewUp(),
+                              panel.render_window.GetSize(), panel.scene.GetViewport(),
+                              panel.scene.GetBackground(),
+                              [(prop, prop.GetVisibility()) for prop in panel.scene.GetViewProps()])
+
+                  before = state()
+                  phase("endpoint export")
+                  paths = manager.export_to(root / "mapping", figure_options=FigureOptions(800, 600))
+                  assert paths and state() == before and manager.current
+                  phase("VTP validation")
+                  for role in ("surface", "points"):
+                      reader = vtk.vtkXMLPolyDataReader()
+                      reader.SetFileName(str(paths[role]))
+                      reader.Update()
+                      output = reader.GetOutput()
+                      assert vtk_to_numpy(output.GetPoints().GetData()).dtype == np.float64
+                      assert output.GetFieldData().GetAbstractArray("SPACE").GetValue(0) == "RAS"
+                      attributes = output.GetCellData() if role == "surface" else output.GetPointData()
+                      ids = attributes.GetArray("triangle_id" if role == "surface" else "streamline_id")
+                      assert vtk_to_numpy(ids).dtype == np.int64
+                      if role == "surface":
+                          np.testing.assert_array_equal(vtk_to_numpy(output.GetPoints().GetData()), coordinates)
+                          assert output.GetNumberOfPolys() == 1
+                          values = vtk_to_numpy(output.GetPointData().GetArray("endpoint_contributions"))
+                          np.testing.assert_allclose(values.sum(), 2)
+                          assert "mm" in output.GetFieldData().GetAbstractArray("endpoint_density_units").GetValue(0)
+                      else:
+                          assert output.GetNumberOfVerts() == 2
+                  phase("PNG validation")
+                  reader = vtk.vtkPNGReader()
+                  reader.SetFileName(str(paths["figure"]))
+                  reader.Update()
+                  image = reader.GetOutput()
+                  assert image.GetDimensions() == (800, 600, 1)
+                  pixels = vtk_to_numpy(image.GetPointData().GetScalars())
+                  assert pixels.shape[1] == 3 and np.std(pixels) > 5
+                  assert paths["figure"].read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+                  sidecar = json.loads(paths["figure_metadata"].read_text("utf-8"))
+                  assert sidecar["legend"]["visible"] and "mm" in sidecar["legend"]["title"]
+                  phase("screenshot")
+                  from PyQt6.QtWidgets import QFileDialog
+                  screenshot = root / "existing-screenshot.png"
+                  original_dialog = QFileDialog.getSaveFileName
+                  QFileDialog.getSaveFileName = lambda *args, **kwargs: (str(screenshot), "PNG")
+                  try:
+                      panel.take_screenshot()
+                  finally:
+                      QFileDialog.getSaveFileName = original_dialog
+                  assert screenshot.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n" and state() == before
+                  provenance = json.loads(paths["provenance"].read_text("utf-8"))
+                  assert provenance["coordinate_units"] == "mm"
+                  for record in provenance["files"]:
+                      assert hashlib.sha256((root / record["name"]).read_bytes()).hexdigest() == record["sha256"]
+                  phase("translucent export")
+                  window.mesh_manager.set_opacity(key, 0.4)
+                  before = state()
+                  assert manager.export_to(root / "translucent", scientific=False,
+                                           figure_options=FigureOptions(640, 480))
+                  assert state() == before
+                  try:
+                      FigureOptions(transparent=True)
+                  except ValueError:
+                      pass
+                  else:
+                      raise AssertionError("Unverified RGBA must remain disabled")
+                  manager.remove()
+                  phase("intersection computation")
+                  assert manager.start(key, SurfaceMappingParameters(mode="surface_intersections"))
+                  wait(lambda: not manager.busy)
+                  assert manager.current and manager.bundle.result.diagnostics.crossing_events == 1
+                  phase("intersection export")
+                  manager.export_to(root / "intersections")
+                  manager.remove()
+                  phase("surface polygon smoke")
+                  from tractedit_pkg.mesh.polygon import load_surface
+                  from tractedit_pkg.mesh.polygon_io import (
+                      read_obj_pair,
+                      read_pair,
+                      write_obj_pair,
+                      write_pair,
+                  )
+
+                  assert window.mesh_polyline_manager.polygon_editor() is not None
+                  layer = window.mesh_layers[key]
+                  surface = load_surface(layer, lambda: None)
+                  assert surface.path(0, 1) == [0, 1]
+                  loop = np.array([0, 1, 2, 0], dtype=np.int64)
+                  poly_faces = surface.region(loop.tolist(), 0)
+                  assert np.array_equal(poly_faces, np.array([0], dtype=np.int64))
+                  poly_region = {"loop": loop, "faces": poly_faces, "digest": surface.digest}
+                  vtp_pair = (root / "smoke_polygon.vtp", root / "smoke_patch.vtp")
+                  write_pair(vtp_pair, surface, poly_region, layer)
+                  assert np.array_equal(read_pair(*vtp_pair, surface, layer)["faces"], poly_faces)
+                  obj_pair = (root / "smoke_polygon.obj", root / "smoke_patch.obj")
+                  poly_color = (0.2, 0.6, 0.9)
+                  write_obj_pair(obj_pair, surface, poly_region, layer, poly_color)
+                  obj_region, obj_color = read_obj_pair(
+                      *obj_pair, surface, layer, return_color=True
+                  )
+                  assert np.array_equal(obj_region["faces"], poly_faces)
+                  assert np.allclose(obj_color, poly_color)
+                  assert not window._background_workers
+                  scope_code = SurfaceMappingRequest.__post_init__.__code__
+                  scope_signature = hashlib.sha256(scope_code.co_code + repr(scope_code.co_names).encode()).hexdigest()
+                  phase("result publication")
+                  (root / "result.json").write_text(json.dumps({"status": "PASS", "vtk": vtk.vtkVersion.GetVTKVersion(),
+                      "scope_signature": scope_signature,
+                      "worker_module": worker.__file__, "executable": sys.executable,
+                      "checks": "frozen nested worker; endpoint/intersection; VTP float64/int64/RAS/mm; PNG RGB/legend; checksums; translucency/restoration; RGBA disabled; surface polygon VTP/OBJ roundtrip"}), "utf-8")
+              except BaseException:
+                  (root / "error.log").write_text(traceback.format_exc(), "utf-8")
+                  raise
+              finally:
+                  window.surface_mapping_manager.close()
+                  window._shutdown_requested = True
+                  window.close()
+                  app.processEvents()
+
+          try:
+              check_mapping()
+          except BaseException:
+              (root / "error.log").write_text(traceback.format_exc(), "utf-8")
+              raise
+          '''), encoding="utf-8")
+          supervisor = root / "supervisor.py"
+          supervisor.write_text(textwrap.dedent(r'''
+          import multiprocessing
+          import multiprocessing.spawn
+          from pathlib import Path
+          import runpy
+          import sys
+
+          if __name__ == "__main__":
+              if sys.platform != "win32":
+                  from multiprocessing import resource_tracker
+
+                  resource_tracker.ensure_running()
+              multiprocessing.set_executable(sys.argv[1])
+              original = multiprocessing.spawn.get_preparation_data
+              def preparation(name):
+                  data = original(name)
+                  for key in ("sys_path", "init_main_from_name", "init_main_from_path"):
+                      data.pop(key, None)
+                  return data
+              sys.frozen = True
+              multiprocessing.spawn.get_preparation_data = preparation
+              process = multiprocessing.get_context("spawn").Process(target=runpy.run_path, args=(sys.argv[2],))
+              try:
+                  process.start()
+                  process.join(150)
+                  if process.is_alive() or process.exitcode:
+                      raise RuntimeError(f"Packaged surface mapping failed: {process.exitcode}")
+                  root = Path(sys.argv[2]).parent
+                  if (root / "error.log").is_file():
+                      raise RuntimeError("Packaged surface mapping checks failed; see error.log")
+                  if not (root / "result.json").is_file():
+                      progress = root / "phase.txt"
+                      last_phase = progress.read_text("utf-8") if progress.is_file() else "not started"
+                      raise RuntimeError(
+                          f"Packaged surface mapping exited without result.json "
+                          f"(exit code {process.exitcode}, last phase: {last_phase})"
+                      )
+              finally:
+                  if process.pid is not None:
+                      if process.is_alive():
+                          process.kill()
+                      process.join()
+                  process.close()
+          '''), encoding="utf-8")
+          env = os.environ.copy()
+          for name in ("PYTHONPATH", "PYTHONHOME", "QT_QPA_PLATFORM", "APPIMAGE_EXTRACT_AND_RUN"):
+              env.pop(name, None)
+          if env["TARGET"] == "appimage":
+              env["APPIMAGE_EXTRACT_AND_RUN"] = "1"
+          command = [env["VERIFIER"], "-B", str(supervisor), env["EXECUTABLE"], str(payload)]
+          if env["RUNNER_OS"] == "Linux":
+              command = ["xvfb-run", "-a", *command]
+          try:
+              subprocess.run(command, cwd=root, env=env, check=True, timeout=180)
+          finally:
+              for name in ("phase.txt", "result.json", "error.log"):
+                  path = root / name
+                  if path.exists():
+                      print(path.read_text("utf-8"))
+      - name: Diagnose macOS GUI failure
+        if: always() && matrix.enabled && runner.os == 'macOS' && steps.packaged-gui.outcome == 'failure'
+        shell: python {0}
+        run: |
+          from pathlib import Path
+          import time
+
+          evidence = Path("evidence")
+          evidence.mkdir(exist_ok=True)
+          sections = []
+          log = evidence / "gui.log"
+          if log.is_file():
+              with log.open("rb") as stream:
+                  stream.seek(max(0, log.stat().st_size - 8000))
+                  sections.append("--- gui.log tail ---\n" + stream.read(8000).decode("utf-8", errors="replace"))
+          recent = []
+          for root in (Path.home() / "Library/Logs/DiagnosticReports", Path("/Library/Logs/DiagnosticReports")):
+              if root.is_dir():
+                  recent.extend(path for path in root.glob("TractEdit*")
+                                if path.suffix in (".ips", ".crash") and path.stat().st_mtime >= time.time() - 900)
+          for path in sorted(recent, key=lambda item: item.stat().st_mtime, reverse=True)[:3]:
+              with path.open("rb") as stream:
+                  sections.append(f"--- {path.name} ---\n" + stream.read(24000).decode("utf-8", errors="replace"))
+          if not recent:
+              sections.append("No recent TractEdit macOS crash report was available.")
+          diagnostic = "\n".join(sections)
+          (evidence / "macos-crash.log").write_text(diagnostic, "utf-8")
+          print(diagnostic)
+
       - name: Diagnose Windows GUI crash
         if: always() && matrix.enabled && matrix.target == 'exe' && steps.packaged-gui.outcome == 'failure'
         shell: pwsh
@@ -2250,15 +3369,50 @@ jobs:
         run: |
           import os
           import subprocess
-          subprocess.run(["hdiutil", "detach", os.environ["DMG_MOUNT"]],
-                         check=True, timeout=30)
+          mount = os.environ["DMG_MOUNT"]
+          result = subprocess.run(["hdiutil", "detach", mount],
+                                  capture_output=True, text=True, check=False, timeout=30)
+          print(result.stdout, result.stderr)
+          if result.returncode == 16:  # EBUSY: the test image was mounted read-only.
+              try:
+                  holders = subprocess.run(["lsof", "-nP", "+f", "--", mount],
+                                           capture_output=True, text=True, check=False, timeout=10)
+                  print(holders.stdout[-16000:], holders.stderr[-4000:])
+              except (OSError, subprocess.TimeoutExpired) as error:
+                  print(f"Could not inspect DMG holders: {error}")
+              result = subprocess.run(["hdiutil", "detach", "-force", mount],
+                                      capture_output=True, text=True, check=False, timeout=30)
+              print(result.stdout, result.stderr)
+          result.check_returncode()
       - name: Report validation diagnostics
         if: always() && matrix.enabled
         shell: python {0}
+        env:
+          VALIDATION_STEPS: ${{ toJSON(steps) }}
         run: |
+          import json
           import os
           from pathlib import Path
 
+          steps = json.loads(os.environ["VALIDATION_STEPS"])
+
+          def result(*identities):
+              outcomes = [steps.get(key, {}).get("outcome") for key in identities]
+              for outcome, label in (("failure", "FAIL"), ("cancelled", "CANCELLED")):
+                  if outcome in outcomes:
+                      return label
+              if all(outcome == "success" for outcome in outcomes):
+                  return "PASS"
+              return "SKIP" if "skipped" in outcomes else "NOT RUN"
+
+          identity = "identity" if os.environ["TARGET"] == "appimage" else "package-identity"
+          checks = (
+              ("Package identity", result(identity)),
+              ("Conversion, TDI and invalid input", result("scientific-run", "scientific-checks")),
+              ("Advanced worker", result("advanced-worker")),
+              ("GUI and mesh display", result("packaged-gui")),
+              ("Surface mapping and exports", result("surface-mapping")),
+          )
           root = Path("evidence")
           reports = sorted(
               path for path in root.rglob("*")
@@ -2276,8 +3430,10 @@ jobs:
               print(tail)
               remaining -= limit
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
-              summary.write("### Validation diagnostics\n\n")
-              summary.write(f"{len(reports)} text reports/logs generated; bounded excerpts are in this step's log.\n\n")
-              summary.write("Only application packages are uploaded as artifacts. Screenshots remain temporary runner files.\n")
+              summary.write("### Validation results\n\n")
+              summary.write("| Check | Result |\n| --- | --- |\n")
+              for label, status in checks:
+                  summary.write(f"| {label} | {status} |\n")
+              summary.write("\nDetails are in the **Report validation diagnostics** step log.\n")
     env:
       TARGET: ${{ matrix.target }}

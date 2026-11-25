@@ -7,13 +7,8 @@ from unittest.mock import Mock
 import numpy as np
 from fury import window
 
+from tests.conftest import vtk_matrix_to_numpy as _vtk_matrix_to_numpy
 from tractedit_pkg.visualization.vtk_panel import VTKPanel
-
-
-def _vtk_matrix_to_numpy(matrix) -> np.ndarray:
-    return np.array(
-        [[matrix.GetElement(row, col) for col in range(4)] for row in range(4)]
-    )
 
 
 def test_anatomical_views_share_pipeline_and_keep_oblique_affine():

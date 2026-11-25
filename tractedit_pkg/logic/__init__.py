@@ -11,10 +11,14 @@ from .roi_manager import ROIManager
 from .state_manager import StateManager
 from .scalar_manager import ScalarManager
 from .connectivity import ConnectivityManager
+from .image_loader import ImageLoaderManager
+from .odf_manager import ODFManager
 
 __all__ = [
     "ROIManager",
     "StateManager",
     "ScalarManager",
     "ConnectivityManager",
+    "ImageLoaderManager",
+    "ODFManager",
 ]

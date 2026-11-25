@@ -26,9 +26,9 @@ from tractedit_pkg.utils import (
 
 
 @pytest.fixture
-def mock_main_window():
+def mock_main_window(make_mock_main_window):
     """Creates a mock MainWindow with the minimum attributes for StateManager."""
-    mw = MagicMock()
+    mw = make_mock_main_window()
 
     # Core state
     mw.unified_undo_stack = []
@@ -37,16 +37,9 @@ def mock_main_window():
     mw.visible_indices = {0, 1, 2, 3, 4}
     mw.selected_streamline_indices = set()
     mw.selection_radius_3d = DEFAULT_SELECTION_RADIUS
-    mw.tractogram_data = MagicMock()  # Non-None to indicate loaded data
     mw._skip_user_disabled = False
 
-    # ROI state
-    mw.roi_layers = {}
-    mw.roi_states = {}
-    mw.roi_intersection_cache = {}
-
     # VTK panel (mocked)
-    mw.vtk_panel = MagicMock()
     mw.vtk_panel.radius_actor = MagicMock()
     mw.vtk_panel.radius_actor.GetVisibility.return_value = False
 
@@ -183,7 +176,9 @@ class TestStreamlineUndoRedo:
         state_manager.perform_undo()
 
         assert mock_main_window._skip_user_disabled is False
-        mock_main_window._auto_calculate_skip_level.assert_called_once()
+        mock_main_window.roi_manager.apply_logic_filters.assert_called_once_with(
+            recalculate_skip=True
+        )
 
 
 # ============================================================================

@@ -15,7 +15,7 @@ followed by precise geometric checks with parallel AOT-compiled processing.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, List, Set
+from typing import TYPE_CHECKING, Set
 
 import numpy as np
 import vtk
@@ -29,11 +29,6 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # AOT-compiled functions (imported from pre-compiled extension)
 # ============================================================================
-
-from tractedit_pkg._numba_aot import (  # noqa: E402
-    check_streamline_sphere_intersection as _check_streamline_sphere_intersection,
-)
-
 
 # _batch_check_sphere_intersection — AOT chunk + ThreadPool wrapper
 from tractedit_pkg._numba_aot._parallel_wrappers import (
@@ -49,6 +44,7 @@ from tractedit_pkg._numba_aot._parallel_wrappers import (
 )
 
 
+from ..render_batch import batch_render
 from ..utils import MAX_HIGHLIGHT_STREAMLINES
 
 
@@ -356,227 +352,65 @@ class SelectionManager:
         self._cached_visible_array = None
         self._cached_visibility_version = -1
 
+    def _select_broad_phase_candidates(
+        self, lower, upper, check_all, *, prefilter_visible=True
+    ):
+        mw = self.panel.main_window
+        bboxes = mw.streamline_bboxes
+        visible = None
+        if prefilter_visible and not check_all:
+            if 0 < len(mw.visible_indices) < len(mw.tractogram_data) * 0.1:
+                visible = self._get_cached_visible_array()
+                bboxes = bboxes[visible]
+
+        overlap = np.all(bboxes[:, 1] >= lower, axis=1) & np.all(
+            bboxes[:, 0] <= upper, axis=1
+        )
+        if visible is not None:
+            return visible[overlap]
+        return self._filter_visible_candidates(np.flatnonzero(overlap), check_all)
+
+    def _run_narrow_phase(self, candidates, batch_kernel, *args):
+        if not len(candidates):
+            return set()
+        data, offsets, valid = _prepare_batch_data_fast(
+            self.panel.main_window.tractogram_data, candidates
+        )
+        if not len(data):
+            return set()
+        hits = batch_kernel(data, offsets, *args)
+        return set(candidates[valid & hits].tolist())
+
+    def _has_selection_data(self):
+        mw = self.panel.main_window
+        return mw and mw.tractogram_data and mw.streamline_bboxes is not None
+
     def find_streamlines_in_radius(
         self, center_point: np.ndarray, radius: float, check_all: bool = False
     ) -> Set[int]:
-        """
-        Find streamlines within a sphere using optimized batch processing.
-
-        Uses vectorized bounding box checks (Broad Phase) followed by parallel
-        AOT-optimized geometric checks (Narrow Phase).
-
-        When working with filtered tractograms, pre-filters to visible indices
-        before the broad phase to avoid checking millions of irrelevant bboxes.
-
-        Args:
-            center_point: Center of the sphere in world coordinates.
-            radius: Radius of the search sphere.
-            check_all: If True, check all streamlines; if False, only visible ones.
-
-        Returns:
-            Set of streamline indices within the sphere.
-        """
-        if (
-            not self.panel.main_window
-            or not self.panel.main_window.tractogram_data
-            or self.panel.main_window.streamline_bboxes is None
-        ):
+        """Find streamlines intersecting the sphere in world coordinates."""
+        if not self._has_selection_data():
             return set()
-
-        tractogram = self.panel.main_window.tractogram_data
-        bboxes = self.panel.main_window.streamline_bboxes
-        total_streamlines = len(tractogram)
-
-        # Sphere bounds for AABB check
-        sphere_min = center_point - radius
-        sphere_max = center_point + radius
-
-        # OPTIMIZATION: Pre-filter by visibility when visible set is much smaller
-        # than the full tractogram. This avoids checking millions of bboxes.
-        if not check_all:
-            visible_indices = self.panel.main_window.visible_indices
-            visible_count = len(visible_indices)
-
-            # If visible is <10% of total, pre-filter first (faster path)
-            if visible_count < total_streamlines * 0.1 and visible_count > 0:
-                # Use cached visible array (avoids repeated np.fromiter calls)
-                visible_arr = self._get_cached_visible_array()
-
-                # Check only visible bboxes
-                visible_bboxes = bboxes[visible_arr]
-                overlap_mask = np.all(
-                    visible_bboxes[:, 1] >= sphere_min, axis=1
-                ) & np.all(visible_bboxes[:, 0] <= sphere_max, axis=1)
-
-                # Get candidates directly from visible set
-                valid_candidates = visible_arr[overlap_mask]
-
-                if len(valid_candidates) == 0:
-                    return set()
-
-                # Skip to NARROW PHASE (already filtered by visibility)
-                radius_sq = radius * radius
-                center_c = np.ascontiguousarray(center_point, dtype=np.float64)
-
-                streamline_data, offsets, valid_mask = _prepare_batch_data_fast(
-                    tractogram, valid_candidates
-                )
-
-                if streamline_data.shape[0] == 0:
-                    return set()
-
-                intersection_results = _batch_check_sphere_intersection(
-                    streamline_data, offsets, center_c, radius_sq
-                )
-
-                final_mask = valid_mask & intersection_results
-                return set(valid_candidates[final_mask].tolist())
-
-        # STANDARD PATH: BROAD PHASE on all bboxes
-        # Used when check_all=True or visible count is large (>10% of total)
-        overlap_mask = np.all(bboxes[:, 1] >= sphere_min, axis=1) & np.all(
-            bboxes[:, 0] <= sphere_max, axis=1
+        candidates = self._select_broad_phase_candidates(
+            center_point - radius, center_point + radius, check_all
         )
-
-        candidate_indices = np.where(overlap_mask)[0]
-
-        # Filter by visibility using vectorized intersection
-        valid_candidates = self._filter_visible_candidates(candidate_indices, check_all)
-
-        if len(valid_candidates) == 0:
-            return set()
-
-        # NARROW PHASE: Parallel AOT Geometric Check
-        radius_sq = radius * radius
-        center_c = np.ascontiguousarray(center_point, dtype=np.float64)
-
-        # Prepare batch data for parallel processing
-        streamline_data, offsets, valid_mask = _prepare_batch_data_fast(
-            tractogram, valid_candidates
+        return self._run_narrow_phase(
+            candidates, _batch_check_sphere_intersection,
+            np.ascontiguousarray(center_point, dtype=np.float64), radius * radius,
         )
-
-        if streamline_data.shape[0] == 0:
-            return set()
-
-        # Run parallel batch intersection check
-        intersection_results = _batch_check_sphere_intersection(
-            streamline_data, offsets, center_c, radius_sq
-        )
-
-        # Combine results: must be valid AND intersecting
-        final_mask = valid_mask & intersection_results
-        indices_in_radius = set(valid_candidates[final_mask].tolist())
-
-        return indices_in_radius
 
     def find_streamlines_in_box(
         self, min_point: np.ndarray, max_point: np.ndarray, check_all: bool = False
     ) -> Set[int]:
-        """
-        Find streamlines within a box using optimized batch processing.
-
-        Uses vectorized bounding box checks (Broad Phase) followed by parallel
-        AOT-optimized point-in-box checks (Narrow Phase).
-
-        When working with filtered tractograms, pre-filters to visible indices
-        before the broad phase to avoid checking millions of irrelevant bboxes.
-
-        Args:
-            min_point: Minimum corner of the box in world coordinates.
-            max_point: Maximum corner of the box in world coordinates.
-            check_all: If True, check all streamlines; if False, only visible ones.
-
-        Returns:
-            Set of streamline indices within the box.
-        """
-        if (
-            not self.panel.main_window
-            or not self.panel.main_window.tractogram_data
-            or self.panel.main_window.streamline_bboxes is None
-        ):
+        """Find streamlines intersecting the axis-aligned box in world coordinates."""
+        if not self._has_selection_data():
             return set()
-
-        tractogram = self.panel.main_window.tractogram_data
-        bboxes = self.panel.main_window.streamline_bboxes
-        total_streamlines = len(tractogram)
-
-        # OPTIMIZATION: Pre-filter by visibility when visible set is much smaller
-        # than the full tractogram. This avoids checking millions of bboxes.
-        if not check_all:
-            visible_indices = self.panel.main_window.visible_indices
-            visible_count = len(visible_indices)
-
-            # If visible is <10% of total, pre-filter first (faster path)
-            if visible_count < total_streamlines * 0.1 and visible_count > 0:
-                # Use cached visible array (avoids repeated np.fromiter calls)
-                visible_arr = self._get_cached_visible_array()
-
-                # Check only visible bboxes
-                visible_bboxes = bboxes[visible_arr]
-                overlap_mask = np.all(
-                    visible_bboxes[:, 1] >= min_point, axis=1
-                ) & np.all(visible_bboxes[:, 0] <= max_point, axis=1)
-
-                # Get candidates directly from visible set
-                valid_candidates = visible_arr[overlap_mask]
-
-                if len(valid_candidates) == 0:
-                    return set()
-
-                # Skip to NARROW PHASE (already filtered by visibility)
-                box_min_c = np.ascontiguousarray(min_point, dtype=np.float64)
-                box_max_c = np.ascontiguousarray(max_point, dtype=np.float64)
-
-                streamline_data, offsets, valid_mask = _prepare_batch_data_fast(
-                    tractogram, valid_candidates
-                )
-
-                if streamline_data.shape[0] == 0:
-                    return set()
-
-                intersection_results = _batch_check_box_intersection(
-                    streamline_data, offsets, box_min_c, box_max_c
-                )
-
-                final_mask = valid_mask & intersection_results
-                return set(valid_candidates[final_mask].tolist())
-
-        # STANDARD PATH: BROAD PHASE on all bboxes
-        # Used when check_all=True or visible count is large (>10% of total)
-        overlap_mask = np.all(bboxes[:, 1] >= min_point, axis=1) & np.all(
-            bboxes[:, 0] <= max_point, axis=1
+        candidates = self._select_broad_phase_candidates(min_point, max_point, check_all)
+        return self._run_narrow_phase(
+            candidates, _batch_check_box_intersection,
+            np.ascontiguousarray(min_point, dtype=np.float64),
+            np.ascontiguousarray(max_point, dtype=np.float64),
         )
-
-        candidate_indices = np.where(overlap_mask)[0]
-
-        # Filter by visibility using vectorized intersection
-        valid_candidates = self._filter_visible_candidates(candidate_indices, check_all)
-
-        if len(valid_candidates) == 0:
-            return set()
-
-        # NARROW PHASE: Parallel AOT Point-in-Box Check
-        box_min_c = np.ascontiguousarray(min_point, dtype=np.float64)
-        box_max_c = np.ascontiguousarray(max_point, dtype=np.float64)
-
-        # Prepare batch data for parallel processing
-        streamline_data, offsets, valid_mask = _prepare_batch_data_fast(
-            tractogram, valid_candidates
-        )
-
-        if streamline_data.shape[0] == 0:
-            return set()
-
-        # Run parallel batch box check
-        intersection_results = _batch_check_box_intersection(
-            streamline_data, offsets, box_min_c, box_max_c
-        )
-
-        # Combine results: must be valid AND intersecting
-        final_mask = valid_mask & intersection_results
-        indices_in_box = set(valid_candidates[final_mask].tolist())
-
-        return indices_in_box
 
     def find_streamlines_in_oriented_box(
         self,
@@ -586,15 +420,10 @@ class SelectionManager:
         check_all: bool = False,
     ) -> Set[int]:
         """Find streamlines intersecting an affine-oriented voxel box."""
-        if (
-            not self.panel.main_window
-            or not self.panel.main_window.tractogram_data
-            or self.panel.main_window.streamline_bboxes is None
-        ):
+        if not self._has_selection_data():
             return set()
 
-        tractogram = self.panel.main_window.tractogram_data
-        bboxes = self.panel.main_window.streamline_bboxes
+
         voxel_min = np.asarray(voxel_min, dtype=np.float64) - 0.5
         voxel_max = np.asarray(voxel_max, dtype=np.float64) + 0.5
         corners = np.array(
@@ -609,32 +438,20 @@ class SelectionManager:
         world_corners = (np.asarray(voxel_to_world) @ homogeneous.T).T[:, :3]
         world_min = world_corners.min(axis=0)
         world_max = world_corners.max(axis=0)
-        overlap = np.all(bboxes[:, 1] >= world_min, axis=1) & np.all(
-            bboxes[:, 0] <= world_max, axis=1
+        candidates = self._select_broad_phase_candidates(
+            world_min, world_max, check_all, prefilter_visible=False
         )
-        candidates = np.flatnonzero(overlap)
-        candidates = self._filter_visible_candidates(candidates, check_all)
-        if len(candidates) == 0:
-            return set()
 
-        streamline_data, offsets, valid_mask = _prepare_batch_data_fast(
-            tractogram, candidates
-        )
-        if streamline_data.shape[0] == 0:
-            return set()
+        def intersect(data, offsets):
+            world_to_voxel = np.linalg.inv(voxel_to_world)
+            linear = np.ascontiguousarray(world_to_voxel[:3, :3].T, dtype=np.float64)
+            offset = np.ascontiguousarray(world_to_voxel[:3, 3], dtype=np.float64)
+            return _batch_check_oriented_box_intersection(
+                data, offsets, linear, offset,
+                np.ascontiguousarray(voxel_min), np.ascontiguousarray(voxel_max),
+            )
 
-        world_to_voxel = np.linalg.inv(voxel_to_world)
-        linear = np.ascontiguousarray(world_to_voxel[:3, :3].T, dtype=np.float64)
-        offset = np.ascontiguousarray(world_to_voxel[:3, 3], dtype=np.float64)
-        results = _batch_check_oriented_box_intersection(
-            streamline_data,
-            offsets,
-            linear,
-            offset,
-            np.ascontiguousarray(voxel_min),
-            np.ascontiguousarray(voxel_max),
-        )
-        return set(candidates[valid_mask & results].tolist())
+        return self._run_narrow_phase(candidates, intersect)
 
     def apply_selection(
         self, indices_in_sphere: Set[int], deselect: bool = False
@@ -687,6 +504,7 @@ class SelectionManager:
         total_selected = len(current_selection)
 
         if added_count > 0 or removed_count > 0:
+            self._notify_selection_changed()
             verb = "Deselected" if deselect else "Added"
             n = removed_count if deselect else added_count
             self.panel.update_status(
@@ -700,6 +518,12 @@ class SelectionManager:
                 f"none {action}. Total selected: {total_selected:,}"
             )
 
+    def _notify_selection_changed(self) -> None:
+        mapping = getattr(self.panel.main_window, "surface_mapping_manager", None)
+        if mapping is not None:
+            mapping.selection_changed()
+
+    @batch_render(lambda self: self.panel)
     def invert_selection(self) -> None:
         """Invert the current selection against the set of visible streamlines.
 
@@ -740,6 +564,7 @@ class SelectionManager:
             restored = mw._inversion_keeper_indices.copy()
             current_selection.clear()
             current_selection.update(restored)
+            self._notify_selection_changed()
 
             mw._inversion_active = False
             mw._inversion_keeper_indices = set()
@@ -766,6 +591,7 @@ class SelectionManager:
         # Update in-place to preserve any external references to the set object.
         current_selection.clear()
         current_selection.update(new_selection)
+        self._notify_selection_changed()
 
         count = len(current_selection)
 
@@ -773,7 +599,7 @@ class SelectionManager:
         mw._inversion_keeper_indices = keeper_indices
 
         # Cyan contour on keepers is always cheap (keeper set is small).
-        self.panel.update_invert_contour()
+        self.panel.streamlines_manager.update_invert_contour()
 
         if count > MAX_HIGHLIGHT_STREAMLINES:
             self.panel.clear_highlight()
@@ -801,6 +627,7 @@ class SelectionManager:
             )
             mw._update_action_states()
 
+    @batch_render(lambda self: self.panel)
     def handle_streamline_selection(self, deselect: bool = False) -> None:
         """Handle the sphere-based streamline selection triggered by the ``S`` key.
 
@@ -831,6 +658,7 @@ class SelectionManager:
         if mw._inversion_active:
             mw.selected_streamline_indices.clear()
             mw.selected_streamline_indices.update(mw._inversion_keeper_indices)
+            self._notify_selection_changed()
             mw._inversion_active = False
             mw._inversion_keeper_indices = set()
             self.panel.clear_invert_contour()

@@ -55,6 +55,12 @@ a = Analysis(
         'tractedit_pkg.assets',
         'tractedit_pkg.main_window',
         'tractedit_pkg.file_io',
+        'tractedit_pkg.file_io.anatomical',
+        'tractedit_pkg.file_io.bundle_gui',
+        'tractedit_pkg.file_io.bundle_stats',
+        'tractedit_pkg.file_io.bbox_cache',
+        'tractedit_pkg.file_io.tractogram',
+        'tractedit_pkg.file_io.density_map',
         'tractedit_pkg.utils',
         'tractedit_pkg.odf_utils',
         'tractedit_pkg.logic',
@@ -67,6 +73,7 @@ a = Analysis(
         # PyQt6 modules
         'PyQt6.QtCore',
         'PyQt6.QtGui',
+        'PyQt6.QtNetwork',
         'PyQt6.QtWidgets',
         # VTK - comprehensive imports
         'vtkmodules',
@@ -105,10 +112,13 @@ a = Analysis(
         'numpy._core._internal',
         'scipy',
         'scipy._cyutility',
+        'scipy.sparse',
+        'scipy.spatial',
         'scipy.special._cdflib',
         'nibabel',
         'fury',
         'trx',
+        'h5py._npystrings',
         # AOT-compiled numerical extension
         'tractedit_pkg._numba_aot',
         'tractedit_pkg._numba_aot.tractedit_numba',
@@ -144,6 +154,8 @@ a = Analysis(
         'skimage',
         # Numba is build-time only (AOT extension is pre-compiled)
         'numba',
+        'tractedit_pkg._numba_aot.build_aot',
+        'tractedit_pkg._numba_aot.kernels',
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

@@ -74,7 +74,7 @@ class CustomInteractorStyle2D(vtk.vtkInteractorStyleImage):
                 # Drawing mode - set active flag and draw
                 self.vtk_panel.is_drawing_active = True
                 self.vtk_panel.draw_stroke_count = 0  # Reset counter for new stroke
-                self.vtk_panel._handle_draw_on_2d(self.GetInteractor())
+                self.vtk_panel.drawing_manager.handle_draw_on_2d(self.GetInteractor())
             else:
                 # Navigation mode - enable fast render for smooth interaction
                 self.vtk_panel.is_navigating_2d = True
@@ -95,15 +95,15 @@ class CustomInteractorStyle2D(vtk.vtkInteractorStyleImage):
                 and self.vtk_panel.main_window
                 and self.vtk_panel.main_window.current_drawing_roi
             ):
-                self.vtk_panel._finish_drawing()
+                self.vtk_panel.drawing_manager.finish_drawing()
         except Exception:
-            logger.error("Error in _finish_drawing, forcing cleanup.", exc_info=True)
+            logger.error("Error in finish_drawing, forcing cleanup.", exc_info=True)
             self.vtk_panel.drawing_manager._cleanup_preview()
         finally:
             self.vtk_panel.is_drawing_active = False
             self.vtk_panel.is_navigating_2d = False
-            self.vtk_panel._update_slow_slice_components()
             if was_navigating:
+                self.vtk_panel._update_slow_slice_components(render=False)
                 self.vtk_panel._disable_fast_render()
 
     def OnMouseMove(self, obj: vtk.vtkObject, event_id: str) -> None:
@@ -111,7 +111,7 @@ class CustomInteractorStyle2D(vtk.vtkInteractorStyleImage):
         if self.vtk_panel:
             if self.vtk_panel.is_drawing_mode and self.vtk_panel.is_drawing_active:
                 # Drawing while dragging (continuous)
-                self.vtk_panel._handle_draw_on_2d(self.GetInteractor())
+                self.vtk_panel.drawing_manager.handle_draw_on_2d(self.GetInteractor())
             elif self.vtk_panel.is_navigating_2d:
                 # If we are in navigation mode, call the logic
                 self.vtk_panel._navigate_2d_view(self.GetInteractor(), event_id)
@@ -122,31 +122,13 @@ class CustomInteractorStyle2D(vtk.vtkInteractorStyleImage):
 
     def OnMouseWheelForward(self, obj: vtk.vtkObject, event_id: str) -> None:
         """Handles mouse wheel forward."""
-        if self.vtk_panel:
-            interactor = self.GetInteractor()
-            is_ctrl = interactor.GetControlKey()
-            is_shift = interactor.GetShiftKey()
-
-            if is_ctrl and getattr(self.vtk_panel, "is_sphere_mode", False):
-                # Ctrl+scroll in sphere mode: adjust radius preview
-                view_type = "axial"
-                if interactor == self.vtk_panel.coronal_interactor:
-                    view_type = "coronal"
-                elif interactor == self.vtk_panel.sagittal_interactor:
-                    view_type = "sagittal"
-                self._adjust_preview_radius(0.5, view_type)
-            elif is_shift:
-                # Shift+scroll: navigate slices on the panel under the cursor
-                self._navigate_slice_by_scroll(interactor, direction=1)
-            else:
-                # Plain scroll: zoom in/out
-                super().OnMouseWheelForward()
-                self._update_scale_bar_for_interactor(interactor)
-        else:
-            super().OnMouseWheelForward()
+        self._handle_mouse_wheel(1)
 
     def OnMouseWheelBackward(self, obj: vtk.vtkObject, event_id: str) -> None:
         """Handles mouse wheel backward."""
+        self._handle_mouse_wheel(-1)
+
+    def _handle_mouse_wheel(self, direction: int) -> None:
         if self.vtk_panel:
             interactor = self.GetInteractor()
             is_ctrl = interactor.GetControlKey()
@@ -159,30 +141,15 @@ class CustomInteractorStyle2D(vtk.vtkInteractorStyleImage):
                     view_type = "coronal"
                 elif interactor == self.vtk_panel.sagittal_interactor:
                     view_type = "sagittal"
-                self._adjust_preview_radius(-0.5, view_type)
-            elif is_shift:
-                # Shift+scroll: navigate slices on the panel under the cursor
-                self._navigate_slice_by_scroll(interactor, direction=-1)
-            else:
-                # Plain scroll: zoom in/out
-                super().OnMouseWheelBackward()
-                self._update_scale_bar_for_interactor(interactor)
+                self._adjust_preview_radius(0.5 * direction, view_type)
+                return
+            if is_shift:
+                self._navigate_slice_by_scroll(interactor, direction=direction)
+                return
+        if direction > 0:
+            super().OnMouseWheelForward()
         else:
             super().OnMouseWheelBackward()
-
-    def _update_scale_bar_for_interactor(self, interactor) -> None:
-        """Update scale bar for the view associated with this interactor."""
-        if not self.vtk_panel:
-            return
-        if not self.vtk_panel.scale_bar_manager.is_initialized():
-            return
-
-        if interactor == self.vtk_panel.axial_interactor:
-            self.vtk_panel.scale_bar_manager.update_view("axial")
-        elif interactor == self.vtk_panel.coronal_interactor:
-            self.vtk_panel.scale_bar_manager.update_view("coronal")
-        elif interactor == self.vtk_panel.sagittal_interactor:
-            self.vtk_panel.scale_bar_manager.update_view("sagittal")
 
     def _navigate_slice_by_scroll(self, interactor, direction: int) -> None:
         """
@@ -262,7 +229,7 @@ class CustomInteractorStyle2D(vtk.vtkInteractorStyleImage):
             with signals_blocked(mw.sphere_radius_spinbox):
                 mw.sphere_radius_spinbox.setValue(self._preview_radius)
 
-        self.vtk_panel.update_status(
+        self.vtk_panel.update_progress_status(
             f"(Preview) Radius: {self._preview_radius:.1f} mm - Release Ctrl to apply"
         )
 
@@ -296,7 +263,7 @@ class CustomInteractorStyle2D(vtk.vtkInteractorStyleImage):
 
         try:
             if is_moving:
-                self.vtk_panel._finish_drawing()
+                self.vtk_panel.drawing_manager.finish_drawing()
             elif self._is_adjusting_radius:
                 if hasattr(mw, "_on_sphere_radius_changed"):
                     mw._on_sphere_radius_changed()
@@ -318,7 +285,7 @@ class CustomInteractorStyle2D(vtk.vtkInteractorStyleImage):
 
         try:
             if is_moving:
-                self.vtk_panel._finish_drawing()
+                self.vtk_panel.drawing_manager.finish_drawing()
         except Exception:
             logger.error("Error applying rectangle preview.", exc_info=True)
             self.vtk_panel.drawing_manager._cleanup_preview()

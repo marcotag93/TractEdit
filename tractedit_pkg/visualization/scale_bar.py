@@ -314,6 +314,7 @@ class ScaleBarManager:
         self._renderers: Dict[str, vtk.vtkRenderer] = {}
         self._cameras: Dict[str, vtk.vtkCamera] = {}
         self._initialized = False
+        self._camera_observers = {}
 
     def initialize(
         self,
@@ -335,6 +336,8 @@ class ScaleBarManager:
             coronal_camera: Camera for coronal view.
             sagittal_camera: Camera for sagittal view.
         """
+        if self._initialized:
+            self.clear()
         # Store references
         self._renderers = {
             "axial": axial_renderer,
@@ -360,6 +363,9 @@ class ScaleBarManager:
             )
             scale_bar.add_to_renderer(self._renderers[view])
             self._scale_bars[view] = scale_bar
+            self._camera_observers[view] = self._cameras[view].AddObserver(
+                "ModifiedEvent", lambda obj, event, view=view: self.update_view(view)
+            )
 
         self._initialized = True
         logger.debug("Scale bars initialized for all 2D views")
@@ -406,11 +412,10 @@ class ScaleBarManager:
             if renderer and scale_bar:
                 scale_bar.remove_from_renderer(renderer)
 
+        for view, observer in self._camera_observers.items():
+            self._cameras[view].RemoveObserver(observer)
+        self._camera_observers.clear()
         self._scale_bars.clear()
         self._renderers.clear()
         self._cameras.clear()
         self._initialized = False
-
-    def is_initialized(self) -> bool:
-        """Check if scale bars are initialized."""
-        return self._initialized

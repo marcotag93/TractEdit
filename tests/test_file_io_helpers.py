@@ -1,15 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Unit tests for tractedit_pkg/file_io.py helper functions.
+Unit tests for tractedit_pkg/file_io/ helper functions.
 
 Tests parsing utilities, AOT-compiled functions, MemoryMappedImage,
 and TRX bbox caching (Phase 1 of TRX optimisation plan).
 Avoids GUI components (QThread-based classes) for headless compatibility.
 """
 
-import os
-import shutil
-import tempfile
+from contextlib import closing
 
 import pytest
 import numpy as np
@@ -35,111 +33,38 @@ from tractedit_pkg.file_io import (
 class TestParseNumericTupleFromString:
     """Tests for the parse_numeric_tuple_from_string function."""
 
-    # ========================================================================
-    # String Input Tests
-    # ========================================================================
-
-    def test_parse_tuple_string_parentheses(self):
-        """Parse string with parentheses: '(1, 2, 3)'."""
-        result = parse_numeric_tuple_from_string("(1, 2, 3)")
-        assert result == (1.0, 2.0, 3.0)
-
-    def test_parse_tuple_string_brackets(self):
-        """Parse string with brackets: '[1, 2, 3]'."""
-        result = parse_numeric_tuple_from_string("[1, 2, 3]")
-        assert result == (1.0, 2.0, 3.0)
-
-    def test_parse_space_separated(self):
-        """Parse space-separated string: '1 2 3'."""
-        result = parse_numeric_tuple_from_string("1 2 3")
-        assert result == (1.0, 2.0, 3.0)
-
-    def test_parse_comma_separated(self):
-        """Parse comma-separated without brackets: '1, 2, 3'."""
-        result = parse_numeric_tuple_from_string("1, 2, 3")
-        assert result == (1.0, 2.0, 3.0)
-
-    def test_parse_mixed_separators(self):
-        """Parse mixed separators: '1,2 3'."""
-        result = parse_numeric_tuple_from_string("1,2 3")
-        assert result == (1.0, 2.0, 3.0)
-
-    def test_parse_floats(self):
-        """Parse float values: '(1.5, 2.7, 3.9)'."""
-        result = parse_numeric_tuple_from_string("(1.5, 2.7, 3.9)")
-        assert result == pytest.approx((1.5, 2.7, 3.9))
-
-    def test_parse_negative_values(self):
-        """Parse negative values: '(-1, -2.5, 3)'."""
-        result = parse_numeric_tuple_from_string("(-1, -2.5, 3)")
-        assert result == (-1.0, -2.5, 3.0)
-
-    def test_parse_integer_type(self):
-        """Parse with integer target type."""
-        result = parse_numeric_tuple_from_string("(1.9, 2.1, 3.5)", target_type=int)
-        assert result == (1, 2, 3)
-
-    # ========================================================================
-    # Length Validation Tests
-    # ========================================================================
-
-    def test_expected_length_match(self):
-        """Parse with matching expected length."""
-        result = parse_numeric_tuple_from_string("(1, 2, 3)", expected_length=3)
-        assert result == (1.0, 2.0, 3.0)
-
-    def test_expected_length_mismatch(self):
-        """Returns original string when length doesn't match."""
-        original = "(1, 2, 3)"
-        result = parse_numeric_tuple_from_string(original, expected_length=2)
-        assert result == original
-
-    # ========================================================================
-    # Non-String Input Tests
-    # ========================================================================
-
-    def test_list_passthrough(self):
-        """Lists should be converted to tuples."""
-        result = parse_numeric_tuple_from_string([1, 2, 3])
-        assert result == (1.0, 2.0, 3.0)
-
-    def test_tuple_passthrough(self):
-        """Tuples should pass through with type conversion."""
-        result = parse_numeric_tuple_from_string((1, 2, 3))
-        assert result == (1.0, 2.0, 3.0)
+    @pytest.mark.parametrize(
+        "value, options, expected",
+        [
+            pytest.param("(1, 2, 3)", {}, (1.0, 2.0, 3.0), id="parentheses"),
+            pytest.param("[1, 2, 3]", {}, (1.0, 2.0, 3.0), id="brackets"),
+            pytest.param("1 2 3", {}, (1.0, 2.0, 3.0), id="space-separated"),
+            pytest.param("1, 2, 3", {}, (1.0, 2.0, 3.0), id="comma-separated"),
+            pytest.param("1,2 3", {}, (1.0, 2.0, 3.0), id="mixed-separators"),
+            pytest.param("(1.5, 2.7, 3.9)", {}, pytest.approx((1.5, 2.7, 3.9)), id="floats"),
+            pytest.param("(-1, -2.5, 3)", {}, (-1.0, -2.5, 3.0), id="negative"),
+            pytest.param("(1.9, 2.1, 3.5)", {"target_type": int}, (1, 2, 3), id="integer"),
+            pytest.param("(1, 2, 3)", {"expected_length": 3}, (1.0, 2.0, 3.0), id="length-match"),
+            pytest.param("(1, 2, 3)", {"expected_length": 2}, "(1, 2, 3)", id="length-mismatch"),
+            pytest.param([1, 2, 3], {}, (1.0, 2.0, 3.0), id="list"),
+            pytest.param((1, 2, 3), {}, (1.0, 2.0, 3.0), id="tuple"),
+            pytest.param("", {}, "", id="empty"),
+            pytest.param("not a number", {}, "not a number", id="invalid"),
+            pytest.param("(1e-3, 2e5)", {}, pytest.approx((0.001, 200000.0)), id="scientific"),
+        ],
+    )
+    def test_parse(self, value, options, expected):
+        assert parse_numeric_tuple_from_string(value, **options) == expected
 
     def test_numpy_array_passthrough(self):
-        """NumPy arrays should be returned with dtype conversion."""
         arr = np.array([1, 2, 3], dtype=np.int32)
         result = parse_numeric_tuple_from_string(arr, target_type=float)
         assert isinstance(result, np.ndarray)
         assert result.dtype == np.float64
 
-    # ========================================================================
-    # Edge Cases
-    # ========================================================================
-
-    def test_empty_string(self):
-        """Empty string should return as-is."""
-        result = parse_numeric_tuple_from_string("")
-        assert result == ""
-
-    def test_invalid_string(self):
-        """Invalid string should return as-is."""
-        original = "not a number"
-        result = parse_numeric_tuple_from_string(original)
-        assert result == original
-
     def test_single_value(self):
-        """Single value string parses to scalar."""
         result = parse_numeric_tuple_from_string("42")
-        # Function returns scalar or single-element tuple depending on context
         assert result == 42.0 or result == (42.0,)
-
-    def test_scientific_notation(self):
-        """Scientific notation should be parsed."""
-        result = parse_numeric_tuple_from_string("(1e-3, 2e5)")
-        assert result == pytest.approx((0.001, 200000.0))
 
 
 class TestComputeBboxesNumba:
@@ -287,25 +212,10 @@ class TestMemoryMappedImage:
 class TestAnatomicalAlignment:
     """Tests for canonical orientation without changing scanner-RAS geometry."""
 
-    @staticmethod
-    def _oblique_affine() -> np.ndarray:
-        angle = np.deg2rad(12.0)
-        rotation = np.array(
-            [
-                [np.cos(angle), -np.sin(angle), 0.0],
-                [np.sin(angle), np.cos(angle), 0.0],
-                [0.0, 0.0, 1.0],
-            ]
-        )
-        affine = np.eye(4)
-        affine[:3, :3] = rotation @ np.diag([0.5, 0.75, 1.25])
-        affine[:3, 3] = [-12.0, 8.0, 21.0]
-        return affine
-
-    def test_canonical_ras_oblique_preserves_data_and_affine(self, tmp_path):
+    def test_canonical_ras_oblique_preserves_data_and_affine(self, tmp_path, oblique_affine):
         data = np.arange(9 * 10 * 11, dtype=np.int16).reshape(9, 10, 11)
         path = tmp_path / "oblique.nii.gz"
-        nib.save(nib.Nifti1Image(data, self._oblique_affine()), path)
+        nib.save(nib.Nifti1Image(data, oblique_affine), path)
         image = nib.load(path)
         statuses = []
 
@@ -532,16 +442,53 @@ def _create_trx_with_bboxes(
         streamlines=streamlines,
         affine_to_rasmm=np.eye(4),
     )
-    trx_obj = tbx.TrxFile.from_tractogram(tractogram, ref)
-    _embed_cached_bboxes(trx_obj, bboxes)
-    tbx.save(trx_obj, path)
+    with closing(tbx.TrxFile.from_tractogram(tractogram, ref)) as trx_obj:
+        _embed_cached_bboxes(trx_obj, bboxes)
+        tbx.save(trx_obj, path)
+
+
+@pytest.fixture
+def load_trx(request):
+    def load(path):
+        trx = tbx.load(path)
+        request.addfinalizer(trx.close)
+        return trx
+
+    return load
+
+
+@pytest.fixture
+def make_trx_source(tmp_path, sample_streamlines, load_trx):
+    def make(filename="source.trx", data_per_point=None):
+        tractogram = nib.streamlines.Tractogram(
+            streamlines=sample_streamlines,
+            data_per_point=data_per_point,
+            affine_to_rasmm=np.eye(4),
+        )
+        path = str(tmp_path / filename)
+        with closing(tbx.TrxFile.from_tractogram(tractogram, _make_reference_image())) as trx:
+            tbx.save(trx, path)
+        return load_trx(path)
+
+    return make
+
+
+@pytest.fixture
+def scalar_trx_source(sample_streamlines, make_trx_source):
+    scalars = []
+    offset = 0
+    for streamline in sample_streamlines:
+        end = offset + len(streamline)
+        scalars.append(np.arange(offset, end, dtype=np.float32).reshape(-1, 1))
+        offset = end
+    return make_trx_source("with_scalars.trx", {"test_scalar": scalars}), scalars
 
 
 class TestTryLoadCachedBboxes:
     """Tests for _try_load_cached_bboxes (Phase 1 load path)."""
 
     @pytest.mark.numba
-    def test_cache_hit_returns_correct_bboxes(self, sample_streamlines):
+    def test_cache_hit_returns_correct_bboxes(self, sample_streamlines, tmp_path, load_trx):
         """Load cached bboxes from a TRX file saved by TractEdit."""
         # Compute ground-truth bboxes
         bboxes_gt = _compute_bboxes_numba(
@@ -550,50 +497,36 @@ class TestTryLoadCachedBboxes:
             sample_streamlines._lengths,
         )
         n = len(sample_streamlines)
-        tmp = tempfile.mkdtemp()
-        trx_loaded = None
-        try:
-            trx_path = os.path.join(tmp, "test_cache_hit.trx")
-            _create_trx_with_bboxes(sample_streamlines, bboxes_gt, trx_path)
+        trx_path = str(tmp_path / "test_cache_hit.trx")
+        _create_trx_with_bboxes(sample_streamlines, bboxes_gt, trx_path)
 
-            # Reload and check
-            trx_loaded = tbx.load(trx_path)
-            result = _try_load_cached_bboxes(trx_loaded, n)
+        # Reload and check
+        trx_loaded = load_trx(trx_path)
+        result = _try_load_cached_bboxes(trx_loaded, n)
 
-            assert result is not None
-            assert result.shape == (n, 2, 3)
-            assert result.dtype == np.float32
-            np.testing.assert_allclose(result, bboxes_gt, atol=1e-6)
-        finally:
-            if trx_loaded is not None and hasattr(trx_loaded, "close"):
-                trx_loaded.close()
-            shutil.rmtree(tmp, ignore_errors=True)
+        assert result is not None
+        assert result.shape == (n, 2, 3)
+        assert result.dtype == np.float32
+        np.testing.assert_allclose(result, bboxes_gt, atol=1e-6)
 
     @pytest.mark.numba
-    def test_cache_miss_returns_none(self, sample_streamlines):
+    def test_cache_miss_returns_none(self, sample_streamlines, tmp_path, load_trx):
         """Third-party TRX file without cached bboxes returns None."""
         ref = _make_reference_image()
         tractogram = nib.streamlines.Tractogram(
             streamlines=sample_streamlines,
             affine_to_rasmm=np.eye(4),
         )
-        trx_obj = tbx.TrxFile.from_tractogram(tractogram, ref)
-        tmp = tempfile.mkdtemp()
-        trx_loaded = None
-        try:
-            trx_path = os.path.join(tmp, "test_no_cache.trx")
+        trx_path = str(tmp_path / "test_no_cache.trx")
+        with closing(tbx.TrxFile.from_tractogram(tractogram, ref)) as trx_obj:
             tbx.save(trx_obj, trx_path)
 
-            trx_loaded = tbx.load(trx_path)
-            result = _try_load_cached_bboxes(trx_loaded, len(sample_streamlines))
-            assert result is None
-        finally:
-            if trx_loaded is not None and hasattr(trx_loaded, "close"):
-                trx_loaded.close()
-            shutil.rmtree(tmp, ignore_errors=True)
+        trx_loaded = load_trx(trx_path)
+        result = _try_load_cached_bboxes(trx_loaded, len(sample_streamlines))
+        assert result is None
 
     @pytest.mark.numba
-    def test_wrong_shape_triggers_fallback(self, sample_streamlines):
+    def test_wrong_shape_triggers_fallback(self, sample_streamlines, tmp_path, load_trx):
         """Corrupted bbox cache with wrong shape triggers fallback."""
         n = len(sample_streamlines)
         ref = _make_reference_image()
@@ -601,25 +534,17 @@ class TestTryLoadCachedBboxes:
             streamlines=sample_streamlines,
             affine_to_rasmm=np.eye(4),
         )
-        trx_obj = tbx.TrxFile.from_tractogram(tractogram, ref)
 
-        # Inject wrong-shape data: (N, 4) instead of (N, 6)
-        wrong_shape = np.zeros((n, 4), dtype=np.float32)
-        trx_obj.data_per_streamline[_TRX_BBOX_KEY] = wrong_shape
-
-        tmp = tempfile.mkdtemp()
-        trx_loaded = None
-        try:
-            trx_path = os.path.join(tmp, "test_wrong_shape.trx")
+        trx_path = str(tmp_path / "test_wrong_shape.trx")
+        with closing(tbx.TrxFile.from_tractogram(tractogram, ref)) as trx_obj:
+            # Inject wrong-shape data: (N, 4) instead of (N, 6)
+            wrong_shape = np.zeros((n, 4), dtype=np.float32)
+            trx_obj.data_per_streamline[_TRX_BBOX_KEY] = wrong_shape
             tbx.save(trx_obj, trx_path)
 
-            trx_loaded = tbx.load(trx_path)
-            result = _try_load_cached_bboxes(trx_loaded, n)
-            assert result is None
-        finally:
-            if trx_loaded is not None and hasattr(trx_loaded, "close"):
-                trx_loaded.close()
-            shutil.rmtree(tmp, ignore_errors=True)
+        trx_loaded = load_trx(trx_path)
+        result = _try_load_cached_bboxes(trx_loaded, n)
+        assert result is None
 
     def test_wrong_count_triggers_fallback(self, sample_streamlines):
         """Bbox cache with mismatched streamline count triggers fallback.
@@ -743,7 +668,7 @@ class TestTrxBboxRoundTrip:
     """End-to-end round-trip tests for TRX bbox caching."""
 
     @pytest.mark.numba
-    def test_save_reload_preserves_bboxes(self, sample_streamlines):
+    def test_save_reload_preserves_bboxes(self, sample_streamlines, tmp_path, load_trx):
         """Save with bboxes → reload → bboxes match within float32 tolerance."""
         bboxes_gt = _compute_bboxes_numba(
             sample_streamlines._data,
@@ -751,33 +676,26 @@ class TestTrxBboxRoundTrip:
             sample_streamlines._lengths,
         )
         n = len(sample_streamlines)
-        tmp = tempfile.mkdtemp()
-        trx_loaded = None
-        try:
-            trx_path = os.path.join(tmp, "roundtrip.trx")
-            _create_trx_with_bboxes(sample_streamlines, bboxes_gt, trx_path)
+        trx_path = str(tmp_path / "roundtrip.trx")
+        _create_trx_with_bboxes(sample_streamlines, bboxes_gt, trx_path)
 
-            trx_loaded = tbx.load(trx_path)
-            cached = _try_load_cached_bboxes(trx_loaded, n)
-            assert cached is not None
-            np.testing.assert_allclose(cached, bboxes_gt, atol=1e-6)
+        trx_loaded = load_trx(trx_path)
+        cached = _try_load_cached_bboxes(trx_loaded, n)
+        assert cached is not None
+        np.testing.assert_allclose(cached, bboxes_gt, atol=1e-6)
 
-            # Also verify streamline data is intact
-            loaded_sl = trx_loaded.streamlines
-            assert len(loaded_sl) == n
-            for i in range(n):
-                np.testing.assert_allclose(
-                    np.asarray(loaded_sl[i], dtype=np.float32),
-                    np.asarray(sample_streamlines[i], dtype=np.float32),
-                    atol=1e-5,
-                )
-        finally:
-            if trx_loaded is not None and hasattr(trx_loaded, "close"):
-                trx_loaded.close()
-            shutil.rmtree(tmp, ignore_errors=True)
+        # Also verify streamline data is intact
+        loaded_sl = trx_loaded.streamlines
+        assert len(loaded_sl) == n
+        for i in range(n):
+            np.testing.assert_allclose(
+                np.asarray(loaded_sl[i], dtype=np.float32),
+                np.asarray(sample_streamlines[i], dtype=np.float32),
+                atol=1e-5,
+            )
 
     @pytest.mark.numba
-    def test_trx_without_cache_falls_back_to_computation(self, sample_streamlines):
+    def test_trx_without_cache_falls_back_to_computation(self, sample_streamlines, tmp_path, load_trx):
         """TRX without cache → _try_load_cached_bboxes returns None,
         and AOT computation produces correct results."""
         ref = _make_reference_image()
@@ -785,27 +703,20 @@ class TestTrxBboxRoundTrip:
             streamlines=sample_streamlines,
             affine_to_rasmm=np.eye(4),
         )
-        trx_obj = tbx.TrxFile.from_tractogram(tractogram, ref)
-        tmp = tempfile.mkdtemp()
-        trx_loaded = None
-        try:
-            trx_path = os.path.join(tmp, "no_cache.trx")
+        trx_path = str(tmp_path / "no_cache.trx")
+        with closing(tbx.TrxFile.from_tractogram(tractogram, ref)) as trx_obj:
             tbx.save(trx_obj, trx_path)
 
-            trx_loaded = tbx.load(trx_path)
-            n = len(trx_loaded.streamlines)
-            cached = _try_load_cached_bboxes(trx_loaded, n)
-            assert cached is None
+        trx_loaded = load_trx(trx_path)
+        n = len(trx_loaded.streamlines)
+        cached = _try_load_cached_bboxes(trx_loaded, n)
+        assert cached is None
 
-            # Fallback: compute from scratch
-            sl = trx_loaded.streamlines
-            computed = _compute_bboxes_numba(sl._data, sl._offsets, sl._lengths)
-            assert computed.shape == (n, 2, 3)
-            assert computed.dtype == np.float32
-        finally:
-            if trx_loaded is not None and hasattr(trx_loaded, "close"):
-                trx_loaded.close()
-            shutil.rmtree(tmp, ignore_errors=True)
+        # Fallback: compute from scratch
+        sl = trx_loaded.streamlines
+        computed = _compute_bboxes_numba(sl._data, sl._offsets, sl._lengths)
+        assert computed.shape == (n, 2, 3)
+        assert computed.dtype == np.float32
 
     @pytest.mark.numba
     def test_trk_format_unaffected(self, sample_streamlines):
@@ -834,100 +745,69 @@ class TestSaveTrxNative:
     """Tests for _save_trx_native (Phase 2 TRX-native save path)."""
 
     @pytest.mark.numba
-    def test_round_trip_preserves_streamlines(self, sample_streamlines):
+    def test_round_trip_preserves_streamlines(
+        self, sample_streamlines, tmp_path, load_trx, make_trx_source,
+    ):
         """Native save → reload should produce identical streamline data."""
         n = len(sample_streamlines)
-        ref = _make_reference_image()
-        tractogram = nib.streamlines.Tractogram(
-            streamlines=sample_streamlines,
-            affine_to_rasmm=np.eye(4),
+        trx_source = make_trx_source()
+
+        out_path = str(tmp_path / "native_out.trx")
+        all_indices = set(range(n))
+        _save_trx_native(
+            trx_source=trx_source,
+            visible_indices=all_indices,
+            bboxes=None,
+            output_path=out_path,
         )
-        trx_source = tbx.TrxFile.from_tractogram(tractogram, ref)
 
-        tmp = tempfile.mkdtemp()
-        trx_loaded = None
-        try:
-            src_path = os.path.join(tmp, "source.trx")
-            tbx.save(trx_source, src_path)
-            # Reload so we have a proper on-disk TRX (memmap-backed)
-            trx_source = tbx.load(src_path)
-
-            out_path = os.path.join(tmp, "native_out.trx")
-            all_indices = set(range(n))
-            _save_trx_native(
-                trx_source=trx_source,
-                visible_indices=all_indices,
-                bboxes=None,
-                output_path=out_path,
+        trx_loaded = load_trx(out_path)
+        assert len(trx_loaded.streamlines) == n
+        for i in range(n):
+            np.testing.assert_allclose(
+                np.asarray(trx_loaded.streamlines[i], dtype=np.float32),
+                np.asarray(sample_streamlines[i], dtype=np.float32),
+                atol=1e-5,
             )
 
-            trx_loaded = tbx.load(out_path)
-            assert len(trx_loaded.streamlines) == n
-            for i in range(n):
-                np.testing.assert_allclose(
-                    np.asarray(trx_loaded.streamlines[i], dtype=np.float32),
-                    np.asarray(sample_streamlines[i], dtype=np.float32),
-                    atol=1e-5,
-                )
-        finally:
-            if trx_source is not None and hasattr(trx_source, "close"):
-                trx_source.close()
-            if trx_loaded is not None and hasattr(trx_loaded, "close"):
-                trx_loaded.close()
-            shutil.rmtree(tmp, ignore_errors=True)
-
     @pytest.mark.numba
-    def test_subset_selection(self, sample_streamlines):
+    def test_subset_selection(
+        self, sample_streamlines, tmp_path, load_trx, make_trx_source,
+    ):
         """Native save with a subset of indices saves only those streamlines."""
         n = len(sample_streamlines)
-        ref = _make_reference_image()
-        tractogram = nib.streamlines.Tractogram(
-            streamlines=sample_streamlines,
-            affine_to_rasmm=np.eye(4),
+        trx_source = make_trx_source()
+
+        # Save only first and last streamline
+        subset = {0, n - 1}
+        out_path = str(tmp_path / "subset_out.trx")
+        _save_trx_native(
+            trx_source=trx_source,
+            visible_indices=subset,
+            bboxes=None,
+            output_path=out_path,
         )
-        trx_source = tbx.TrxFile.from_tractogram(tractogram, ref)
 
-        tmp = tempfile.mkdtemp()
-        trx_loaded = None
-        try:
-            src_path = os.path.join(tmp, "source.trx")
-            tbx.save(trx_source, src_path)
-            trx_source = tbx.load(src_path)
+        trx_loaded = load_trx(out_path)
+        assert len(trx_loaded.streamlines) == 2
 
-            # Save only first and last streamline
-            subset = {0, n - 1}
-            out_path = os.path.join(tmp, "subset_out.trx")
-            _save_trx_native(
-                trx_source=trx_source,
-                visible_indices=subset,
-                bboxes=None,
-                output_path=out_path,
-            )
-
-            trx_loaded = tbx.load(out_path)
-            assert len(trx_loaded.streamlines) == 2
-
-            # First saved streamline should match original index 0
-            np.testing.assert_allclose(
-                np.asarray(trx_loaded.streamlines[0], dtype=np.float32),
-                np.asarray(sample_streamlines[0], dtype=np.float32),
-                atol=1e-5,
-            )
-            # Second saved streamline should match original last index
-            np.testing.assert_allclose(
-                np.asarray(trx_loaded.streamlines[1], dtype=np.float32),
-                np.asarray(sample_streamlines[n - 1], dtype=np.float32),
-                atol=1e-5,
-            )
-        finally:
-            if trx_source is not None and hasattr(trx_source, "close"):
-                trx_source.close()
-            if trx_loaded is not None and hasattr(trx_loaded, "close"):
-                trx_loaded.close()
-            shutil.rmtree(tmp, ignore_errors=True)
+        # First saved streamline should match original index 0
+        np.testing.assert_allclose(
+            np.asarray(trx_loaded.streamlines[0], dtype=np.float32),
+            np.asarray(sample_streamlines[0], dtype=np.float32),
+            atol=1e-5,
+        )
+        # Second saved streamline should match original last index
+        np.testing.assert_allclose(
+            np.asarray(trx_loaded.streamlines[1], dtype=np.float32),
+            np.asarray(sample_streamlines[n - 1], dtype=np.float32),
+            atol=1e-5,
+        )
 
     @pytest.mark.numba
-    def test_embeds_bboxes_on_save(self, sample_streamlines):
+    def test_embeds_bboxes_on_save(
+        self, sample_streamlines, tmp_path, load_trx, make_trx_source,
+    ):
         """Native save should embed bboxes that survive round-trip."""
         n = len(sample_streamlines)
         bboxes = _compute_bboxes_numba(
@@ -935,42 +815,26 @@ class TestSaveTrxNative:
             sample_streamlines._offsets,
             sample_streamlines._lengths,
         )
-        ref = _make_reference_image()
-        tractogram = nib.streamlines.Tractogram(
-            streamlines=sample_streamlines,
-            affine_to_rasmm=np.eye(4),
+        trx_source = make_trx_source()
+
+        out_path = str(tmp_path / "with_bboxes.trx")
+        all_indices = set(range(n))
+        _save_trx_native(
+            trx_source=trx_source,
+            visible_indices=all_indices,
+            bboxes=bboxes,
+            output_path=out_path,
         )
-        trx_source = tbx.TrxFile.from_tractogram(tractogram, ref)
 
-        tmp = tempfile.mkdtemp()
-        trx_loaded = None
-        try:
-            src_path = os.path.join(tmp, "source.trx")
-            tbx.save(trx_source, src_path)
-            trx_source = tbx.load(src_path)
-
-            out_path = os.path.join(tmp, "with_bboxes.trx")
-            all_indices = set(range(n))
-            _save_trx_native(
-                trx_source=trx_source,
-                visible_indices=all_indices,
-                bboxes=bboxes,
-                output_path=out_path,
-            )
-
-            trx_loaded = tbx.load(out_path)
-            cached = _try_load_cached_bboxes(trx_loaded, n)
-            assert cached is not None
-            np.testing.assert_allclose(cached, bboxes, atol=1e-6)
-        finally:
-            if trx_source is not None and hasattr(trx_source, "close"):
-                trx_source.close()
-            if trx_loaded is not None and hasattr(trx_loaded, "close"):
-                trx_loaded.close()
-            shutil.rmtree(tmp, ignore_errors=True)
+        trx_loaded = load_trx(out_path)
+        cached = _try_load_cached_bboxes(trx_loaded, n)
+        assert cached is not None
+        np.testing.assert_allclose(cached, bboxes, atol=1e-6)
 
     @pytest.mark.numba
-    def test_subset_bboxes_match_selected(self, sample_streamlines):
+    def test_subset_bboxes_match_selected(
+        self, sample_streamlines, tmp_path, load_trx, make_trx_source,
+    ):
         """When saving a subset, embedded bboxes should match the subset."""
         n = len(sample_streamlines)
         bboxes = _compute_bboxes_numba(
@@ -978,185 +842,102 @@ class TestSaveTrxNative:
             sample_streamlines._offsets,
             sample_streamlines._lengths,
         )
-        ref = _make_reference_image()
-        tractogram = nib.streamlines.Tractogram(
-            streamlines=sample_streamlines,
-            affine_to_rasmm=np.eye(4),
+        trx_source = make_trx_source()
+
+        # Save only indices 1 and 2
+        subset = {1, 2}
+        out_path = str(tmp_path / "subset_bboxes.trx")
+        _save_trx_native(
+            trx_source=trx_source,
+            visible_indices=subset,
+            bboxes=bboxes,
+            output_path=out_path,
         )
-        trx_source = tbx.TrxFile.from_tractogram(tractogram, ref)
 
-        tmp = tempfile.mkdtemp()
-        trx_loaded = None
-        try:
-            src_path = os.path.join(tmp, "source.trx")
-            tbx.save(trx_source, src_path)
-            trx_source = tbx.load(src_path)
-
-            # Save only indices 1 and 2
-            subset = {1, 2}
-            out_path = os.path.join(tmp, "subset_bboxes.trx")
-            _save_trx_native(
-                trx_source=trx_source,
-                visible_indices=subset,
-                bboxes=bboxes,
-                output_path=out_path,
-            )
-
-            trx_loaded = tbx.load(out_path)
-            assert len(trx_loaded.streamlines) == 2
-            cached = _try_load_cached_bboxes(trx_loaded, 2)
-            assert cached is not None
-            # Cached bboxes should match original indices 1 and 2
-            expected = bboxes[[1, 2]]
-            np.testing.assert_allclose(cached, expected, atol=1e-6)
-        finally:
-            if trx_source is not None and hasattr(trx_source, "close"):
-                trx_source.close()
-            if trx_loaded is not None and hasattr(trx_loaded, "close"):
-                trx_loaded.close()
-            shutil.rmtree(tmp, ignore_errors=True)
+        trx_loaded = load_trx(out_path)
+        assert len(trx_loaded.streamlines) == 2
+        cached = _try_load_cached_bboxes(trx_loaded, 2)
+        assert cached is not None
+        # Cached bboxes should match original indices 1 and 2
+        expected = bboxes[[1, 2]]
+        np.testing.assert_allclose(cached, expected, atol=1e-6)
 
     @pytest.mark.numba
-    def test_none_bboxes_saves_without_cache(self, sample_streamlines):
+    def test_none_bboxes_saves_without_cache(
+        self, sample_streamlines, tmp_path, load_trx, make_trx_source,
+    ):
         """Native save with bboxes=None should not embed bbox cache."""
         n = len(sample_streamlines)
-        ref = _make_reference_image()
-        tractogram = nib.streamlines.Tractogram(
-            streamlines=sample_streamlines,
-            affine_to_rasmm=np.eye(4),
+        trx_source = make_trx_source()
+
+        out_path = str(tmp_path / "no_bboxes.trx")
+        _save_trx_native(
+            trx_source=trx_source,
+            visible_indices=set(range(n)),
+            bboxes=None,
+            output_path=out_path,
         )
-        trx_source = tbx.TrxFile.from_tractogram(tractogram, ref)
 
-        tmp = tempfile.mkdtemp()
-        trx_loaded = None
-        try:
-            src_path = os.path.join(tmp, "source.trx")
-            tbx.save(trx_source, src_path)
-            trx_source = tbx.load(src_path)
-
-            out_path = os.path.join(tmp, "no_bboxes.trx")
-            _save_trx_native(
-                trx_source=trx_source,
-                visible_indices=set(range(n)),
-                bboxes=None,
-                output_path=out_path,
-            )
-
-            trx_loaded = tbx.load(out_path)
-            cached = _try_load_cached_bboxes(trx_loaded, n)
-            assert cached is None
-        finally:
-            if trx_source is not None and hasattr(trx_source, "close"):
-                trx_source.close()
-            if trx_loaded is not None and hasattr(trx_loaded, "close"):
-                trx_loaded.close()
-            shutil.rmtree(tmp, ignore_errors=True)
+        trx_loaded = load_trx(out_path)
+        cached = _try_load_cached_bboxes(trx_loaded, n)
+        assert cached is None
 
     @pytest.mark.numba
-    def test_scalar_data_preserved(self, sample_streamlines):
+    def test_scalar_data_preserved(self, tmp_path, load_trx, scalar_trx_source):
         """Native save should preserve data_per_vertex (scalar data)."""
-        n = len(sample_streamlines)
-        ref = _make_reference_image()
+        trx_source, scalar_per_point = scalar_trx_source
 
-        # Build per-point scalars as a list of arrays (one per streamline)
-        # — this is how nibabel's data_per_point works.
-        scalar_per_point = []
-        offset = 0
-        for i in range(n):
-            pts = len(sample_streamlines[i])
-            scalar_per_point.append(
-                np.arange(offset, offset + pts, dtype=np.float32).reshape(-1, 1)
-            )
-            offset += pts
-
-        tractogram = nib.streamlines.Tractogram(
-            streamlines=sample_streamlines,
-            data_per_point={"test_scalar": scalar_per_point},
-            affine_to_rasmm=np.eye(4),
+        out_path = str(tmp_path / "scalars_out.trx")
+        _save_trx_native(
+            trx_source=trx_source,
+            visible_indices=set(range(len(scalar_per_point))),
+            bboxes=None,
+            output_path=out_path,
         )
-        trx_source = tbx.TrxFile.from_tractogram(tractogram, ref)
 
-        tmp = tempfile.mkdtemp()
-        trx_loaded = None
-        try:
-            src_path = os.path.join(tmp, "with_scalars.trx")
-            tbx.save(trx_source, src_path)
-            trx_source = tbx.load(src_path)
-
-            out_path = os.path.join(tmp, "scalars_out.trx")
-            _save_trx_native(
-                trx_source=trx_source,
-                visible_indices=set(range(n)),
-                bboxes=None,
-                output_path=out_path,
-            )
-
-            trx_loaded = tbx.load(out_path)
-            assert "test_scalar" in trx_loaded.data_per_vertex
-            loaded_dpv = trx_loaded.data_per_vertex["test_scalar"]
-            # data_per_vertex values are ArraySequence — use ._data
-            # to get the flat (N_total_pts, K) array.
-            loaded_flat = np.asarray(loaded_dpv._data)
-            expected = np.concatenate(scalar_per_point, axis=0)
-            np.testing.assert_allclose(loaded_flat, expected, atol=1e-6)
-        finally:
-            if trx_source is not None and hasattr(trx_source, "close"):
-                trx_source.close()
-            if trx_loaded is not None and hasattr(trx_loaded, "close"):
-                trx_loaded.close()
-            shutil.rmtree(tmp, ignore_errors=True)
+        trx_loaded = load_trx(out_path)
+        assert "test_scalar" in trx_loaded.data_per_vertex
+        loaded_dpv = trx_loaded.data_per_vertex["test_scalar"]
+        # data_per_vertex values are ArraySequence — use ._data
+        # to get the flat (N_total_pts, K) array.
+        loaded_flat = np.asarray(loaded_dpv._data)
+        expected = np.concatenate(scalar_per_point, axis=0)
+        np.testing.assert_allclose(loaded_flat, expected, atol=1e-6)
 
     @pytest.mark.numba
-    def test_scalar_subset_preserved(self, sample_streamlines):
+    def test_scalar_subset_preserved(self, tmp_path, load_trx, scalar_trx_source):
         """Native save with subset should preserve only selected scalars."""
-        n = len(sample_streamlines)
-        ref = _make_reference_image()
+        trx_source, scalar_per_point = scalar_trx_source
 
-        # Build per-point scalars as a list of arrays (one per streamline)
-        scalar_per_point = []
-        offset = 0
-        for i in range(n):
-            pts = len(sample_streamlines[i])
-            scalar_per_point.append(
-                np.arange(offset, offset + pts, dtype=np.float32).reshape(-1, 1)
-            )
-            offset += pts
-
-        tractogram = nib.streamlines.Tractogram(
-            streamlines=sample_streamlines,
-            data_per_point={"test_scalar": scalar_per_point},
-            affine_to_rasmm=np.eye(4),
+        # Save only streamline 0
+        out_path = str(tmp_path / "scalar_subset.trx")
+        _save_trx_native(
+            trx_source=trx_source,
+            visible_indices={0},
+            bboxes=None,
+            output_path=out_path,
         )
-        trx_source = tbx.TrxFile.from_tractogram(tractogram, ref)
 
-        tmp = tempfile.mkdtemp()
-        trx_loaded = None
-        try:
-            src_path = os.path.join(tmp, "with_scalars.trx")
-            tbx.save(trx_source, src_path)
-            trx_source = tbx.load(src_path)
+        trx_loaded = load_trx(out_path)
+        assert len(trx_loaded.streamlines) == 1
+        assert "test_scalar" in trx_loaded.data_per_vertex
 
-            # Save only streamline 0
-            out_path = os.path.join(tmp, "scalar_subset.trx")
-            _save_trx_native(
-                trx_source=trx_source,
-                visible_indices={0},
-                bboxes=None,
-                output_path=out_path,
-            )
+        # The scalar for streamline 0 should match the original
+        expected_scalar = scalar_per_point[0]
+        loaded_dpv = trx_loaded.data_per_vertex["test_scalar"]
+        loaded_flat = np.asarray(loaded_dpv._data)
+        np.testing.assert_allclose(loaded_flat, expected_scalar, atol=1e-6)
 
-            trx_loaded = tbx.load(out_path)
-            assert len(trx_loaded.streamlines) == 1
-            assert "test_scalar" in trx_loaded.data_per_vertex
 
-            # The scalar for streamline 0 should match the original
-            expected_scalar = scalar_per_point[0]
-            loaded_dpv = trx_loaded.data_per_vertex["test_scalar"]
-            loaded_flat = np.asarray(loaded_dpv._data)
-            np.testing.assert_allclose(loaded_flat, expected_scalar, atol=1e-6)
-        finally:
-            if trx_source is not None and hasattr(trx_source, "close"):
-                trx_source.close()
-            if trx_loaded is not None and hasattr(trx_loaded, "close"):
-                trx_loaded.close()
-            shutil.rmtree(tmp, ignore_errors=True)
+def test_file_io_public_all_and_external_exports():
+    import tractedit_pkg.file_io as f
+
+    forbidden = {"os", "np", "nib", "Any", "List", "Optional", "Tuple", "QMessageBox", "Qt"}
+    assert forbidden.isdisjoint(f.__all__)
+    for name in f.__all__:
+        assert not name.startswith("_")
+    assert f.nib is nib
+    assert f.np is np
+    assert callable(f._resample_batch_numba)
+    assert callable(f._compute_bboxes_numba)
+    assert callable(f.write_vtk_polydata)

@@ -163,10 +163,15 @@ def create_cropped_tunnel_mask(streamlines, affine, volume_shape, dilation_iter=
     inverse_affine = np.linalg.inv(affine)
     lower = shape.copy()
     upper = np.zeros(3, dtype=np.intp)
+    cached = []
+    cache_bytes = 0
     found = False
 
-    for streamline in streamlines:
+    for index, streamline in enumerate(streamlines):
         indices = _voxel_indices(streamline, inverse_affine, shape)
+        if index == len(cached) and cache_bytes + indices.nbytes <= 8 * 1024**2:
+            cached.append(indices)
+            cache_bytes += indices.nbytes
         if indices.size == 0:
             continue
         lower = np.minimum(lower, indices.min(axis=0))
@@ -181,10 +186,9 @@ def create_cropped_tunnel_mask(streamlines, affine, volume_shape, dilation_iter=
     upper = np.minimum(shape, upper + dilation_iter)
     mask = np.zeros(tuple(upper - lower), dtype=bool)
 
-    for streamline in streamlines:
-        indices = _voxel_indices(streamline, inverse_affine, shape)
-        if indices.size == 0:
-            continue
+    for index, streamline in enumerate(streamlines):
+        indices = (cached[index] if index < len(cached)
+                   else _voxel_indices(streamline, inverse_affine, shape))
         local = indices - lower
         mask[local[:, 0], local[:, 1], local[:, 2]] = True
 

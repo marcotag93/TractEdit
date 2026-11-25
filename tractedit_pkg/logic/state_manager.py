@@ -26,13 +26,13 @@ from typing import TYPE_CHECKING, Any, Dict, Iterator, Optional, Set
 import numpy as np
 from PyQt6.QtWidgets import QMessageBox
 
+from ..render_batch import batch_render, request_render
 from ..utils import (
     AUTO_SKIP_THRESHOLD,
     ColorMode,
     MAX_STACK_LEVELS,
     MIN_SELECTION_RADIUS,
     RADIUS_INCREMENT,
-    TARGET_RENDER_COUNT,
 )
 
 if TYPE_CHECKING:
@@ -55,9 +55,19 @@ class ActionType(Enum):
 
     STREAMLINE_DELETION = auto()
     ROI_MODIFICATION = auto()
+    POLYLINE_EDIT = auto()
 
 
 _ROI_HISTORY_SCAN_ITEMS = 262144
+
+
+def retain_polyline_history(mw) -> None:
+    for name in ("unified_undo_stack", "unified_redo_stack"):
+        retained = [
+            action for action in getattr(mw, name, ())
+            if action.get("action_type") == ActionType.POLYLINE_EDIT
+        ]
+        setattr(mw, name, retained)
 
 
 def _different_elements(first: np.ndarray, second: np.ndarray) -> np.ndarray:
@@ -133,103 +143,67 @@ class StateManager:
         self.mw = main_window
 
     def perform_undo(self) -> None:
-        """
-        Performs undo operation from the unified stack.
-
-        Dispatches to the appropriate undo handler based on the action type
-        stored in the action record, not the current UI mode.
-        """
-        mw = self.mw
-
-        if not mw.unified_undo_stack:
-            if mw.vtk_panel:
-                mw.vtk_panel.update_status("Nothing to undo.")
-            return
-
-        action = mw.unified_undo_stack.pop()
-        action_type = action.get("action_type")
-
-        if action_type == ActionType.ROI_MODIFICATION:
-            self._undo_roi_action(action)
-        elif action_type == ActionType.STREAMLINE_DELETION:
-            self._undo_streamline_action(action)
-        else:
-            logger.warning(f"Unknown action type in undo stack: {action_type}")
-
-        mw._update_action_states()
+        self._replay_history(undo=True)
 
     def perform_redo(self) -> None:
-        """
-        Performs redo operation from the unified stack.
+        self._replay_history(undo=False)
 
-        Dispatches to the appropriate redo handler based on the action type
-        stored in the action record, not the current UI mode.
-        """
+    def _replay_history(self, *, undo: bool) -> None:
         mw = self.mw
-
-        if not mw.unified_redo_stack:
+        polylines = getattr(mw, "mesh_polyline_manager", None)
+        if polylines is not None and polylines.active is True:
+            polylines.step_draft(undo=undo)
+            return
+        source = mw.unified_undo_stack if undo else mw.unified_redo_stack
+        operation = "undo" if undo else "redo"
+        if not source:
             if mw.vtk_panel:
-                mw.vtk_panel.update_status("Nothing to redo.")
+                mw.vtk_panel.update_status(f"Nothing to {operation}.")
+            return
+        if source[-1].get("action_type") == ActionType.POLYLINE_EDIT:
+            mw.mesh_polyline_manager.replay_history(undo=undo)
             return
 
-        action = mw.unified_redo_stack.pop()
+        action = source.pop()
         action_type = action.get("action_type")
-
         if action_type == ActionType.ROI_MODIFICATION:
-            self._redo_roi_action(action)
+            destination = mw.unified_redo_stack if undo else mw.unified_undo_stack
+            self._apply_roi_action(action, destination, "undone" if undo else "redone")
         elif action_type == ActionType.STREAMLINE_DELETION:
-            self._redo_streamline_action(action)
+            self._replay_streamline_action(action, undo=undo)
         else:
-            logger.warning(f"Unknown action type in redo stack: {action_type}")
-
+            logger.warning("Unknown action type in %s stack: %s", operation, action_type)
         mw._update_action_states()
 
-    def _undo_streamline_action(self, action: Dict[str, Any]) -> None:
-        """Undo a streamline deletion, restoring visibility and re-applying skip.
-
-        For large tractograms (at or above AUTO_SKIP_THRESHOLD), clears the
-        user's manual skip-disable override, applies a conservative pre-stride
-        to prevent a transient stride-1 render from exhausting RAM, and
-        recalculates the skip level.  For small tractograms, the user's skip
-        preference is preserved and skip is not recalculated.
-
-        Args:
-            action: The action record containing deleted_indices.
-        """
+    @batch_render(lambda self: self.mw.vtk_panel)
+    def _replay_streamline_action(self, action: Dict[str, Any], *, undo: bool) -> None:
         mw = self.mw
-
         deleted_indices = action.get("deleted_indices", set())
         if not deleted_indices:
             return
 
-        redo_action = {
+        destination = mw.unified_redo_stack if undo else mw.unified_undo_stack
+        destination.append({
             "action_type": ActionType.STREAMLINE_DELETION,
             "deleted_indices": deleted_indices.copy(),
-        }
-        mw.unified_redo_stack.append(redo_action)
-        if len(mw.unified_redo_stack) > MAX_STACK_LEVELS:
-            mw.unified_redo_stack.pop(0)
+        })
+        if len(destination) > MAX_STACK_LEVELS:
+            destination.pop(0)
 
-        mw.manual_visible_indices.update(deleted_indices)
-
-        force_auto_skip = self._should_force_auto_skip_for_undo_redo()
-        if force_auto_skip:
-            mw._skip_user_disabled = False
-
-            approx_visible = len(mw.manual_visible_indices)
-            if approx_visible > TARGET_RENDER_COUNT:
-                mw.render_stride = max(1, approx_visible // TARGET_RENDER_COUNT)
-            else:
-                mw.render_stride = 1
-
-            mw._auto_calculate_skip_level()
-
-        mw.roi_manager.apply_logic_filters()
+        if undo:
+            mw.manual_visible_indices.update(deleted_indices)
+            force_auto_skip = self._should_force_auto_skip_for_undo_redo()
+            if force_auto_skip:
+                mw._skip_user_disabled = False
+            mw.roi_manager.apply_logic_filters(recalculate_skip=force_auto_skip)
+            status = "Undone: Restored"
+        else:
+            mw.manual_visible_indices.difference_update(deleted_indices)
+            mw.roi_manager.apply_logic_filters()
+            status = "Redone: Deleted"
 
         if mw.vtk_panel:
-            mw.vtk_panel.update_status(
-                f"Undone: Restored {len(deleted_indices)} streamline(s)."
-            )
+            mw.vtk_panel.update_status(f"{status} {len(deleted_indices)} streamline(s).")
 
     def _should_force_auto_skip_for_undo_redo(self) -> bool:
         """Return True when undo/redo should force auto-skip protection."""
@@ -243,55 +217,6 @@ class StateManager:
             return False
 
         return total_streamlines >= AUTO_SKIP_THRESHOLD
-
-    def _redo_streamline_action(self, action: Dict[str, Any]) -> None:
-        """
-        Redoes a streamline deletion action.
-
-        Args:
-            action: The action record containing deleted_indices.
-        """
-        mw = self.mw
-
-        deleted_indices = action.get("deleted_indices", set())
-        if not deleted_indices:
-            return
-
-        # Create undo action to allow re-undoing
-        undo_action = {
-            "action_type": ActionType.STREAMLINE_DELETION,
-            "deleted_indices": deleted_indices.copy(),
-        }
-        mw.unified_undo_stack.append(undo_action)
-
-        # Limit undo stack size
-        if len(mw.unified_undo_stack) > MAX_STACK_LEVELS:
-            mw.unified_undo_stack.pop(0)
-
-        # Re-delete the streamlines
-        mw.manual_visible_indices.difference_update(deleted_indices)
-        mw.roi_manager.apply_logic_filters()
-
-        if mw.vtk_panel:
-            mw.vtk_panel.update_status(
-                f"Redone: Deleted {len(deleted_indices)} streamline(s)."
-            )
-
-    def _undo_roi_action(self, action: Dict[str, Any]) -> None:
-        """Undo one ROI modification."""
-        self._apply_roi_action(
-            action,
-            self.mw.unified_redo_stack,
-            "undone",
-        )
-
-    def _redo_roi_action(self, action: Dict[str, Any]) -> None:
-        """Redo one ROI modification."""
-        self._apply_roi_action(
-            action,
-            self.mw.unified_undo_stack,
-            "redone",
-        )
 
     def _roi_parameters(self, roi_name: str) -> tuple[Any, Any]:
         panel = self.mw.vtk_panel
@@ -398,6 +323,7 @@ class StateManager:
                     if len(self.mw.unified_undo_stack) > MAX_STACK_LEVELS:
                         self.mw.unified_undo_stack.pop(0)
 
+    @batch_render(lambda self: self.mw.vtk_panel)
     def _apply_roi_action(
         self,
         action: Dict[str, Any],
@@ -454,7 +380,12 @@ class StateManager:
             mw.vtk_panel.update_status(
                 f"ROI operation {operation} on {os.path.basename(roi_name)}"
             )
-        mw.roi_manager.compute_roi_intersection(roi_name)
+        if (action.get("sphere_params") is not None
+                or action.get("rectangle_params") is not None
+                or any(mw.roi_states.get(roi_name, {}).values())):
+            mw.roi_manager.compute_roi_intersection(roi_name)
+        else:
+            mw.roi_intersection_cache.pop(roi_name, None)
         mw.roi_manager.update_roi_visual_selection()
         mw.roi_manager.apply_logic_filters()
 
@@ -503,6 +434,7 @@ class StateManager:
         if len(mw.unified_undo_stack) > MAX_STACK_LEVELS:
             mw.unified_undo_stack.pop(0)
 
+    @batch_render(lambda self: self.mw.vtk_panel)
     def perform_clear_selection(self) -> None:
         """Clear the current streamline selection and exit inversion mode."""
         mw = self.mw
@@ -512,6 +444,9 @@ class StateManager:
 
         if mw.selected_streamline_indices:
             mw.selected_streamline_indices = set()
+            mapping = getattr(mw, "surface_mapping_manager", None)
+            if mapping is not None:
+                mapping.selection_changed()
 
             # Exit inversion mode and remove the cyan keeper contour.
             mw._inversion_active = False
@@ -550,11 +485,11 @@ class StateManager:
 
         # Finalize update
         mw.vtk_panel.scene.reset_clipping_range()
+        mw.vtk_panel.update_status("Camera reset (Front Coronal).", render=False)
         if mw.vtk_panel.render_window:
-            mw.vtk_panel.render_window.Render()
+            request_render(mw.vtk_panel, mw.vtk_panel.render_window)
 
-        mw.vtk_panel.update_status("Camera reset (Front Coronal).")
-
+    @batch_render(lambda self: self.mw.vtk_panel)
     def perform_delete_selection(self) -> None:
         """Delete the currently selected streamlines and exit inversion mode."""
         mw = self.mw
@@ -570,6 +505,9 @@ class StateManager:
         mw.manual_visible_indices.difference_update(to_delete)
 
         mw.selected_streamline_indices = set()
+        mapping = getattr(mw, "surface_mapping_manager", None)
+        if mapping is not None:
+            mapping.selection_changed()
 
         # Exit inversion mode and remove the cyan keeper contour.
         mw._inversion_active = False
@@ -577,10 +515,7 @@ class StateManager:
         if mw.vtk_panel:
             mw.vtk_panel.clear_invert_contour()
 
-        mw.roi_manager.apply_logic_filters()
-
-        # Recalculate stride for the smaller visible set.
-        mw._auto_calculate_skip_level()
+        mw.roi_manager.apply_logic_filters(recalculate_skip=True)
 
         mw._update_action_states()
 
@@ -590,35 +525,23 @@ class StateManager:
             mw.vtk_panel.update_status(f"Deleted {len(to_delete)} streamline(s).")
 
     def increase_radius(self) -> None:
-        """Increases the selection radius."""
-        mw = self.mw
-
-        if not mw.tractogram_data:
-            return
-
-        mw.selection_radius_3d += RADIUS_INCREMENT
-        if mw.vtk_panel:
-            mw.vtk_panel.update_status(
-                f"Selection radius increased to {mw.selection_radius_3d:.1f}mm."
-            )
-            if mw.vtk_panel.radius_actor and mw.vtk_panel.radius_actor.GetVisibility():
-                center = mw.vtk_panel.radius_actor.GetCenter()
-                mw.vtk_panel.update_radius_actor(
-                    center_point=center, radius=mw.selection_radius_3d, visible=True
-                )
+        self._adjust_radius(RADIUS_INCREMENT)
 
     def decrease_radius(self) -> None:
-        """Decreases the selection radius."""
-        mw = self.mw
+        self._adjust_radius(-RADIUS_INCREMENT)
 
+    @batch_render(lambda self: self.mw.vtk_panel)
+    def _adjust_radius(self, delta: float) -> None:
+        mw = self.mw
         if not mw.tractogram_data:
             return
 
-        new_radius = mw.selection_radius_3d - RADIUS_INCREMENT
-        mw.selection_radius_3d = max(MIN_SELECTION_RADIUS, new_radius)
+        radius = mw.selection_radius_3d + delta
+        mw.selection_radius_3d = max(MIN_SELECTION_RADIUS, radius) if delta < 0 else radius
+        direction = "decreased" if delta < 0 else "increased"
         if mw.vtk_panel:
             mw.vtk_panel.update_status(
-                f"Selection radius decreased to {mw.selection_radius_3d:.1f}mm."
+                f"Selection radius {direction} to {mw.selection_radius_3d:.1f}mm."
             )
             if mw.vtk_panel.radius_actor and mw.vtk_panel.radius_actor.GetVisibility():
                 center = mw.vtk_panel.radius_actor.GetCenter()
@@ -626,6 +549,7 @@ class StateManager:
                     center_point=center, radius=mw.selection_radius_3d, visible=True
                 )
 
+    @batch_render(lambda self: self.mw.vtk_panel)
     def hide_sphere(self) -> None:
         """Hides the selection sphere."""
         mw = self.mw
@@ -634,6 +558,7 @@ class StateManager:
             mw.vtk_panel.update_radius_actor(visible=False)
             mw.vtk_panel.update_status("Selection sphere hidden.")
 
+    @batch_render(lambda self: self.mw.vtk_panel)
     def set_color_mode(self, mode: ColorMode) -> None:
         """Sets the streamline coloring mode and triggers VTK update."""
         mw = self.mw
@@ -661,7 +586,7 @@ class StateManager:
 
                 # Calculate range in scalar mode
                 if not mw.scalar_range_initialized:
-                    mw._update_scalar_data_range()
+                    mw.scalar_manager.update_scalar_data_range()
                     mw.scalar_range_initialized = True
 
                 if mw.scalar_toolbar:

@@ -11,7 +11,15 @@ import uuid
 
 import numpy as np
 
-from .session_io import SessionError, checkpoint, checked_fingerprint, source_stamp
+from .io import SessionError, checkpoint, checked_fingerprint, source_stamp
+from .mesh import (
+    MESH_FIELDS,
+    mesh_geometry_values,
+    mesh_attribute_values,
+    mesh_source_id,
+    validate_mesh_records,
+    validate_polyline_containers,
+)
 
 STATE_FIELDS = (
     "manual_visible_indices",
@@ -125,11 +133,17 @@ def _validate_parameters(spheres, rectangles):
 def capture_state(mw) -> dict[str, Any]:
     """Capture borrowed arrays while the caller prevents scene mutations."""
     state = {name: getattr(mw, name) for name in STATE_FIELDS}
+    if getattr(mw, "scalar_display", None) is not None:
+        state["scalar_display"] = dict(mw.scalar_display)
+    selection = anatomical_display_selection(mw)
+    if selection is not None:
+        state["anatomical_display"] = selection
     state["current_color_mode"] = mw.current_color_mode.name
     state["history"] = {
         name: [
             dict(action, action_type=action["action_type"].name)
             for action in getattr(mw, name)
+            if action["action_type"].name != "POLYLINE_EDIT"
         ]
         for name in ("unified_undo_stack", "unified_redo_stack")
     }
@@ -167,6 +181,23 @@ def capture_state(mw) -> dict[str, Any]:
     state["streamline_count"] = (
         len(mw.tractogram_data) if mw.tractogram_data is not None else 0
     )
+    state["mesh_layers"] = [
+        {**{field: layer[field] for field in MESH_FIELDS + ("texture", "polylines")
+            if field in layer},
+         "parent_id": layer.get("parent_id"),
+         "presentation": {key: dict(value)
+                          for key, value in layer["presentation"].items()}}
+        for layer in getattr(mw, "mesh_layers", {}).values()
+    ]
+    if getattr(mw, "standalone_polylines", None):
+        state["standalone_polylines"] = [
+            dict(record) for record in mw.standalone_polylines
+        ]
+    from .surface_mapping import capture_recipe
+
+    recipe = capture_recipe(getattr(mw, "surface_mapping_manager", None))
+    if recipe is not None:
+        state["surface_mapping_recipe"] = recipe
     return state
 
 
@@ -189,8 +220,8 @@ def _indices(values, count, name):
 
 def validate_state(state):
     """Reject invalid references before any data reaches native consumers."""
-    from .reference_grid import validate_volume_geometry
-    from .utils import ColorMode
+    from ..reference_grid import validate_volume_geometry
+    from ..utils import ColorMode
 
     required = set(STATE_FIELDS) | {
         "current_color_mode",
@@ -202,8 +233,27 @@ def validate_state(state):
         "roi_ids",
         "streamline_count",
     }
-    if not isinstance(state, dict) or set(state) != required:
+    if not isinstance(state, dict) or set(state) - {
+        "mesh_layers", "surface_mapping_recipe", "standalone_polylines",
+        "anatomical_display", "scalar_display",
+    } != required:
         raise SessionError("Invalid session state fields")
+    if "scalar_display" in state:
+        from ..tractogram_arrays import validate_scalar_display
+
+        try:
+            validate_scalar_display(state["scalar_display"])
+        except ValueError as error:
+            raise SessionError(str(error)) from error
+    if "anatomical_display" in state:
+        from ..image_volume import validate_display_selection
+
+        try:
+            validate_display_selection(state["anatomical_display"])
+        except ValueError as error:
+            raise SessionError(str(error)) from error
+    validate_mesh_records(state.get("mesh_layers", []))
+    validate_polyline_containers(state)
     for name in (
         "_inversion_active",
         "_skip_user_disabled",
@@ -237,6 +287,9 @@ def validate_state(state):
     count = state["streamline_count"]
     if type(count) is not int or count < 0:
         raise SessionError("Invalid streamline count")
+    from .surface_mapping import validate_recipe
+
+    validate_recipe(state.get("surface_mapping_recipe"), state)
     for name in (
         "manual_visible_indices",
         "visible_indices",
@@ -446,10 +499,31 @@ def _same(first, second, cancelled):
     return first == second
 
 
-def load_source(role, path, cancelled, progress, set_loader=lambda loader: None):
+def anatomical_display_selection(mw):
+    image = getattr(mw, "anatomical_mmap_image", None)
+    if image is not None and len(getattr(image, "source_shape", ())) == 4:
+        return {"volume_index": image.volume_index, "rgb": image.rgb}
+    return None
+
+
+def load_source(
+    role, path, cancelled, progress, set_loader=lambda loader: None,
+    *, anatomical_display=None,
+):
     """Run existing scientific loaders without touching the live window."""
+    if mesh_source_id(role) is not None:
+        from ..mesh_io import MeshLoadCancelled, load_mesh
+        from .io import SessionCancelled
+
+        progress(f"Loading surface: {Path(path).name}")
+        try:
+            return load_mesh(path, cancel_check=cancelled)
+        except MeshLoadCancelled as error:
+            raise SessionCancelled() from error
+    if role not in SOURCE_FIELDS:
+        raise SessionError(f"Unknown source role: {role}")
     from PyQt6.QtCore import Qt
-    from . import file_io
+    from .. import file_io
 
     if role in ("tractogram", "anatomy"):
         cls = (
@@ -457,7 +531,7 @@ def load_source(role, path, cancelled, progress, set_loader=lambda loader: None)
             if role == "tractogram"
             else file_io.AnatomicalImageLoaderThread
         )
-        loader = cls(path)
+        loader = cls(path, **(anatomical_display or {})) if role == "anatomy" else cls(path)
         result, errors = [], []
         loader.finished.connect(result.append, Qt.ConnectionType.DirectConnection)
         loader.error.connect(errors.append, Qt.ConnectionType.DirectConnection)
@@ -481,16 +555,16 @@ def load_source(role, path, cancelled, progress, set_loader=lambda loader: None)
             loader.discard_pending_result()
             set_loader(None)
     import nibabel as nib
-    from .reference_grid import validate_volume_geometry, validate_affine
+    from ..reference_grid import validate_volume_geometry, validate_affine
 
     image = nib.load(path)
     if role == "parcellation":
-        from .logic.connectivity import _read_atlas_c_int32
+        from ..logic.connectivity import _read_atlas_c_int32
 
         validate_volume_geometry(image.dataobj, image.affine, "Parcellation")
         data = _read_atlas_c_int32(image.dataobj)
     else:
-        from .odf_utils import calculate_sh_order
+        from ..odf_utils import calculate_sh_order
 
         validate_affine(image.affine, "ODF")
         if len(image.shape) != 4:
@@ -498,7 +572,12 @@ def load_source(role, path, cancelled, progress, set_loader=lambda loader: None)
         calculate_sh_order(image.shape[-1])
         data = image.get_fdata()
     checkpoint(cancelled)
-    return {"data": data, "affine": image.affine, "path": path}
+    result = {"data": data, "affine": image.affine, "path": path}
+    if role == "parcellation":
+        from ..reference_grid import mask_spatial_metadata
+
+        result["spatial"] = mask_spatial_metadata(image)
+    return result
 
 
 def dispose_sources(sources):
@@ -511,12 +590,55 @@ def dispose_sources(sources):
         if mmap is not None:
             mmap.clear_cache()
             result["mmap_image"] = None
+        if mesh_source_id(role) is not None:
+            result.pop("polydata", None)
+            result.pop("texture_preparation", None)
 
 
 def associate_sources(mw, cancelled, progress, set_loader=lambda loader: None):
     """Prove external files still reproduce the live immutable scientific inputs."""
     records = {}
     cache = getattr(mw, "_session_source_associations", {})
+    for identity, layer in getattr(mw, "mesh_layers", {}).items():
+        if identity != layer["id"]:
+            raise SessionError("Mesh registry UUID does not match its layer")
+        role, path = "mesh:" + identity, layer["path"]
+        record, stamp = checked_fingerprint(path, cancelled, progress)
+        if "texture" in layer and record["sha256"] != layer.get("source_sha256"):
+            raise SessionError("OBJ changed since texture preparation; reload the mesh")
+        if layer.get("source_sha256", record["sha256"]) != record["sha256"] or any(
+            line["region"]["digest"] != record["sha256"]
+            for line in layer.get("polylines", ()) if "region" in line
+        ):
+            raise SessionError("Mesh source changed since loading")
+        signature = _content_digest(_source_values(mw, role), cancelled)
+        if cache.get(role) != (record, signature):
+            result = load_source(role, path, cancelled, progress, set_loader)
+            try:
+                expected_values = [
+                    mesh_geometry_values(result["polydata"]),
+                    result["space_metadata"],
+                    mesh_attribute_values(result["polydata"]),
+                ]
+                if not _same(
+                    _source_values(mw, role),
+                    expected_values,
+                    cancelled,
+                ):
+                    raise SessionError(
+                        f"The {role} source no longer reproduces the loaded data: "
+                        f"{path}"
+                    )
+            finally:
+                dispose_sources({role: result})
+        if source_stamp(path) != stamp:
+            raise SessionError(f"Source changed during session save: {path}")
+        records[role] = record
+        cache[role] = (record.copy(), signature)
+        if "texture" in layer:
+            from .mesh_texture import verify_texture_assets
+
+            records.update(verify_texture_assets(layer, cancelled, progress))
     for role, (path_name, data_name) in SOURCE_FIELDS.items():
         if getattr(mw, data_name) is None:
             continue
@@ -531,8 +653,13 @@ def associate_sources(mw, cancelled, progress, set_loader=lambda loader: None):
                 raise SessionError(f"Source changed during session save: {path}")
             records[role] = record
             continue
+        options = {}
+        if role == "anatomy":
+            selection = anatomical_display_selection(mw)
+            if selection is not None:
+                options["anatomical_display"] = selection
         result = load_source(
-            role, str(Path(path).resolve()), cancelled, progress, set_loader
+            role, str(Path(path).resolve()), cancelled, progress, set_loader, **options
         )
         try:
             pairs = [
@@ -556,12 +683,13 @@ def associate_sources(mw, cancelled, progress, set_loader=lambda loader: None):
                 )
                 owner = mw.trx_file_reference
                 loaded_owner = result.get("trx_obj")
-                pairs.append(
-                    (
-                        getattr(owner, "groups", {}) or {},
-                        getattr(loaded_owner, "groups", {}) or {},
+                for field in ("groups", "data_per_group"):
+                    pairs.append(
+                        (
+                            getattr(owner, field, {}) or {},
+                            getattr(loaded_owner, field, {}) or {},
+                        )
                     )
-                )
             else:
                 affine_name = (
                     "anatomical_image_affine" if role == "anatomy" else role + "_affine"
@@ -587,6 +715,15 @@ def associate_sources(mw, cancelled, progress, set_loader=lambda loader: None):
 
 def _source_values(mw, role):
     """Exactly the immutable input values compared by associate_sources."""
+    identity = mesh_source_id(role)
+    if identity is not None:
+        layer = mw.mesh_layers[identity]
+        values = [
+            mesh_geometry_values(layer["polydata"]),
+            layer["coordinate_provenance"]["metadata"],
+            mesh_attribute_values(layer["polydata"]),
+        ]
+        return values
     values = [getattr(mw, SOURCE_FIELDS[role][1])]
     if role == "tractogram":
         values.extend(
@@ -597,6 +734,7 @@ def _source_values(mw, role):
                 mw.original_trk_affine,
                 mw.tractogram_reference_grid,
                 getattr(mw.trx_file_reference, "groups", {}) or {},
+                getattr(mw.trx_file_reference, "data_per_group", {}) or {},
             ]
         )
     else:
@@ -607,6 +745,9 @@ def _source_values(mw, role):
         )
         if role == "anatomy":
             values.append(mw.anatomical_reference_grid)
+            selection = anatomical_display_selection(mw)
+            if selection is not None:
+                values.append(selection)
     return values
 
 

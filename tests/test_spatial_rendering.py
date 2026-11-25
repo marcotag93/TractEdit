@@ -6,6 +6,7 @@ import pytest
 import vtk
 from fury import window
 
+from tests.conftest import vtk_matrix_to_numpy as _vtk_matrix_to_numpy
 from tractedit_pkg.visualization.actors import (
     apply_slicer_affine,
     create_slicer_actor,
@@ -15,12 +16,6 @@ from tractedit_pkg.visualization.coordinates import (
     translate_camera_to_plane,
 )
 from tractedit_pkg.visualization.scene_manager import SceneManager
-
-
-def _vtk_matrix_to_numpy(matrix: vtk.vtkMatrix4x4) -> np.ndarray:
-    return np.array(
-        [[matrix.GetElement(row, col) for col in range(4)] for row in range(4)]
-    )
 
 
 @pytest.fixture(

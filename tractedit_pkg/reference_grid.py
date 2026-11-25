@@ -27,11 +27,13 @@ def validate_volume_geometry(
     data: Any,
     affine: np.ndarray,
     label: str,
+    *,
+    allow_rgb: bool = False,
 ) -> None:
     """Validate the dimensional and spatial contract of a native volume."""
     shape = getattr(data, "shape", None)
     ndim = len(shape) if shape is not None else np.ndim(data)
-    if ndim != 3:
+    if ndim != 3 and not (allow_rgb and ndim == 4 and shape[-1] == 3):
         raise ValueError(f"{label} data must have exactly 3 dimensions, got {ndim}.")
     if shape is not None and any(int(length) < 1 for length in shape):
         raise ValueError(f"{label} data dimensions must be non-empty.")
@@ -66,6 +68,27 @@ def canonicalize_nifti(image: nib.Nifti1Image) -> nib.Nifti1Image:
     # With neither form declared, retain nibabel's explicit canonical sform:
     # an unset header fallback cannot describe the reordered grid in general.
     return canonical
+
+
+def mask_spatial_metadata(image):
+    if not hasattr(image, "get_sform"):
+        return None
+    return {
+        "sform": image.get_sform(),
+        "sform_code": int(image.header["sform_code"]),
+        "qform": image.get_qform(),
+        "qform_code": int(image.header["qform_code"]),
+        "units": list(image.header.get_xyzt_units()),
+    }
+
+
+def mask_image(data, affine, spatial):
+    image = nib.Nifti1Image(data, affine, dtype=data.dtype)
+    if spatial is not None:
+        image.set_sform(spatial["sform"], spatial["sform_code"], update_affine=False)
+        image.set_qform(spatial["qform"], spatial["qform_code"], update_affine=False)
+        image.header.set_xyzt_units(*spatial["units"])
+    return image
 
 
 def _mapping_value(metadata: Mapping[str, Any], *keys: str) -> Any:
@@ -211,6 +234,7 @@ class ReferenceGrid:
         points: np.ndarray,
         provenance: str,
         affine: np.ndarray | None = None,
+        *, include_origin: bool = True,
     ) -> "ReferenceGrid":
         """Create a covering grid for world-space points."""
         points = np.asarray(points)
@@ -228,8 +252,10 @@ class ReferenceGrid:
                 np.linalg.inv(base_affine),
                 points,
             )
-        lower = np.minimum(np.floor(np.min(voxel_points, axis=0)), 0).astype(int)
-        upper = np.ceil(np.max(voxel_points, axis=0)).astype(int)
+        lower = np.floor(np.min(voxel_points, axis=0))
+        if include_origin:
+            lower = np.minimum(lower, 0)
+        upper = np.ceil(np.max(voxel_points, axis=0))
         shift = np.eye(4)
         shift[:3, 3] = lower
         return cls(

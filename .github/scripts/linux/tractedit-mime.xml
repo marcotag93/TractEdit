@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="model/obj">
+    <comment>Wavefront OBJ mesh</comment>
+    <glob pattern="*.obj"/>
+  </mime-type>
+  <mime-type type="application/x-tractedit-session">
+    <comment>TractEdit session</comment>
+    <glob pattern="*.tractedit-session"/>
+    <sub-class-of type="application/zip"/>
+  </mime-type>
+  <mime-type type="application/x-trk">
+    <comment>TrackVis tractogram</comment>
+    <glob pattern="*.trk"/>
+  </mime-type>
+  <mime-type type="application/x-trx">
+    <comment>TRX tractogram</comment>
+    <glob pattern="*.trx"/>
+  </mime-type>
+  <mime-type type="application/x-tck">
+    <comment>MRtrix tractogram</comment>
+    <glob pattern="*.tck"/>
+  </mime-type>
+  <mime-type type="application/x-vtk">
+    <comment>VTK legacy data</comment>
+    <glob pattern="*.vtk"/>
+  </mime-type>
+  <mime-type type="application/x-vtp">
+    <comment>VTK XML PolyData</comment>
+    <glob pattern="*.vtp"/>
+  </mime-type>
+  <mime-type type="application/x-nifti">
+    <comment>NIfTI image</comment>
+    <glob pattern="*.nii"/>
+  </mime-type>
+  <mime-type type="application/x-nifti-gzip">
+    <comment>Compressed NIfTI image</comment>
+    <sub-class-of type="application/x-nifti"/>
+    <sub-class-of type="application/gzip"/>
+    <glob pattern="*.nii.gz"/>
+    <icon name="application-x-nifti"/>
+  </mime-type>
+</mime-info>

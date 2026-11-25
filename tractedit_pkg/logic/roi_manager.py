@@ -31,7 +31,9 @@ from PyQt6.QtWidgets import (
     QMessageBox,
 )
 
-from ..utils import AUTO_SKIP_THRESHOLD, TARGET_RENDER_COUNT
+from ..reference_grid import mask_image
+from ..render_batch import batch_render
+from ..utils import AUTO_SKIP_THRESHOLD
 from ..transactional_io import transactional_save
 
 if TYPE_CHECKING:
@@ -277,8 +279,10 @@ class ROIManager:
         intersecting_indices = self._compute_parametric_intersection(roi_name)
         if intersecting_indices is None:
             if min_point is not None and max_point is not None:
-                intersecting_indices = mw.vtk_panel._find_streamlines_in_box(
-                    min_point, max_point, check_all=True
+                intersecting_indices = (
+                    mw.vtk_panel.selection_manager.find_streamlines_in_box(
+                        min_point, max_point, check_all=True
+                    )
                 )
             elif not self.compute_roi_intersection(roi_name):
                 return
@@ -332,9 +336,9 @@ class ROIManager:
             combined.update(mw.roi_intersection_cache.get(p, set()))
         mw.roi_highlight_indices = combined
         if mw.vtk_panel:
-            mw.vtk_panel.update_roi_highlight_actor()
+            mw.vtk_panel.streamlines_manager.update_roi_highlight_actor()
 
-    def apply_logic_filters(self) -> None:
+    def apply_logic_filters(self, *, recalculate_skip: bool = False) -> None:
         """Applies include/exclude logic filters to streamline visibility."""
         mw = self.mw
 
@@ -402,6 +406,9 @@ class ROIManager:
 
         mw.visible_indices = final_indices
         mw._visibility_version += 1
+        mapping = getattr(mw, "surface_mapping_manager", None)
+        if mapping is not None:
+            mapping.visibility_changed()
 
         # Invalidate visible array cache since visibility changed
         if mw.vtk_panel and hasattr(mw.vtk_panel, "selection_manager"):
@@ -417,19 +424,19 @@ class ROIManager:
                     "No streamlines match current filters - remove filters to restore"
                 )
 
-        # Re-render with current stride (do NOT recalculate skip level).
-        # The rebuild guard handles deduplication.
+        if recalculate_skip:
+            mw._auto_calculate_skip_level(update_actor=False, notify=True)
         if mw.vtk_panel:
             mw.vtk_panel.update_main_streamlines_actor()
         mw._update_bundle_info_display()
 
+    @batch_render(lambda self: self.mw.vtk_panel)
     def _apply_filters_with_skip_protection(self) -> None:
         """Applies logic filters with automatic skip/stride recalculation.
 
         For tractograms at or above AUTO_SKIP_THRESHOLD, the
-        user's manual skip-disable override is cleared and a conservative
-        pre-stride is applied before the filter pass to prevent a transient
-        stride-1 render from exhausting RAM.
+        user's manual skip-disable override is cleared before rebuilding
+        the actor at the stride selected for the filtered set.
         """
         mw = self.mw
 
@@ -441,15 +448,10 @@ class ROIManager:
 
             if total >= AUTO_SKIP_THRESHOLD:
                 mw._skip_user_disabled = False
-                approx_visible = len(mw.manual_visible_indices)
-                if approx_visible > TARGET_RENDER_COUNT:
-                    mw.render_stride = max(1, approx_visible // TARGET_RENDER_COUNT)
-                else:
-                    mw.render_stride = 1
 
-        self.apply_logic_filters()
-        mw._auto_calculate_skip_level()
+        self.apply_logic_filters(recalculate_skip=True)
 
+    @batch_render(lambda self: self.mw.vtk_panel)
     def change_roi_color_action(self, path: str) -> None:
         """Opens a color picker and updates the ROI layer color."""
         mw = self.mw
@@ -614,7 +616,7 @@ class ROIManager:
             return
 
         try:
-            image = nib.Nifti1Image(roi_data, roi_affine)
+            image = mask_image(roi_data, roi_affine, roi_layer.get("spatial"))
             transactional_save(save_path, lambda path: nib.save(image, path))
             if mw.vtk_panel:
                 mw.vtk_panel.update_status(f"Saved ROI to: {save_path}")
@@ -622,6 +624,7 @@ class ROIManager:
             logger.error(f"Error saving ROI: {e}", exc_info=True)
             QMessageBox.critical(mw, "Save Error", f"Failed to save ROI: {e}")
 
+    @batch_render(lambda self: self.mw.vtk_panel)
     def remove_roi_layer_action(self, path: str) -> None:
         """Removes a specific ROI layer."""
         mw = self.mw

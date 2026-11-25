@@ -8,7 +8,7 @@ import zipfile
 import numpy as np
 import pytest
 
-from tractedit_pkg.session_io import (
+from tractedit_pkg.session.io import (
     SessionCancelled,
     SessionError,
     fingerprint,

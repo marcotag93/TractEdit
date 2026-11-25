@@ -4,155 +4,249 @@
 Actor factory functions for TractEdit visualization.
 
 Provides factory functions for creating VTK/FURY actors used in the
-visualization of streamlines, anatomical slices, ROIs, ODFs, and UI overlays.
+visualization of meshes, anatomical slices, ROIs, and UI overlays.
 """
 
 import logging
-from typing import Optional, List, Tuple, Any, Dict
+from typing import Optional, Tuple
 
 import numpy as np
 import vtk
-from fury import actor, window
+from fury import actor
+from ..data_contracts import MeshComponent, MeshLayer
 
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# Streamline Actors
-# =============================================================================
+def polyline_display_data(points) -> tuple[vtk.vtkPolyData, vtk.vtkPolyData]:
+    """Share RAS points; only display markers omit a repeated closing vertex."""
+    from vtk.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray
 
+    values = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    vertices = vtk.vtkPoints()
+    vertices.SetData(numpy_to_vtk(np.ascontiguousarray(values), deep=True))
+    dtype = np.int64 if vtk.vtkIdTypeArray().GetDataTypeSize() == 8 else np.int32
 
-def create_streamline_actor(
-    streamlines_list: List[np.ndarray],
-    colors: Any,
-    opacity: float = 1.0,
-    linewidth: float = 2.0,
-    use_tubes: bool = False,
-    tube_radius: float = 0.15,
-    use_lod: bool = False,
-) -> Optional[vtk.vtkActor]:
-    """
-    Creates a streamline actor using FURY's line or streamtube.
-
-    Args:
-        streamlines_list: List of streamline arrays (Nx3 each).
-        colors: Color specification - tuple (R,G,B), or array of colors.
-        opacity: Actor opacity (0.0 to 1.0).
-        linewidth: Line width in pixels (for lines) or tube radius (for tubes).
-        use_tubes: If True, render as tubes; otherwise as lines.
-        tube_radius: Radius for tube rendering.
-        use_lod: If True, use Level of Detail for smoother interaction.
-
-    Returns:
-        VTK actor for the streamlines, or None if creation fails.
-    """
-    if not streamlines_list:
-        return None
-
-    try:
-        if use_tubes:
-            return actor.streamtube(
-                streamlines_list,
-                colors=colors,
-                opacity=opacity,
-                linewidth=tube_radius,
-                lod=use_lod,
-            )
-        else:
-            return actor.line(
-                streamlines_list,
-                colors=colors,
-                opacity=opacity,
-                linewidth=linewidth,
-                lod=use_lod,
-            )
-    except (RuntimeError, ValueError, AttributeError) as e:
-        logger.error(f"Error creating streamline actor: {e}")
-        return None
-
-
-def create_highlight_actor(
-    streamlines_list: List[np.ndarray],
-    color: Tuple[float, float, float] = (1.0, 1.0, 0.0),
-    linewidth: float = 3.0,
-    opacity: float = 0.8,
-) -> Optional[vtk.vtkActor]:
-    """
-    Creates a highlight actor for selected streamlines.
-
-    Args:
-        streamlines_list: List of streamline arrays to highlight.
-        color: RGB color tuple (default yellow).
-        linewidth: Line width in pixels.
-        opacity: Actor opacity.
-
-    Returns:
-        VTK actor for highlighted streamlines, or None if creation fails.
-    """
-    if not streamlines_list:
-        return None
-
-    try:
-        highlight_actor = actor.line(
-            streamlines_list,
-            colors=color,
-            linewidth=linewidth,
-            opacity=opacity,
-            depth_cue=False,
+    def cells(count):
+        result = vtk.vtkCellArray()
+        offsets = np.array([0, count] if count else [0], dtype=dtype)
+        result.SetData(
+            numpy_to_vtkIdTypeArray(offsets, deep=True),
+            numpy_to_vtkIdTypeArray(np.arange(count, dtype=dtype), deep=True),
         )
+        return result
 
-        # Use mapper offset to ensure it draws on top
-        mapper = highlight_actor.GetMapper()
-        if mapper:
-            mapper.SetResolveCoincidentTopologyToPolygonOffset()
-            mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(-1, -10)
+    line_data = vtk.vtkPolyData()
+    line_data.SetPoints(vertices)
+    line_data.SetLines(cells(len(values) if len(values) > 1 else 0))
+    count = len(values)
+    if count > 1 and np.array_equal(values[0], values[-1]):
+        count -= 1
+    marker_data = vtk.vtkPolyData()
+    marker_data.SetPoints(vertices)
+    marker_data.SetVerts(cells(count))
+    return line_data, marker_data
 
-        return highlight_actor
-    except (RuntimeError, ValueError, AttributeError) as e:
-        logger.error(f"Error creating highlight actor: {e}")
-        return None
+
+def create_mesh_polyline_actor(
+    points, color, *, line_width=3.0, point_size=7.0, show_points=False,
+    allow_duplicate_adjacent=False,
+) -> vtk.vtkActor:
+    from ..mesh.polylines import validated_color, validated_points, validated_style
+
+    values = validated_points(points, allow_duplicate_adjacent=allow_duplicate_adjacent)
+    color = validated_color(color)
+    style = validated_style(line_width, point_size, show_points)
+    line_data, marker_data = polyline_display_data(values)
+    mapper = vtk.vtkPolyDataMapper()
+    mapper.SetInputData(line_data)
+    mapper.ScalarVisibilityOff()
+    mapper.SetResolveCoincidentTopologyToPolygonOffset()
+    mapper.SetRelativeCoincidentTopologyLineOffsetParameters(0, -2)
+    result = vtk.vtkActor()
+    result.SetMapper(mapper)
+    result.PickableOff()
+    result.GetProperty().SetColor(*color)
+    result.GetProperty().SetLineWidth(style["line_width"])
+    result.GetProperty().SetPointSize(style["point_size"])
+    result.GetProperty().LightingOff()
+    marker_mapper = vtk.vtkPolyDataMapper()
+    marker_mapper.SetInputData(marker_data)
+    marker_mapper.ScalarVisibilityOff()
+    marker_mapper.SetResolveCoincidentTopologyToPolygonOffset()
+    marker_mapper.SetRelativeCoincidentTopologyPointOffsetParameter(-2)
+    markers = vtk.vtkActor()
+    markers.SetMapper(marker_mapper)
+    markers.PickableOff()
+    markers.GetProperty().SetColor(*color)
+    markers.GetProperty().SetPointSize(style["point_size"])
+    markers.GetProperty().LightingOff()
+    markers.SetVisibility(style["show_points"])
+    result.polyline_markers = markers
+    return result
 
 
-def create_roi_highlight_actor(
-    streamlines_list: List[np.ndarray],
-    color: Tuple[float, float, float] = (1.0, 0.0, 0.0),
-    linewidth: float = 4.0,
+def create_mesh_actor(
+    polydata: vtk.vtkPolyData,
+    source_to_ras: np.ndarray,
+    color: tuple[float, float, float] = (0.8, 0.8, 0.8),
     opacity: float = 1.0,
-) -> Optional[vtk.vtkActor]:
+    *, mapper=None,
+) -> vtk.vtkActor:
+    """Present validated surface data in scanner-RAS without copying geometry.
+
+    The caller retains immutable source data. Only RAS/LPS millimetre
+    presentation is supported; anatomy and radiological mirrors play no role.
     """
-    Creates a red highlight actor for ROI-selected streamlines.
+    matrix = np.asarray(source_to_ras, dtype=np.float64)
+    if matrix.shape != (4, 4) or not (
+        np.array_equal(matrix, np.eye(4))
+        or np.array_equal(matrix, np.diag([-1.0, -1.0, 1.0, 1.0]))
+    ):
+        raise ValueError("Mesh source_to_ras must be the RAS identity or LPS flip")
+    rgb = np.asarray(color, dtype=np.float64)
+    if rgb.shape != (3,) or not np.all(np.isfinite(rgb) & (rgb >= 0) & (rgb <= 1)):
+        raise ValueError("Mesh color must contain three finite values in [0, 1]")
+    if not np.isfinite(opacity) or not 0.0 <= opacity <= 1.0:
+        raise ValueError("Mesh opacity must be finite and in [0, 1]")
 
-    Args:
-        streamlines_list: List of streamline arrays to highlight.
-        color: RGB color tuple (default red).
-        linewidth: Line width in pixels.
-        opacity: Actor opacity.
+    if mapper is None:
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputData(polydata)
+        mapper.ScalarVisibilityOff()
+    mesh_actor = vtk.vtkActor()
+    mesh_actor.SetMapper(mapper)
+    mesh_actor.PickableOff()
+    mesh_actor.GetProperty().SetColor(*rgb)
+    mesh_actor.GetProperty().SetOpacity(opacity)
+    mesh_actor.GetProperty().BackfaceCullingOff()
+    user_matrix = vtk.vtkMatrix4x4()
+    user_matrix.DeepCopy(matrix.ravel())
+    mesh_actor.SetUserMatrix(user_matrix)
+    return mesh_actor
 
-    Returns:
-        VTK actor for ROI-highlighted streamlines, or None if creation fails.
-    """
-    if not streamlines_list:
-        return None
 
-    try:
-        roi_actor = actor.line(
-            streamlines_list,
-            colors=color,
-            linewidth=linewidth,
-            opacity=opacity,
-            depth_cue=False,
+def create_mesh_component_actor(
+    layer: MeshLayer, component: MeshComponent,
+) -> vtk.vtkActor:
+    """Build one unlit overlay from source geometry, never from UV display data."""
+    from vtk.util.numpy_support import numpy_to_vtkIdTypeArray
+    from ..mesh.presentation import validate_mesh_component_style
+
+    if component not in ("edges", "vertices"):
+        raise ValueError("Expected an edges or vertices overlay")
+    preference = layer["presentation"][component]
+    size_field = "line_width" if component == "edges" else "point_size"
+    style = validate_mesh_component_style(component, {
+        "color": preference["color"], size_field: preference[size_field],
+    })
+    source = layer["polydata"]
+    if component == "vertices":
+        # A single polyvertex includes every loaded point, including unused ones.
+        points = vtk.vtkPolyData()
+        points.SetPoints(source.GetPoints())
+        count = source.GetNumberOfPoints()
+        cells = vtk.vtkCellArray()
+        cells.SetData(
+            numpy_to_vtkIdTypeArray(np.array([0, count], dtype=np.int64), deep=True),
+            numpy_to_vtkIdTypeArray(np.arange(count, dtype=np.int64), deep=True),
         )
+        points.SetVerts(cells)
+        source = points
+    overlay = create_mesh_actor(source, layer["source_to_ras"], style["color"], 1.0)
+    properties = overlay.GetProperty()
+    properties.LightingOff()
+    if component == "edges":
+        properties.SetRepresentationToWireframe()
+        properties.SetLineWidth(style["line_width"])
+    else:
+        properties.SetPointSize(style["point_size"])
+    # Per-actor raster depth bias avoids VTK's process-global polygon offset mode.
+    bias = "1.0" if component == "edges" else "2.0"
+    overlay.GetShaderProperty().AddFragmentShaderReplacement(
+        "//VTK::Depth::Impl", True,
+        "//VTK::Depth::Impl\n"
+        f"gl_FragDepth = gl_FragCoord.z - {bias} / 65000.0;\n", False,
+    )
+    from ..mesh.overlays import mesh_interaction_preview
 
-        # Stronger offset to draw on top of yellow highlights
-        mapper = roi_actor.GetMapper()
-        if mapper:
-            mapper.SetResolveCoincidentTopologyToPolygonOffset()
-            mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(-2, -20)
+    preview = mesh_interaction_preview(layer["polydata"], component)
+    overlay._mesh_full_mapper = overlay.GetMapper()
+    if preview is not None:
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputData(preview)
+        mapper.ScalarVisibilityOff()
+        overlay._mesh_interaction_mapper = mapper
+    overlay._mesh_preview_base_mapper = getattr(
+        overlay, "_mesh_interaction_mapper", overlay.GetMapper(),
+    )
+    overlay._mesh_preview_levels = {}
+    return overlay
 
-        return roi_actor
-    except (RuntimeError, ValueError, AttributeError) as e:
-        logger.error(f"Error creating ROI highlight actor: {e}")
-        return None
+
+def create_mesh_advanced_actor(layer: MeshLayer, component: MeshComponent, data=None):
+    """Create a single non-pickable overlay; glyph size is in world millimetres."""
+    from ..mesh.overlays import mesh_ras_bounds, sampled_normal_polydata
+
+    preference = layer["presentation"][component]
+    if component == "bounding_box":
+        outline = vtk.vtkOutlineSource()
+        outline.SetBounds(mesh_ras_bounds(layer))
+        outline.Update()
+        overlay = create_mesh_actor(
+            outline.GetOutput(), np.eye(4), preference["color"], 1,
+        )
+    elif component == "boundary_edges":
+        overlay = create_mesh_actor(
+            data.polydata, layer["source_to_ras"], preference["color"], 1,
+        )
+        from ..mesh.overlays import mesh_interaction_preview
+
+        preview = mesh_interaction_preview(data.polydata, component)
+        overlay._mesh_full_mapper = overlay.GetMapper()
+        if preview is not None:
+            mapper = vtk.vtkPolyDataMapper()
+            mapper.SetInputData(preview)
+            mapper.ScalarVisibilityOff()
+            overlay._mesh_interaction_mapper = mapper
+        overlay._mesh_preview_base_mapper = getattr(
+            overlay, "_mesh_interaction_mapper", overlay.GetMapper(),
+        )
+        overlay._mesh_preview_levels = {}
+    elif component == "surface_normals":
+        arrow = vtk.vtkArrowSource()
+        arrow.SetTipResolution(6)
+        arrow.SetShaftResolution(6)
+        mapper = vtk.vtkGlyph3DMapper()
+        mapper.SetSourceConnection(arrow.GetOutputPort())
+        mapper.SetInputData(sampled_normal_polydata(data, preference["density"]))
+        mapper.SetOrientationArray("face_normals")
+        mapper.SetOrientationModeToDirection()
+        mapper.OrientOn()
+        mapper.ScalingOn()
+        mapper.SetScaleModeToNoDataScaling()
+        mapper.SetScaleFactor(preference["length_mm"])
+        mapper.ScalarVisibilityOff()
+        overlay = vtk.vtkActor()
+        overlay.SetMapper(mapper)
+        matrix = vtk.vtkMatrix4x4()
+        matrix.DeepCopy(layer["source_to_ras"].ravel())
+        overlay.SetUserMatrix(matrix)
+        overlay.GetProperty().SetColor(*preference["color"])
+        overlay.PickableOff()
+    else:
+        raise ValueError("Unknown Advanced mesh component")
+    overlay.UseBoundsOff()
+    overlay.GetProperty().LightingOff()
+    if "line_width" in preference:
+        overlay.GetProperty().SetLineWidth(preference["line_width"])
+    if component == "boundary_edges":
+        overlay.GetShaderProperty().AddFragmentShaderReplacement(
+            "//VTK::Depth::Impl", True,
+            "//VTK::Depth::Impl\ngl_FragDepth = gl_FragCoord.z - 1.5 / 65000.0;\n",
+            False,
+        )
+    return overlay
 
 
 # =============================================================================
@@ -210,6 +304,11 @@ def create_slicer_actor(
         VTK slicer actor, or None if creation fails.
     """
     try:
+        if data.ndim == 4 and data.shape[-1] == 3:
+            from ..image_volume import rgb_display_values
+
+            data = rgb_display_values(data)
+            value_range = (0, 255)
         slicer_actor = actor.slicer(
             data,
             affine=np.eye(4),
@@ -222,100 +321,6 @@ def create_slicer_actor(
     except (RuntimeError, ValueError, AttributeError) as e:
         logger.error(f"Error creating slicer actor: {e}")
         return None
-
-
-# =============================================================================
-# ODF Actors
-# =============================================================================
-
-
-def create_odf_actor(
-    odf_amplitudes: np.ndarray,
-    sphere: Any,
-    affine: np.ndarray,
-    scale: float = 0.5,
-    extent: Optional[Tuple[int, ...]] = None,
-) -> Optional[vtk.vtkActor]:
-    """
-    Creates an ODF glyph actor using FURY's odf_slicer.
-
-    Args:
-        odf_amplitudes: 4D array (x, y, z, N_vertices) of SF amplitudes.
-        sphere: The SimpleSphere object used for reconstruction.
-        affine: The affine of the ODF volume.
-        scale: Scale factor for ODF glyphs.
-        extent: Optional display extent (min_x, max_x, min_y, max_y, min_z, max_z).
-
-    Returns:
-        VTK actor for ODF visualization, or None if creation fails.
-    """
-    if odf_amplitudes is None:
-        return None
-
-    try:
-        odf_actor = actor.odf_slicer(
-            odf_amplitudes,
-            sphere=sphere,
-            affine=affine,
-            scale=scale,
-            norm=True,
-            global_cm=False,
-        )
-
-        if extent is not None:
-            odf_actor.display_extent(*extent)
-
-        return odf_actor
-    except (RuntimeError, ValueError, AttributeError) as e:
-        logger.error(f"Error creating ODF actor: {e}")
-        return None
-
-
-# =============================================================================
-# Selection Sphere Actor
-# =============================================================================
-
-
-def create_selection_sphere(
-    radius: float,
-    center: Tuple[float, float, float],
-    color: Tuple[float, float, float] = (0.2, 0.5, 1.0),
-    opacity: float = 0.3,
-) -> vtk.vtkActor:
-    """
-    Creates a wireframe sphere actor for selection visualization.
-
-    Args:
-        radius: Sphere radius in world units.
-        center: Center point (x, y, z).
-        color: RGB color tuple.
-        opacity: Sphere opacity.
-
-    Returns:
-        VTK sphere actor.
-    """
-    sphere_source = vtk.vtkSphereSource()
-    sphere_source.SetRadius(radius)
-    sphere_source.SetCenter(0, 0, 0)
-    sphere_source.SetPhiResolution(16)
-    sphere_source.SetThetaResolution(16)
-
-    mapper = vtk.vtkPolyDataMapper()
-    mapper.SetInputConnection(sphere_source.GetOutputPort())
-
-    sphere_actor = vtk.vtkActor()
-    sphere_actor.SetMapper(mapper)
-    sphere_actor.SetPosition(center)
-
-    prop = sphere_actor.GetProperty()
-    prop.SetColor(*color)
-    prop.SetOpacity(opacity)
-    prop.SetRepresentationToWireframe()
-    prop.SetLineWidth(1.0)
-
-    sphere_actor.SetVisibility(0)
-
-    return sphere_actor
 
 
 # =============================================================================
@@ -506,7 +511,7 @@ def create_orientation_cube() -> vtk.vtkAnnotatedCubeActor:
 
 
 def create_orientation_widget(
-    cube_actor: vtk.vtkAnnotatedCubeActor,
+    cube_actor: vtk.vtkProp3D,
     interactor: vtk.vtkRenderWindowInteractor,
     viewport: Tuple[float, float, float, float] = (0.85, 0.0, 1.0, 0.15),
 ) -> vtk.vtkOrientationMarkerWidget:
@@ -529,128 +534,3 @@ def create_orientation_widget(
     widget.InteractiveOff()
 
     return widget
-
-
-# =============================================================================
-# Scalar Bar Actor
-# =============================================================================
-
-
-def create_scalar_bar(
-    lut: vtk.vtkLookupTable,
-    title: str,
-    position: Tuple[float, float] = (0.88, 0.25),
-    width: float = 0.1,
-    height: float = 0.5,
-) -> vtk.vtkScalarBarActor:
-    """
-    Creates a scalar bar actor for colormap display.
-
-    Args:
-        lut: VTK lookup table for colors.
-        title: Title for the scalar bar.
-        position: Position in normalized display coordinates.
-        width: Width as fraction of display.
-        height: Height as fraction of display.
-
-    Returns:
-        VTK scalar bar actor.
-    """
-    scalar_bar = vtk.vtkScalarBarActor()
-    scalar_bar.SetLookupTable(lut)
-    scalar_bar.SetTitle(title + "\n")
-
-    # Positioning
-    scalar_bar.SetPosition(*position)
-    scalar_bar.SetWidth(width)
-    scalar_bar.SetHeight(height)
-
-    # Title Styling
-    title_prop = vtk.vtkTextProperty()
-    title_prop.SetColor(0.9, 0.9, 0.9)
-    title_prop.SetFontSize(10)
-    title_prop.SetFontFamilyToArial()
-    title_prop.BoldOn()
-    title_prop.ShadowOn()
-    title_prop.SetJustificationToRight()
-
-    # Label Styling
-    label_prop = vtk.vtkTextProperty()
-    label_prop.SetColor(0.8, 0.8, 0.8)
-    label_prop.SetFontSize(10)
-    label_prop.SetFontFamilyToArial()
-    label_prop.ShadowOff()
-
-    scalar_bar.SetTitleTextProperty(title_prop)
-    scalar_bar.SetLabelTextProperty(label_prop)
-
-    # Formatting
-    scalar_bar.SetNumberOfLabels(5)
-    scalar_bar.SetLabelFormat("%-.4g")
-    scalar_bar.UnconstrainedFontSizeOn()
-    scalar_bar.SetTextPositionToPrecedeScalarBar()
-
-    return scalar_bar
-
-
-# =============================================================================
-# Crosshair Actors
-# =============================================================================
-
-
-def create_crosshair_components() -> Dict[str, Any]:
-    """
-    Creates the VTK components for a crosshair (two perpendicular lines).
-
-    Returns:
-        Dictionary containing:
-        - 'line1': vtkLineSource for first line
-        - 'line2': vtkLineSource for second line
-        - 'appender': vtkAppendPolyData combining both lines
-        - 'mapper': vtkPolyDataMapper for the combined geometry
-    """
-    line1 = vtk.vtkLineSource()
-    line2 = vtk.vtkLineSource()
-
-    appender = vtk.vtkAppendPolyData()
-    appender.AddInputConnection(line1.GetOutputPort())
-    appender.AddInputConnection(line2.GetOutputPort())
-
-    mapper = vtk.vtkPolyDataMapper()
-    mapper.SetInputConnection(appender.GetOutputPort())
-    mapper.SetResolveCoincidentTopologyToPolygonOffset()
-    mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(-1, -1)
-
-    return {
-        "line1": line1,
-        "line2": line2,
-        "appender": appender,
-        "mapper": mapper,
-    }
-
-
-def create_crosshair_actor(
-    mapper: vtk.vtkPolyDataMapper,
-    color: Tuple[float, float, float] = (1.0, 1.0, 0.0),
-    line_width: float = 1.0,
-    opacity: float = 0.8,
-) -> vtk.vtkActor:
-    """
-    Creates a crosshair actor from a mapper.
-
-    Args:
-        mapper: VTK mapper for the crosshair geometry.
-        color: RGB color tuple (default yellow).
-        line_width: Line width in pixels.
-        opacity: Actor opacity.
-
-    Returns:
-        VTK actor for the crosshair.
-    """
-    crosshair_actor = vtk.vtkActor()
-    crosshair_actor.SetMapper(mapper)
-    crosshair_actor.GetProperty().SetColor(*color)
-    crosshair_actor.GetProperty().SetLineWidth(line_width)
-    crosshair_actor.GetProperty().SetOpacity(opacity)
-
-    return crosshair_actor

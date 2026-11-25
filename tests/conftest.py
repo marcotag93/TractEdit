@@ -7,10 +7,60 @@ Provides reusable test data and setup for streamline, NIfTI, and ODF testing.
 
 import os
 import tempfile
+from unittest.mock import MagicMock
 import numpy as np
 import pytest
 import nibabel as nib
 from nibabel.streamlines import ArraySequence
+
+
+@pytest.fixture
+def make_mock_main_window():
+    def make(**overrides):
+        window = MagicMock()
+        window.configure_mock(
+            roi_layers={}, roi_states={}, roi_intersection_cache={},
+            tractogram_data=MagicMock(), vtk_panel=MagicMock(),
+        )
+        window.configure_mock(**overrides)
+        return window
+
+    return make
+
+
+def vtk_matrix_to_numpy(matrix) -> np.ndarray:
+    return np.array(
+        [[matrix.GetElement(row, col) for col in range(4)] for row in range(4)]
+    )
+
+
+@pytest.fixture
+def sheared_oblique_affine() -> np.ndarray:
+    return np.array(
+        [
+            [0.0, -3.0, 0.4, 10.0],
+            [2.0, 0.0, 0.0, -5.0],
+            [0.2, 0.5, 4.0, 2.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+
+@pytest.fixture
+def oblique_affine() -> np.ndarray:
+    angle = np.deg2rad(12.0)
+    rotation = np.array(
+        [
+            [np.cos(angle), -np.sin(angle), 0.0],
+            [np.sin(angle), np.cos(angle), 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    affine = np.eye(4)
+    affine[:3, :3] = rotation @ np.diag([0.5, 0.75, 1.25])
+    affine[:3, 3] = [-12.0, 8.0, 21.0]
+    return affine
 
 
 # ============================================================================
