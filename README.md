@@ -24,7 +24,11 @@
 > [!IMPORTANT]
 > **Research Use Only.** TractEdit is a research tool for the visualization, virtual dissection, and quality control of diffusion MRI tractography. It is **not a medical device**, has not been clinically validated, and holds no regulatory clearance (FDA / CE). It must not be used for diagnosis, treatment planning, or neurosurgical guidance.
 
-https://github.com/user-attachments/assets/8b95cfea-a0b9-4537-8e0f-0ac645f44294
+
+
+https://github.com/user-attachments/assets/397241bc-2700-4f4f-9fe1-027de6bb4900
+
+
 
 <sub>The surface mesh and the TRX file shown with it in this video were obtained from the <a href="https://zenodo.org/records/20681790">Track4Edu repository on Zenodo</a> and used solely for this video demonstration. We thank the Track4Edu authors for making these data available.</sub>
 
