@@ -13,18 +13,248 @@ Provides centralized style definitions for consistent theming across all compone
 
 from __future__ import annotations
 
+import ctypes
 import logging
+import sys
+import weakref
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QWidget
 from PyQt6.QtGui import QPalette, QColor
-from PyQt6.QtCore import QSettings
+from PyQt6.QtCore import QSettings, Qt
 
 if TYPE_CHECKING:
     from ..main_window import MainWindow
 
 logger = logging.getLogger(__name__)
+
+_OBJC_LIB = None
+_MSG_PTR_0 = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
+_MSG_PTR_1_PTR = ctypes.CFUNCTYPE(
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p
+)
+_MSG_PTR_1_CSTR = ctypes.CFUNCTYPE(
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p
+)
+_MSG_PTR_1_SIZE = ctypes.CFUNCTYPE(
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t
+)
+_MSG_VOID_0 = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p)
+_MSG_VOID_1_PTR = ctypes.CFUNCTYPE(
+    None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p
+)
+_MSG_SIZE_0 = ctypes.CFUNCTYPE(ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p)
+_MSG_CSTR_0 = ctypes.CFUNCTYPE(ctypes.c_char_p, ctypes.c_void_p, ctypes.c_void_p)
+
+
+def _get_objc_lib():
+    global _OBJC_LIB
+    if _OBJC_LIB is None:
+        lib = ctypes.CDLL("/usr/lib/libobjc.A.dylib")
+        lib.objc_getClass.restype = ctypes.c_void_p
+        lib.objc_getClass.argtypes = [ctypes.c_char_p]
+        lib.sel_registerName.restype = ctypes.c_void_p
+        lib.sel_registerName.argtypes = [ctypes.c_char_p]
+        _OBJC_LIB = lib
+    return _OBJC_LIB
+
+
+def _is_macos_cocoa(app: Optional[QApplication]) -> bool:
+    if sys.platform != "darwin" or app is None:
+        return False
+    platform_name = getattr(app, "platformName", None)
+    return callable(platform_name) and platform_name() == "cocoa"
+
+
+def _set_macos_appearance(app: Optional[QApplication], mode: "ThemeMode") -> bool:
+    """Sync NSApp and open NSWindow appearances with the selected theme."""
+    if not _is_macos_cocoa(app):
+        return False
+    pool = None
+    try:
+        lib = _get_objc_lib()
+        msg_ptr_0 = ctypes.cast(lib.objc_msgSend, _MSG_PTR_0)
+        msg_ptr_1_ptr = ctypes.cast(lib.objc_msgSend, _MSG_PTR_1_PTR)
+        msg_ptr_1_cstr = ctypes.cast(lib.objc_msgSend, _MSG_PTR_1_CSTR)
+        msg_ptr_1_size = ctypes.cast(lib.objc_msgSend, _MSG_PTR_1_SIZE)
+        msg_void_0 = ctypes.cast(lib.objc_msgSend, _MSG_VOID_0)
+        msg_void_1_ptr = ctypes.cast(lib.objc_msgSend, _MSG_VOID_1_PTR)
+        msg_size_0 = ctypes.cast(lib.objc_msgSend, _MSG_SIZE_0)
+
+        pool = msg_ptr_0(
+            lib.objc_getClass(b"NSAutoreleasePool"),
+            lib.sel_registerName(b"new"),
+        )
+        ns_app = msg_ptr_0(
+            lib.objc_getClass(b"NSApplication"),
+            lib.sel_registerName(b"sharedApplication"),
+        )
+        if not ns_app:
+            return False
+
+        if mode == ThemeMode.SYSTEM:
+            appearance = None
+        else:
+            name = (
+                b"NSAppearanceNameDarkAqua"
+                if mode == ThemeMode.DARK
+                else b"NSAppearanceNameAqua"
+            )
+            ns_name = msg_ptr_1_cstr(
+                lib.objc_getClass(b"NSString"),
+                lib.sel_registerName(b"stringWithUTF8String:"),
+                name,
+            )
+            if not ns_name:
+                return False
+            appearance = msg_ptr_1_ptr(
+                lib.objc_getClass(b"NSAppearance"),
+                lib.sel_registerName(b"appearanceNamed:"),
+                ns_name,
+            )
+            if not appearance:
+                return False
+
+        sel_set_appearance = lib.sel_registerName(b"setAppearance:")
+        msg_void_1_ptr(ns_app, sel_set_appearance, appearance)
+        windows = msg_ptr_0(ns_app, lib.sel_registerName(b"windows"))
+        if windows:
+            count = msg_size_0(windows, lib.sel_registerName(b"count"))
+            sel_object_at = lib.sel_registerName(b"objectAtIndex:")
+            for index in range(count):
+                window = msg_ptr_1_size(windows, sel_object_at, index)
+                if window:
+                    msg_void_1_ptr(window, sel_set_appearance, appearance)
+        return True
+    except Exception as exc:
+        logger.debug("Failed to update macOS appearance: %s", exc)
+        return False
+    finally:
+        if pool:
+            try:
+                lib = _get_objc_lib()
+                ctypes.cast(lib.objc_msgSend, _MSG_VOID_0)(
+                    pool, lib.sel_registerName(b"drain")
+                )
+            except Exception:
+                pass
+
+
+def _macos_system_is_dark(app: Optional[QApplication]) -> Optional[bool]:
+    """Read the live macOS system appearance polarity via AppKit."""
+    if not _is_macos_cocoa(app):
+        return None
+    pool = None
+    try:
+        lib = _get_objc_lib()
+        msg_ptr_0 = ctypes.cast(lib.objc_msgSend, _MSG_PTR_0)
+        msg_ptr_1_ptr = ctypes.cast(lib.objc_msgSend, _MSG_PTR_1_PTR)
+        msg_ptr_1_cstr = ctypes.cast(lib.objc_msgSend, _MSG_PTR_1_CSTR)
+        msg_cstr_0 = ctypes.cast(lib.objc_msgSend, _MSG_CSTR_0)
+
+        pool = msg_ptr_0(
+            lib.objc_getClass(b"NSAutoreleasePool"),
+            lib.sel_registerName(b"new"),
+        )
+        ns_app = msg_ptr_0(
+            lib.objc_getClass(b"NSApplication"),
+            lib.sel_registerName(b"sharedApplication"),
+        )
+        if not ns_app:
+            return None
+
+        sel_utf8 = lib.sel_registerName(b"UTF8String")
+        explicit = msg_ptr_0(ns_app, lib.sel_registerName(b"appearance"))
+        if not explicit:
+            effective = msg_ptr_0(
+                ns_app, lib.sel_registerName(b"effectiveAppearance")
+            )
+            if not effective:
+                return None
+            name_obj = msg_ptr_0(effective, lib.sel_registerName(b"name"))
+            raw = msg_cstr_0(name_obj, sel_utf8) if name_obj else None
+            return b"Dark" in raw if raw else None
+
+        defaults = msg_ptr_0(
+            lib.objc_getClass(b"NSUserDefaults"),
+            lib.sel_registerName(b"standardUserDefaults"),
+        )
+        if not defaults:
+            return None
+        key = msg_ptr_1_cstr(
+            lib.objc_getClass(b"NSString"),
+            lib.sel_registerName(b"stringWithUTF8String:"),
+            b"AppleInterfaceStyle",
+        )
+        style = msg_ptr_1_ptr(
+            defaults, lib.sel_registerName(b"stringForKey:"), key
+        )
+        if not style:
+            return False
+        raw = msg_cstr_0(style, sel_utf8)
+        return bool(raw and b"Dark" in raw)
+    except Exception as exc:
+        logger.debug("Failed to read macOS system appearance: %s", exc)
+        return None
+    finally:
+        if pool:
+            try:
+                lib = _get_objc_lib()
+                ctypes.cast(lib.objc_msgSend, _MSG_VOID_0)(
+                    pool, lib.sel_registerName(b"drain")
+                )
+            except Exception:
+                pass
+
+
+def get_macos_appearance_state(
+    app: Optional[QApplication] = None,
+) -> Optional[dict[str, Optional[str]]]:
+    """Return explicit and effective NSApp appearance names on macOS Cocoa."""
+    app = app if app is not None else QApplication.instance()
+    if not _is_macos_cocoa(app):
+        return None
+    pool = None
+    try:
+        lib = _get_objc_lib()
+        msg_ptr_0 = ctypes.cast(lib.objc_msgSend, _MSG_PTR_0)
+        msg_cstr_0 = ctypes.cast(lib.objc_msgSend, _MSG_CSTR_0)
+        pool = msg_ptr_0(
+            lib.objc_getClass(b"NSAutoreleasePool"),
+            lib.sel_registerName(b"new"),
+        )
+        ns_app = msg_ptr_0(
+            lib.objc_getClass(b"NSApplication"),
+            lib.sel_registerName(b"sharedApplication"),
+        )
+        if not ns_app:
+            return None
+        sel_name = lib.sel_registerName(b"name")
+        sel_utf8 = lib.sel_registerName(b"UTF8String")
+
+        def _name(appearance_ptr):
+            if not appearance_ptr:
+                return None
+            name_obj = msg_ptr_0(appearance_ptr, sel_name)
+            raw = msg_cstr_0(name_obj, sel_utf8) if name_obj else None
+            return raw.decode("utf-8", errors="replace") if raw else None
+
+        explicit = msg_ptr_0(ns_app, lib.sel_registerName(b"appearance"))
+        effective = msg_ptr_0(ns_app, lib.sel_registerName(b"effectiveAppearance"))
+        return {"explicit": _name(explicit), "effective": _name(effective)}
+    except Exception as exc:
+        logger.debug("Failed to query macOS appearance state: %s", exc)
+        return None
+    finally:
+        if pool:
+            try:
+                lib = _get_objc_lib()
+                ctypes.cast(lib.objc_msgSend, _MSG_VOID_0)(
+                    pool, lib.sel_registerName(b"drain")
+                )
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -139,6 +369,14 @@ _WIDGETS_QSS = """
     QDockWidget::title {{ background-color: {raised}; padding: 4px; }}
 """
 
+_MACOS_WIDGETS_QSS = """
+    QToolBar {{ background-color: {window}; color: {text}; border: none; border-bottom: 1px solid {border}; }}
+    QToolBar QLabel {{ color: {text}; background-color: transparent; }}
+    QDockWidget::title {{ background-color: {raised}; color: {text}; padding: 4px; }}
+    QStatusBar {{ background-color: {window}; color: {text}; }}
+    QStatusBar QLabel {{ color: {text}; background-color: transparent; }}
+"""
+
 _TREE_QSS = """
     QTreeWidget {{ outline: 0; {tree_colors} }}
     QTreeWidget::item {{ padding: 4px; border-radius: 4px; }}
@@ -245,6 +483,18 @@ class ThemeManager:
     def _system_is_dark(self) -> bool:
         app = QApplication.instance()
         if app:
+            if sys.platform == "darwin":
+                macos_dark = _macos_system_is_dark(app)
+                if macos_dark is not None:
+                    return macos_dark
+                hints = getattr(app, "styleHints", lambda: None)()
+                scheme_fn = getattr(hints, "colorScheme", None)
+                if callable(scheme_fn):
+                    scheme = scheme_fn()
+                    if scheme == Qt.ColorScheme.Dark:
+                        return True
+                    if scheme == Qt.ColorScheme.Light:
+                        return False
             color = app.palette().color(QPalette.ColorRole.Window)
             return self._calculate_luminance(color) < 128
         return False
@@ -266,19 +516,126 @@ class ThemeManager:
         if not app:
             return
 
-        if self._current_mode == ThemeMode.SYSTEM:
-            # Reset to system default palette
-            app.setPalette(app.style().standardPalette())
-            # On Windows, menus don't properly inherit palette colors,
-            # so we need to apply minimal menu styling based on detected theme
-            app.setStyleSheet(self._get_system_menu_stylesheet())
-        elif self._current_mode == ThemeMode.DARK:
-            self._apply_dark_palette(app)
-        else:
-            self._apply_light_palette(app)
+        self._applying_theme = True
+        try:
+            self._connect_system_theme_changes(app)
+            if sys.platform == "darwin":
+                _set_macos_appearance(app, self._current_mode)
 
-        # Update all themed components
-        self._update_themed_components()
+            if self._current_mode == ThemeMode.SYSTEM:
+                if sys.platform == "darwin":
+                    self._apply_palette(app, self._system_is_dark())
+                else:
+                    # Reset to system default palette
+                    app.setPalette(app.style().standardPalette())
+                    # On Windows, menus don't properly inherit palette colors,
+                    # so we need to apply minimal menu styling based on detected theme
+                    app.setStyleSheet(self._get_system_menu_stylesheet())
+            elif self._current_mode == ThemeMode.DARK:
+                self._apply_dark_palette(app)
+            else:
+                self._apply_light_palette(app)
+
+            self._sync_theme_actions()
+            # Update all themed components
+            self._update_themed_components()
+            if sys.platform == "darwin":
+                self._refresh_macos_widgets()
+        finally:
+            self._applying_theme = False
+
+    def _sync_theme_actions(self) -> None:
+        mw = getattr(self, "mw", None)
+        if mw is None:
+            return
+        action_map = {
+            ThemeMode.LIGHT: getattr(mw, "theme_light_action", None),
+            ThemeMode.DARK: getattr(mw, "theme_dark_action", None),
+            ThemeMode.SYSTEM: getattr(mw, "theme_system_action", None),
+        }
+        target = action_map.get(self._current_mode)
+        if target is None or target.isChecked():
+            return
+        group = getattr(mw, "theme_action_group", None)
+        blockables = [obj for obj in (group, target) if obj is not None and hasattr(obj, "blockSignals")]
+        previous = [(obj, obj.blockSignals(True)) for obj in blockables]
+        try:
+            target.setChecked(True)
+        finally:
+            for obj, was_blocked in reversed(previous):
+                obj.blockSignals(was_blocked)
+
+    def _connect_system_theme_changes(self, app: QApplication) -> None:
+        if sys.platform != "darwin" or getattr(self, "_system_theme_connected", False):
+            return
+        hints = getattr(app, "styleHints", lambda: None)()
+        signal = getattr(hints, "colorSchemeChanged", None)
+        if signal is None:
+            return
+        self_ref = weakref.ref(self)
+
+        def _on_scheme_changed(_scheme=None) -> None:
+            manager = self_ref()
+            if (
+                manager is None
+                or manager._current_mode != ThemeMode.SYSTEM
+                or getattr(manager, "_applying_theme", False)
+            ):
+                return
+            manager._apply_theme()
+
+        try:
+            signal.connect(_on_scheme_changed)
+        except Exception:
+            return
+        self._system_theme_connected = True
+        self._system_theme_slot = _on_scheme_changed
+        mw = getattr(self, "mw", None)
+        destroyed = getattr(mw, "destroyed", None)
+        if destroyed is not None:
+
+            def _disconnect(*_args) -> None:
+                try:
+                    signal.disconnect(_on_scheme_changed)
+                except (RuntimeError, TypeError):
+                    pass
+
+            destroyed.connect(_disconnect)
+
+    def _refresh_macos_widgets(self) -> None:
+        """Repolish non-VTK chrome widgets on macOS after appearance updates."""
+        mw = getattr(self, "mw", None)
+        if mw is None:
+            return
+        containers = (
+            getattr(mw, "main_toolbar", None),
+            getattr(mw, "scalar_toolbar", None),
+            getattr(mw, "data_dock_widget", None),
+            getattr(mw, "status_bar", None),
+        )
+        seen: set[int] = set()
+        targets: list[QWidget] = []
+        for container in containers:
+            if container is None:
+                continue
+            for widget in (container, *container.findChildren(QWidget)):
+                ident = id(widget)
+                if ident not in seen:
+                    seen.add(ident)
+                    targets.append(widget)
+        for widget in targets:
+            try:
+                style = widget.style()
+                if style is not None:
+                    style.unpolish(widget)
+                    style.polish(widget)
+                widget.update()
+            except RuntimeError:
+                continue
+        try:
+            mw.update()
+        except RuntimeError:
+            pass
 
     def _apply_dark_palette(self, app: QApplication) -> None:
         self._apply_palette(app, True)
@@ -307,8 +664,18 @@ class ThemeManager:
         app.setStyleSheet(self._application_stylesheet(is_dark))
 
     @staticmethod
-    def _application_stylesheet(is_dark: bool) -> str:
-        return (_TOOLTIP_QSS + _MENU_QSS + _WIDGETS_QSS).format(**_tokens(is_dark))
+    def _application_stylesheet(
+        is_dark: bool, is_macos: Optional[bool] = None
+    ) -> str:
+        if is_macos is None:
+            is_macos = sys.platform == "darwin"
+        tokens = _tokens(is_dark)
+        if not is_macos:
+            return (_TOOLTIP_QSS + _MENU_QSS + _WIDGETS_QSS).format(**tokens)
+        mac_tokens = {**tokens, "dock_icons_rule": ""}
+        return (
+            _TOOLTIP_QSS + _MENU_QSS + _WIDGETS_QSS + _MACOS_WIDGETS_QSS
+        ).format(**mac_tokens)
 
     def _get_system_menu_stylesheet(self) -> str:
         return _MENU_QSS.format(**_tokens(self._system_is_dark()))

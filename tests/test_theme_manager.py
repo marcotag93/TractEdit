@@ -24,3 +24,16 @@ def test_generated_stylesheets_have_complete_rules(mode, monkeypatch):
     rule = r"[^{}]+\{(?:\s*[\w-]+:\s*[^{};]+;)+\s*\}"
     for stylesheet in styles:
         assert re.fullmatch(rf"(?:{rule}\s*)+", stylesheet), stylesheet
+
+
+@pytest.mark.parametrize("is_dark", [False, True])
+def test_macos_stylesheet_covers_toolbar_and_preserves_dock_buttons(is_dark):
+    rule = r"[^{}]+\{(?:\s*[\w-]+:\s*[^{};]+;)+\s*\}"
+    mac_style = ThemeManager._application_stylesheet(is_dark, is_macos=True)
+    other_style = ThemeManager._application_stylesheet(is_dark, is_macos=False)
+    assert re.fullmatch(rf"(?:{rule}\s*)+", mac_style), mac_style
+    assert "QToolBar {" in mac_style and "QToolBar QLabel {" in mac_style
+    assert "QStatusBar {" in mac_style and "titlebar-close-icon: none" not in mac_style
+    assert "QToolBar {" not in other_style
+    if is_dark:
+        assert "titlebar-close-icon: none" in other_style
