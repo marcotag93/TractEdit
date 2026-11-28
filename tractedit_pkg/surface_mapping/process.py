@@ -28,6 +28,7 @@ from .models import (
     mapping_source,
     prepare_surface_geometry,
 )
+from .queries import flat_streamline_source
 
 TRANSFER_BYTES = 4 * 1024 * 1024
 MARKER_LIMIT = 50_000
@@ -100,20 +101,119 @@ def _polydata(points, cells):
 
 
 def _terminal_pair(line, end, cancel):
-    index = 0 if end == 0 else len(line) - 1
+    length = len(line)
+    index = 0 if end == 0 else length - 1
     point = np.asarray(line[index], dtype=np.float64)
-    for start in range(1, len(line), QUERY_CHUNK_ITEMS):
+    if length < 2:
+        return point, point
+    if isinstance(line, np.ndarray):
+        neighbor = line[1 if end == 0 else length - 2]
+        if (
+            float(neighbor[0]) != float(point[0])
+            or float(neighbor[1]) != float(point[1])
+            or float(neighbor[2]) != float(point[2])
+        ):
+            return point, np.asarray(neighbor, dtype=np.float64)
+    for start in range(1, length, QUERY_CHUNK_ITEMS):
         _check_cancel(cancel)
-        stop = min(start + QUERY_CHUNK_ITEMS, len(line))
+        stop = min(start + QUERY_CHUNK_ITEMS, length)
         block = np.asarray(
             line[start:stop]
             if end == 0
-            else line[len(line) - stop : len(line) - start][::-1]
+            else line[length - stop : length - start][::-1]
         )
         distinct = np.flatnonzero(np.any(block != point, axis=1))
         if len(distinct):
             return point, block[distinct[0]]
     return point, point
+
+
+def _stage_flat_points(
+    points, ids, offsets, data, src_offsets, src_lengths, endpoint_mode, cancel
+):
+    if endpoint_mode:
+        buf = np.empty((QUERY_CHUNK_ITEMS, 4, 3), dtype=np.float64)
+        for c_start in range(0, len(ids), QUERY_CHUNK_ITEMS):
+            _check_cancel(cancel)
+            c_stop = min(c_start + QUERY_CHUNK_ITEMS, len(ids))
+            chunk_ids = ids[c_start:c_stop]
+            chunk_lens = src_lengths[chunk_ids].astype(np.int64, copy=False)
+            valid_mask = chunk_lens > 0
+            if not np.any(valid_mask):
+                continue
+            if not np.all(valid_mask):
+                chunk_ids = chunk_ids[valid_mask]
+                chunk_lens = chunk_lens[valid_mask]
+            chunk_offs = src_offsets[chunk_ids].astype(np.int64, copy=False)
+            out = buf[: len(chunk_ids)]
+            out[:, 0] = data[chunk_offs]
+            out[:, 1] = data[chunk_offs + np.minimum(chunk_lens - 1, 1)]
+            out[:, 2] = data[chunk_offs + np.maximum(chunk_lens - 2, 0)]
+            out[:, 3] = data[chunk_offs + chunk_lens - 1]
+            dup0 = (chunk_lens > 2) & ~np.any(out[:, 1] != out[:, 0], axis=1)
+            if np.any(dup0):
+                for k in np.flatnonzero(dup0):
+                    off_k = int(chunk_offs[k])
+                    len_k = int(chunk_lens[k])
+                    _, out[k, 1] = _terminal_pair(
+                        data[off_k : off_k + len_k], 0, cancel
+                    )
+            dup1 = (chunk_lens > 2) & ~np.any(out[:, 2] != out[:, 3], axis=1)
+            if np.any(dup1):
+                for k in np.flatnonzero(dup1):
+                    off_k = int(chunk_offs[k])
+                    len_k = int(chunk_lens[k])
+                    _, out[k, 2] = _terminal_pair(
+                        data[off_k : off_k + len_k], 1, cancel
+                    )
+            points[int(offsets[c_start]) : int(offsets[c_stop])] = out.reshape(-1, 3)
+        return
+    step = max(1, TRANSFER_BYTES // (3 * 8))
+    gather_limit = QUERY_CHUNK_ITEMS * 16
+    for c_start in range(0, len(ids), QUERY_CHUNK_ITEMS):
+        _check_cancel(cancel)
+        c_stop = min(c_start + QUERY_CHUNK_ITEMS, len(ids))
+        out_start = int(offsets[c_start])
+        out_stop = int(offsets[c_stop])
+        total_pts = out_stop - out_start
+        if not total_pts:
+            continue
+        chunk_ids = ids[c_start:c_stop]
+        chunk_lens = src_lengths[chunk_ids].astype(np.int64, copy=False)
+        valid_mask = chunk_lens > 0
+        if not np.all(valid_mask):
+            chunk_ids = chunk_ids[valid_mask]
+            chunk_lens = chunk_lens[valid_mask]
+        chunk_offs = src_offsets[chunk_ids].astype(np.int64, copy=False)
+        if len(chunk_offs) == 1 or bool(
+            np.all(chunk_offs[1:] == chunk_offs[:-1] + chunk_lens[:-1])
+        ):
+            base_src = int(chunk_offs[0])
+            for rel in range(0, total_pts, step):
+                _check_cancel(cancel)
+                end_rel = min(rel + step, total_pts)
+                points[out_start + rel : out_start + end_rel] = data[
+                    base_src + rel : base_src + end_rel
+                ]
+        elif total_pts <= gather_limit:
+            local_offsets = np.empty(len(chunk_lens), dtype=np.int64)
+            local_offsets[0] = 0
+            if len(chunk_lens) > 1:
+                np.cumsum(chunk_lens[:-1], out=local_offsets[1:])
+            gather = np.arange(total_pts, dtype=np.int64) + np.repeat(
+                chunk_offs - local_offsets, chunk_lens
+            )
+            points[out_start:out_stop] = data[gather]
+        else:
+            dst = out_start
+            for off_k, len_k in zip(chunk_offs.tolist(), chunk_lens.tolist()):
+                for block in range(0, len_k, QUERY_CHUNK_ITEMS):
+                    _check_cancel(cancel)
+                    stop_k = min(len_k, block + QUERY_CHUNK_ITEMS)
+                    points[dst + block : dst + stop_k] = data[
+                        off_k + block : off_k + stop_k
+                    ]
+                dst += len_k
 
 
 def _stage(folder, layer, request, streamlines, cancel):
@@ -143,12 +243,27 @@ def _stage(folder, layer, request, streamlines, cancel):
     ids = request.streamline_ids
     lengths = np.zeros(len(ids), dtype=np.int64)
     endpoint_mode = request.parameters.mode == "endpoint_proximity"
-    for index, original_id in enumerate(ids):
-        _check_cancel(cancel)
-        line = streamlines[int(original_id)]
-        if len(line.shape) == 2 and line.shape[1] == 3 and len(line):
-            lengths[index] = 4 if endpoint_mode else len(line)
-    offsets = np.concatenate(([0], np.cumsum(lengths)))
+    flat = flat_streamline_source(streamlines)
+    if flat is not None:
+        data, src_offsets, src_lengths, _ = flat
+        for start in range(0, len(ids), QUERY_CHUNK_ITEMS):
+            _check_cancel(cancel)
+            stop = min(start + QUERY_CHUNK_ITEMS, len(ids))
+            block_lens = src_lengths[ids[start:stop]].astype(np.int64, copy=False)
+            if endpoint_mode:
+                lengths[start:stop] = np.where(block_lens > 0, 4, 0)
+            else:
+                lengths[start:stop] = np.maximum(block_lens, 0)
+    else:
+        for index, original_id in enumerate(ids):
+            _check_cancel(cancel)
+            line = streamlines[int(original_id)]
+            if len(line.shape) == 2 and line.shape[1] == 3 and len(line):
+                lengths[index] = 4 if endpoint_mode else len(line)
+    offsets = np.empty(len(ids) + 1, dtype=np.int64)
+    offsets[0] = 0
+    if len(ids):
+        np.cumsum(lengths, out=offsets[1:])
     _save_array(folder / "offsets.npy", offsets, cancel)
     points = np.lib.format.open_memmap(
         folder / "line-points.npy",
@@ -157,23 +272,35 @@ def _stage(folder, layer, request, streamlines, cancel):
         shape=(int(offsets[-1]), 3),
     )
     try:
-        for index, original_id in enumerate(ids):
-            _check_cancel(cancel)
-            if not lengths[index]:
-                continue
-            line = streamlines[int(original_id)]
-            start = int(offsets[index])
-            if endpoint_mode:
-                first, first_inner = _terminal_pair(line, 0, cancel)
-                last, last_inner = _terminal_pair(line, 1, cancel)
-                points[start : start + 4] = (first, first_inner, last_inner, last)
-            else:
-                for block in range(0, len(line), QUERY_CHUNK_ITEMS):
-                    _check_cancel(cancel)
-                    stop = min(len(line), block + QUERY_CHUNK_ITEMS)
-                    points[start + block : start + stop] = line[
-                        block : block + QUERY_CHUNK_ITEMS
-                    ]
+        if flat is not None:
+            _stage_flat_points(
+                points,
+                ids,
+                offsets,
+                data,
+                src_offsets,
+                src_lengths,
+                endpoint_mode,
+                cancel,
+            )
+        else:
+            for index, original_id in enumerate(ids):
+                _check_cancel(cancel)
+                if not lengths[index]:
+                    continue
+                line = streamlines[int(original_id)]
+                start = int(offsets[index])
+                if endpoint_mode:
+                    first, first_inner = _terminal_pair(line, 0, cancel)
+                    last, last_inner = _terminal_pair(line, 1, cancel)
+                    points[start : start + 4] = (first, first_inner, last_inner, last)
+                else:
+                    for block in range(0, len(line), QUERY_CHUNK_ITEMS):
+                        _check_cancel(cancel)
+                        stop = min(len(line), block + QUERY_CHUNK_ITEMS)
+                        points[start + block : start + stop] = line[
+                            block : block + QUERY_CHUNK_ITEMS
+                        ]
         points.flush()
     finally:
         points._mmap.close()

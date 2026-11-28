@@ -5,6 +5,6 @@ TractEdit package initialization.
 """
 
 #: Application version — keep in sync with ``pyproject.toml``.
-__version__: str = "3.6.1"
+__version__: str = "3.6.2"
 
 SESSION_EXTENSION = ".tractedit-session"

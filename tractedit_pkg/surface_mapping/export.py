@@ -229,26 +229,27 @@ def _table_columns(dtype):
 
 def _write_table(path, table, cancel_check):
     columns = _table_columns(table.dtype)
+    numeric_only = all(
+        len(table.dtype.fields[name][0].shape) <= 1
+        and table.dtype.fields[name][0].base.kind in "biuf"
+        for name in table.dtype.names
+    )
+    fmt = ",".join(["%s"] * (len(columns) + 1)) + "\r\n"
     with path.open("w", encoding="utf-8", newline="") as stream:
         writer = csv.writer(stream)
         writer.writerow(["record_id", *(name for name, _, _ in columns)])
         for start in range(0, len(table), BLOCK_ITEMS):
             _check_cancel(cancel_check)
-            for index in range(start, min(start + BLOCK_ITEMS, len(table))):
-                row = table[index]
-                writer.writerow(
-                    [
-                        index,
-                        *(
-                            (
-                                row[name].item()
-                                if component is None
-                                else row[name][component].item()
-                            )
-                            for _, name, component in columns
-                        ),
-                    ]
-                )
+            stop = min(start + BLOCK_ITEMS, len(table))
+            block = table[start:stop]
+            cols = [range(start, stop)]
+            for _, name, component in columns:
+                col = block[name]
+                cols.append((col if component is None else col[:, component]).tolist())
+            if numeric_only:
+                stream.write("".join(map(fmt.__mod__, zip(*cols))))
+            else:
+                writer.writerows(zip(*cols))
 
 
 def _surface_data(bundle):
